@@ -1,0 +1,64 @@
+[project]
+name = "bims-shopify"
+version = "0.1.0"
+description = "Multi-tenant sync microservice between BIMS ERP (Paraguay) and Shopify"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "alembic>=1.13",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "httpx>=0.27",
+    "apscheduler>=3.10",
+    "structlog>=24.1",
+    "cryptography>=42.0",
+    "aiosqlite>=0.20",
+    "asyncpg>=0.29",
+    "pagopar-sdk>=0.1.1",
+]
+
+[project.optional-dependencies]
+pagopar = ["pagopar-sdk>=0.1"]
+dev = [
+    "pytest>=8.2",
+    "ruff>=0.6",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bims_shopify"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# Ruff's implicit defaults (pyflakes `F` plus a couple of pycodestyle error
+# codes) are kept as-is; we only extend them with the categories that were
+# already firing in this codebase before this file existed.
+select = [
+    "F",    # pyflakes (ruff default)
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "DTZ",  # flake8-datetimez
+    "RUF",  # ruff-specific rules
+]
+ignore = [
+    # FastAPI's dependency-injection idiom relies on calling `Depends(...)`
+    # (and similar) as an argument default; that's the framework's expected
+    # pattern, not a real mutable-default bug.
+    "B008",
+]

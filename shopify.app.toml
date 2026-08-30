@@ -1,0 +1,28 @@
+# Shopify CLI app configuration (config-only app, no Remix frontend).
+# Managed with Shopify CLI 4.x: `shopify app config link` / `shopify app deploy`.
+# See README.md "Shopify app / OAuth install" for the full setup walkthrough.
+
+name = "BIMS Sync"
+client_id = "REPLACE_WITH_CLIENT_ID_FROM_DEV_DASHBOARD"
+application_url = "https://mystoresync.ignitesolutions.click"
+embedded = false
+
+[access_scopes]
+scopes = "read_products,write_products,read_inventory,write_inventory,read_orders,write_orders,read_locations"
+
+[auth]
+redirect_urls = [
+  "https://mystoresync.ignitesolutions.click/shopify/callback",
+  "http://localhost:8000/shopify/callback",
+]
+
+[webhooks]
+api_version = "2025-07"
+
+  [[webhooks.subscriptions]]
+  topics = ["orders/paid", "orders/cancelled"]
+  uri = "/webhooks/shopify/app"
+
+  [[webhooks.subscriptions]]
+  compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+  uri = "/webhooks/shopify/compliance/"

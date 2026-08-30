@@ -1,0 +1,46 @@
+when:
+  event: [manual, api]
+
+steps:
+  update:
+    image: alpine/git
+    volumes:
+      - /home/ubuntu/apps/bims-shopify:/srv/app
+      - /home/ubuntu/apps:/srv/parent:ro
+      - /home/ubuntu/.ssh:/home/ubuntu/.ssh:ro
+    commands:
+      - OWNER=$(stat -c '%u:%g' /srv/parent)
+      - chown -R "$OWNER" /srv/app
+      - cd /srv/app
+      - git -c safe.directory=/srv/app fetch --prune origin
+      - git -c safe.directory=/srv/app reset --hard origin/main
+      - chown -R "$OWNER" /srv/app
+
+  deploy:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/ubuntu/apps/bims-shopify:/srv/app
+      - /home/ubuntu/.docker/config.json:/root/.docker/config.json:ro
+    commands:
+      - cd /srv/app
+      - docker compose -p bims-shopify pull && docker compose -p bims-shopify up -d --no-deps app
+      - docker image prune -f
+
+  healthcheck:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        for i in $(seq 1 15); do
+          STATUS=$(docker inspect --format='{{.State.Health.Status}}' bims-shopify 2>/dev/null || echo "starting")
+          if [ "$STATUS" = "healthy" ]; then
+            echo "bims-shopify is healthy"
+            exit 0
+          fi
+          echo "waiting for bims-shopify to become healthy (status: $STATUS)..."
+          sleep 5
+        done
+        echo "bims-shopify did not become healthy in time"
+        exit 1

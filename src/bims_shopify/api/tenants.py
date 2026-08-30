@@ -1,0 +1,105 @@
+"""CRUD router for tenants, protected by a static admin bearer token."""
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from bims_shopify.adapters.persistence.tenant_repository import (
+    SqlAlchemyTenantRepository,
+)
+from bims_shopify.domain.tenant import PaymentProvider, ReorderStrategy, Tenant
+
+from .deps import get_tenant_repository, require_admin
+
+router = APIRouter(prefix="/tenants", tags=["tenants"], dependencies=[Depends(require_admin)])
+
+
+class TenantCreate(BaseModel):
+    slug: str
+    bims_base_url: str
+    bims_api_key: str
+    shopify_shop_domain: str
+    shopify_access_token: str
+    shopify_webhook_secret: str
+    shopify_location_id: str = ""
+    bims_posale_id: int = 0
+    bims_warehouse_id: int = 0
+    bims_company_id: int = 0
+    bims_currency_id: int = 0
+    bims_payment_method_id: int = 0
+    default_customer_contact_id: int = 0
+    reorder_threshold: float = 0.0
+    reorder_strategy: ReorderStrategy = ReorderStrategy.NONE
+    payment_provider: PaymentProvider | None = None
+    provider_config: dict = {}
+    field_mappings: dict = {}
+    active: bool = True
+
+
+class TenantOut(BaseModel):
+    id: int
+    slug: str
+    bims_base_url: str
+    shopify_shop_domain: str
+    shopify_location_id: str
+    reorder_threshold: float
+    reorder_strategy: ReorderStrategy
+    payment_provider: PaymentProvider | None
+    active: bool
+
+    @classmethod
+    def from_domain(cls, tenant: Tenant) -> TenantOut:
+        return cls(
+            id=tenant.id,
+            slug=tenant.slug,
+            bims_base_url=tenant.bims_base_url,
+            shopify_shop_domain=tenant.shopify_shop_domain,
+            shopify_location_id=tenant.shopify_location_id,
+            reorder_threshold=tenant.reorder_threshold,
+            reorder_strategy=tenant.reorder_strategy,
+            payment_provider=tenant.payment_provider,
+            active=tenant.active,
+        )
+
+
+@router.get("", response_model=list[TenantOut])
+async def list_tenants(repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository)):
+    tenants = await repo.list_all()
+    return [TenantOut.from_domain(tenant) for tenant in tenants]
+
+
+@router.post("", response_model=TenantOut, status_code=201)
+async def create_tenant(
+    body: TenantCreate, repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository)
+):
+    tenant = Tenant(id=None, **body.model_dump())
+    created = await repo.create(tenant)
+    return TenantOut.from_domain(created)
+
+
+@router.get("/{slug}", response_model=TenantOut)
+async def get_tenant(slug: str, repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository)):
+    tenant = await repo.get_by_slug(slug)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    return TenantOut.from_domain(tenant)
+
+
+@router.put("/{slug}", response_model=TenantOut)
+async def update_tenant(
+    slug: str, body: TenantCreate, repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository)
+):
+    existing = await repo.get_by_slug(slug)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    updated = Tenant(id=existing.id, **body.model_dump())
+    saved = await repo.update(updated)
+    return TenantOut.from_domain(saved)
+
+
+@router.delete("/{slug}", status_code=204)
+async def delete_tenant(slug: str, repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository)):
+    existing = await repo.get_by_slug(slug)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    await repo.delete(existing.id)

@@ -1,0 +1,49 @@
+services:
+  app:
+    image: ghcr.io/devpbeat/bims-shopify:latest
+    build: .
+    container_name: bims-shopify
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - traefik_web
+      - internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik_web
+      - traefik.http.routers.mystoresync.rule=Host(`mystoresync.ignitesolutions.click`)
+      - traefik.http.routers.mystoresync.entrypoints=websecure
+      - traefik.http.routers.mystoresync.tls=true
+      - traefik.http.routers.mystoresync.tls.certresolver=myresolver
+      - traefik.http.routers.mystoresync.middlewares=secure-headers@file
+      - traefik.http.services.mystoresync.loadbalancer.server.port=8000
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: bims-shopify-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bims_shopify
+      POSTGRES_PASSWORD: bims_shopify
+      POSTGRES_DB: bims_shopify
+    volumes:
+      - bims_shopify_pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bims_shopify"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+networks:
+  traefik_web:
+    external: true
+  internal:
+    internal: true
+
+volumes:
+  bims_shopify_pgdata:

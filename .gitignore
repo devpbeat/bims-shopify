@@ -1,0 +1,19 @@
+# Environment / secrets
+.env
+.env.*
+!env.example
+!env.prod.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+
+# Tooling
+.atl/
+.coverage
+htmlcov/
