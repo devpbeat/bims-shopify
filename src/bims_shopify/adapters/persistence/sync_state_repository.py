@@ -8,20 +8,9 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bims_shopify.datetime_utils import ensure_aware_utc
+
 from .models import ProcessedEventModel, SyncStateModel
-
-
-def _utcnow_naive() -> datetime:
-    """Timezone-aware "now", stripped to naive UTC for storage.
-
-    `sync_states.last_error_at` is a plain (non-timezone-aware) DateTime
-    column, and SQLite round-trips any stored datetime as naive. Using
-    `datetime.now(UTC)` avoids the deprecated `datetime.utcnow()` while the
-    stored value stays naive-UTC, consistent with `last_run_at` (which
-    callers already populate via `datetime.now(UTC)` in api/sync.py before
-    it round-trips through SQLite as naive).
-    """
-    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class SqlAlchemySyncStateRepository:
@@ -42,7 +31,7 @@ class SqlAlchemySyncStateRepository:
 
     async def get_last_run(self, tenant_id: int) -> datetime | None:
         model = await self._get_or_create_state(tenant_id)
-        return model.last_run_at
+        return ensure_aware_utc(model.last_run_at)
 
     async def set_last_run(self, tenant_id: int, when: datetime) -> None:
         model = await self._get_or_create_state(tenant_id)
@@ -52,7 +41,7 @@ class SqlAlchemySyncStateRepository:
     async def set_last_error(self, tenant_id: int, message: str) -> None:
         model = await self._get_or_create_state(tenant_id)
         model.last_error = message[:2000]
-        model.last_error_at = _utcnow_naive()
+        model.last_error_at = datetime.now(UTC)
         await self._session.commit()
 
     async def set_last_run_summary(self, tenant_id: int, summary: dict) -> None:
@@ -62,10 +51,12 @@ class SqlAlchemySyncStateRepository:
 
     async def get_status(self, tenant_id: int) -> dict:
         model = await self._get_or_create_state(tenant_id)
+        last_run_at = ensure_aware_utc(model.last_run_at)
+        last_error_at = ensure_aware_utc(model.last_error_at)
         return {
-            "last_run_at": model.last_run_at.isoformat() if model.last_run_at else None,
+            "last_run_at": last_run_at.isoformat() if last_run_at else None,
             "last_error": model.last_error,
-            "last_error_at": model.last_error_at.isoformat() if model.last_error_at else None,
+            "last_error_at": last_error_at.isoformat() if last_error_at else None,
             "last_run_summary": dict(model.last_run_summary or {}),
         }
 

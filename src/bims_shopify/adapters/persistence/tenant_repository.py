@@ -33,6 +33,7 @@ class SqlAlchemyTenantRepository:
             default_customer_contact_id=model.default_customer_contact_id,
             reorder_threshold=model.reorder_threshold,
             reorder_strategy=ReorderStrategy(model.reorder_strategy),
+            bims_timezone=model.bims_timezone,
             payment_provider=PaymentProvider(model.payment_provider) if model.payment_provider else None,
             provider_config=model.provider_config or {},
             field_mappings=model.field_mappings or {},
@@ -55,6 +56,7 @@ class SqlAlchemyTenantRepository:
         model.default_customer_contact_id = tenant.default_customer_contact_id
         model.reorder_threshold = tenant.reorder_threshold
         model.reorder_strategy = tenant.reorder_strategy.value
+        model.bims_timezone = tenant.bims_timezone
         model.payment_provider = tenant.payment_provider.value if tenant.payment_provider else None
         model.provider_config = tenant.provider_config
         model.field_mappings = tenant.field_mappings

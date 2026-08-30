@@ -115,12 +115,13 @@ async def test_incremental_since_is_passed_as_last_update(bims_client, tenant):
 
 
 @respx.mock
-async def test_since_is_formatted_verbatim_no_timezone_conversion(bims_client, tenant):
-    """Documents the explicit assumption: `since` is forwarded to BIMS as
-    naive local wall-clock text with no UTC conversion applied, even though
-    our own persisted sync state is UTC (see LAST_UPDATE_FORMAT docstring)."""
+async def test_since_is_converted_to_tenant_bims_local_time(bims_client, tenant):
+    """`since` (aware UTC) must be converted to the tenant's BIMS-local wall
+    clock time (naive, no offset) before being sent as `last_update`, per
+    `adapters.bims.timezones.to_bims_local`. America/Asuncion is UTC-3."""
     from datetime import datetime
 
+    tenant.bims_timezone = "America/Asuncion"
     route = respx.get(f"{tenant.bims_base_url}/api/products/index.json").mock(
         side_effect=[httpx.Response(200, json={"status": "ok", "count": "0", "data": []})]
     )
@@ -133,8 +134,8 @@ async def test_since_is_formatted_verbatim_no_timezone_conversion(bims_client, t
     await adapter.list_products(tenant, since=since_utc)
 
     request = route.calls.last.request
-    # No timezone offset is appended; the UTC wall-clock value is sent as-is.
-    assert "last_update=2026-01-01+12%3A30%3A45" in str(request.url)
+    # 12:30:45 UTC -> 09:30:45 America/Asuncion (UTC-3), no offset suffix.
+    assert "last_update=2026-01-01+09%3A30%3A45" in str(request.url)
 
 
 @respx.mock

@@ -9,20 +9,10 @@ from bims_shopify.domain.sale import SaleOrder, SaleResult, SaleResultKind
 from bims_shopify.domain.tenant import Tenant
 
 from .client import BIMSClient
+from .timezones import to_bims_local
 
 PAGE_LIMIT = 250
 STOCK_BATCH_SIZE = 200
-
-# ASSUMPTION (not documented in docs/bims-api-notes.md): BIMS's `last_update`
-# filter is treated as opaque server-local wall-clock time by this adapter —
-# we send whatever `since` we're given, formatted without a timezone suffix,
-# and never convert it. Our own persisted sync state (SyncStateModel.last_run_at)
-# is stored in UTC (see api/sync.py, `datetime.now(timezone.utc)`). If BIMS's
-# server clock is NOT UTC, callers passing our UTC `since` value straight
-# through will under- or over-fetch by the server's UTC offset. This constant
-# exists so that assumption is explicit and testable rather than implicit in
-# a strftime call.
-LAST_UPDATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def _extract_sku(product: dict[str, Any], field_mappings: dict[str, Any]) -> str | None:
@@ -105,7 +95,7 @@ class BIMSERPAdapter:
         # associations we don't use) — see docs/bims-api-notes.md.
         params: dict[str, Any] = {"mode": "simple", "limit": PAGE_LIMIT}
         if since is not None:
-            params["last_update"] = since.strftime(LAST_UPDATE_FORMAT)
+            params["last_update"] = to_bims_local(since, tenant.bims_timezone)
 
         products: list[dict[str, Any]] = []
         offset = 0
@@ -179,7 +169,7 @@ class BIMSERPAdapter:
         zero-out/unpublish the matching Shopify variants).
         """
         response = await self._client.list_deleted_products(
-            since.strftime("%Y-%m-%d %H:%M:%S")
+            to_bims_local(since, tenant.bims_timezone)
         )
         data = response.get("data")
         if not data:

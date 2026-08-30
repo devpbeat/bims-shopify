@@ -1,8 +1,10 @@
 """CRUD router for tenants, protected by a static admin bearer token."""
 from __future__ import annotations
 
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
@@ -30,10 +32,20 @@ class TenantCreate(BaseModel):
     default_customer_contact_id: int = 0
     reorder_threshold: float = 0.0
     reorder_strategy: ReorderStrategy = ReorderStrategy.NONE
+    bims_timezone: str = "America/Asuncion"
     payment_provider: PaymentProvider | None = None
     provider_config: dict = {}
     field_mappings: dict = {}
     active: bool = True
+
+    @field_validator("bims_timezone")
+    @classmethod
+    def _validate_bims_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Unknown IANA timezone: {value!r}") from exc
+        return value
 
 
 class TenantOut(BaseModel):
@@ -44,6 +56,7 @@ class TenantOut(BaseModel):
     shopify_location_id: str
     reorder_threshold: float
     reorder_strategy: ReorderStrategy
+    bims_timezone: str
     payment_provider: PaymentProvider | None
     active: bool
 
@@ -57,6 +70,7 @@ class TenantOut(BaseModel):
             shopify_location_id=tenant.shopify_location_id,
             reorder_threshold=tenant.reorder_threshold,
             reorder_strategy=tenant.reorder_strategy,
+            bims_timezone=tenant.bims_timezone,
             payment_provider=tenant.payment_provider,
             active=tenant.active,
         )

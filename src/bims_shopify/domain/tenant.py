@@ -41,6 +41,7 @@ class Tenant:
     default_customer_contact_id: int
     reorder_threshold: float = 0.0
     reorder_strategy: ReorderStrategy = ReorderStrategy.NONE
+    bims_timezone: str = "America/Asuncion"
     payment_provider: PaymentProvider | None = None
     provider_config: dict[str, Any] = field(default_factory=dict)
     field_mappings: dict[str, Any] = field(default_factory=dict)

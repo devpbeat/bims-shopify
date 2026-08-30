@@ -7,22 +7,11 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bims_shopify.datetime_utils import ensure_aware_utc
+
 from .models import OAuthStateModel
 
 STATE_TTL_SECONDS = 600
-
-
-def _utcnow_naive() -> datetime:
-    """Timezone-aware "now", stripped to naive UTC for storage.
-
-    The `oauth_states` table uses a plain (non-timezone-aware) DateTime
-    column, and SQLite round-trips any stored datetime as naive (tzinfo is
-    dropped on read). Building the value via `datetime.now(UTC)` avoids the
-    deprecated `datetime.utcnow()` while keeping what we persist and later
-    compare naive-UTC on both sides, so comparisons never mix aware and
-    naive datetimes.
-    """
-    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class SqlAlchemyOAuthStateRepository:
@@ -32,7 +21,7 @@ class SqlAlchemyOAuthStateRepository:
     async def create(self, shop: str, ttl_seconds: int = STATE_TTL_SECONDS) -> str:
         """Generate and persist a fresh state nonce for `shop`, returning it."""
         state = secrets.token_urlsafe(32)
-        now = _utcnow_naive()
+        now = datetime.now(UTC)
         model = OAuthStateModel(
             shop=shop,
             state=state,
@@ -61,4 +50,5 @@ class SqlAlchemyOAuthStateRepository:
 
         if model.shop != shop:
             return False
-        return not model.expires_at < _utcnow_naive()
+        expires_at = ensure_aware_utc(model.expires_at)
+        return not expires_at < datetime.now(UTC)

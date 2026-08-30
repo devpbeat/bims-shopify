@@ -11,16 +11,17 @@ class Base(DeclarativeBase):
     pass
 
 
-def _utcnow_naive() -> datetime:
-    """Timezone-aware "now", stripped to naive UTC for storage.
+def _now_utc() -> datetime:
+    """Aware UTC "now" used as a column default.
 
-    These plain DateTime columns are naive (no `timezone=True`), and SQLite
-    round-trips any stored datetime as naive regardless. Building the value
-    via `datetime.now(UTC)` avoids the deprecated `datetime.utcnow()` while
-    the stored value stays naive-UTC, matching what these columns already
-    held.
+    On Postgres these columns are `DateTime(timezone=True)` (timestamptz), so
+    the aware value round-trips as-is. On SQLite, `DateTime(timezone=True)`
+    silently stores/reads naive datetimes (SQLite has no real tz-aware
+    column type); values read back there are re-tagged as UTC via
+    `datetime_utils.ensure_aware_utc` at the repository boundary rather than
+    stripped here.
     """
-    return datetime.now(UTC).replace(tzinfo=None)
+    return datetime.now(UTC)
 
 
 class TenantModel(Base):
@@ -42,6 +43,7 @@ class TenantModel(Base):
     default_customer_contact_id: Mapped[int] = mapped_column(Integer, default=0)
     reorder_threshold: Mapped[float] = mapped_column(Float, default=0.0)
     reorder_strategy: Mapped[str] = mapped_column(String(40), default="none")
+    bims_timezone: Mapped[str] = mapped_column(String(64), default="America/Asuncion")
     payment_provider: Mapped[str | None] = mapped_column(String(40), nullable=True)
     provider_config: Mapped[dict] = mapped_column(JSON, default=dict)
     field_mappings: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -53,10 +55,10 @@ class SyncStateModel(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     tenant_id: Mapped[int] = mapped_column(Integer, index=True, unique=True)
-    last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     product_hashes: Mapped[dict] = mapped_column(JSON, default=dict)
     last_error: Mapped[str | None] = mapped_column(String(2000), nullable=True)
-    last_error_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_run_summary: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -66,8 +68,8 @@ class OAuthStateModel(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     shop: Mapped[str] = mapped_column(String(255), index=True)
     state: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive)
-    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class ProcessedEventModel(Base):
@@ -80,4 +82,4 @@ class ProcessedEventModel(Base):
     external_id: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(40), default="processed")
     payload_hash: Mapped[str] = mapped_column(String(128), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
