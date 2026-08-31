@@ -138,7 +138,8 @@ async def test_callback_valid_hmac_and_state_upserts_tenant(app_ctx):
         resp = await client.get("/shopify/callback", params=params)
 
     assert resp.status_code == 200
-    assert resp.json()["status"] == "installed"
+    assert "text/html" in resp.headers["content-type"]
+    assert "acme" in resp.text
 
     async with session_factory() as session:
         repo = SqlAlchemyTenantRepository(session, SecretBox(settings.fernet_key))

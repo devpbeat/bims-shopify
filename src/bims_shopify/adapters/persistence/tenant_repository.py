@@ -67,6 +67,13 @@ class SqlAlchemyTenantRepository:
         model = result.scalar_one_or_none()
         return self._to_domain(model) if model else None
 
+    async def get_by_shopify_domain(self, shopify_shop_domain: str) -> Tenant | None:
+        result = await self._session.execute(
+            select(TenantModel).where(TenantModel.shopify_shop_domain == shopify_shop_domain)
+        )
+        model = result.scalar_one_or_none()
+        return self._to_domain(model) if model else None
+
     async def get_by_id(self, tenant_id: int) -> Tenant | None:
         model = await self._session.get(TenantModel, tenant_id)
         return self._to_domain(model) if model else None
