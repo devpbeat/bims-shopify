@@ -1,5 +1,5 @@
 when:
-  event: [manual, api]
+  event: [manual]
 
 steps:
   update:
