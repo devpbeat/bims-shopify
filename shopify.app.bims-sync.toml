@@ -1,19 +1,31 @@
-# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+# Shopify CLI app configuration (config-only app, no Remix frontend).
+# Managed with Shopify CLI 4.x: `shopify app config link` / `shopify app deploy`.
+# See README.md "Shopify app / OAuth install" for the full setup walkthrough.
 
-client_id = "900a68f997eada9ee16dc16165389eef"
-application_url = "https://shopify.dev/apps/default-app-home"
-embedded = true
 name = "BIMS Sync"
+client_id = "900a68f997eada9ee16dc16165389eef"
+application_url = "https://mystoresync.ignitesolutions.click"
+embedded = false
 
 [access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_inventory,read_locations,read_orders,read_products,write_inventory,write_orders,write_products"
+scopes = "read_products,write_products,read_inventory,write_inventory,read_orders,write_orders,read_locations"
 
 [auth]
-redirect_urls = [ "https://shopify.dev/apps/default-app-home/api/auth" ]
+redirect_urls = [
+  "https://mystoresync.ignitesolutions.click/shopify/callback",
+  "http://localhost:8000/shopify/callback",
+]
 
 [webhooks]
-api_version = "2026-10"
+api_version = "2025-07"
+
+  [[webhooks.subscriptions]]
+  topics = ["orders/paid", "orders/cancelled"]
+  uri = "/webhooks/shopify/app"
+
+  [[webhooks.subscriptions]]
+  compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+  uri = "/webhooks/shopify/compliance/"
 
 [build]
-automatically_update_urls_on_dev = true
+automatically_update_urls_on_dev = false
