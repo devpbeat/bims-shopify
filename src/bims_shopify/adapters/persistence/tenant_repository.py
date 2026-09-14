@@ -27,6 +27,7 @@ class SqlAlchemyTenantRepository:
             shopify_location_id=model.shopify_location_id,
             bims_posale_id=model.bims_posale_id,
             bims_warehouse_id=model.bims_warehouse_id,
+            bims_warehouse_ids=list(model.bims_warehouse_ids or []),
             bims_company_id=model.bims_company_id,
             bims_currency_id=model.bims_currency_id,
             bims_payment_method_id=model.bims_payment_method_id,
@@ -50,6 +51,7 @@ class SqlAlchemyTenantRepository:
         model.shopify_location_id = tenant.shopify_location_id
         model.bims_posale_id = tenant.bims_posale_id
         model.bims_warehouse_id = tenant.bims_warehouse_id
+        model.bims_warehouse_ids = list(tenant.bims_warehouse_ids or [])
         model.bims_company_id = tenant.bims_company_id
         model.bims_currency_id = tenant.bims_currency_id
         model.bims_payment_method_id = tenant.bims_payment_method_id

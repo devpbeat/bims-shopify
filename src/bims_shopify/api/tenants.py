@@ -26,6 +26,7 @@ class TenantCreate(BaseModel):
     shopify_location_id: str = ""
     bims_posale_id: int = 0
     bims_warehouse_id: int = 0
+    bims_warehouse_ids: list[int] = []
     bims_company_id: int = 0
     bims_currency_id: int = 0
     bims_payment_method_id: int = 0
@@ -54,6 +55,8 @@ class TenantOut(BaseModel):
     bims_base_url: str
     shopify_shop_domain: str
     shopify_location_id: str
+    bims_warehouse_id: int
+    bims_warehouse_ids: list[int]
     reorder_threshold: float
     reorder_strategy: ReorderStrategy
     bims_timezone: str
@@ -68,6 +71,8 @@ class TenantOut(BaseModel):
             bims_base_url=tenant.bims_base_url,
             shopify_shop_domain=tenant.shopify_shop_domain,
             shopify_location_id=tenant.shopify_location_id,
+            bims_warehouse_id=tenant.bims_warehouse_id,
+            bims_warehouse_ids=list(tenant.bims_warehouse_ids or []),
             reorder_threshold=tenant.reorder_threshold,
             reorder_strategy=tenant.reorder_strategy,
             bims_timezone=tenant.bims_timezone,

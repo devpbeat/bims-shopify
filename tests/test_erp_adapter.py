@@ -242,3 +242,105 @@ async def test_list_deleted_product_ids_empty_when_no_data(bims_client, tenant):
     ids = await adapter.list_deleted_product_ids(tenant, datetime(2026, 1, 1, tzinfo=UTC))
 
     assert ids == []
+
+
+@respx.mock
+async def test_stock_lookup_aggregates_across_bims_warehouse_ids(bims_client, tenant):
+    """When `bims_warehouse_ids` is set, stock_fenicio must be called with
+    that full list instead of just `bims_warehouse_id`."""
+    tenant.bims_warehouse_ids = [24, 25, 26, 27]
+    respx.get(f"{tenant.bims_base_url}/api/products/index.json").mock(
+        side_effect=[
+            httpx.Response(
+                200, json={"status": "ok", "count": "1", "data": [_product(id=1, code2="SKU-1")]}
+            ),
+            httpx.Response(200, json={"status": "ok", "count": "1", "data": []}),
+        ]
+    )
+    stock_route = respx.post(
+        f"{tenant.bims_base_url}/api/products_stocks/stock_fenicio.json"
+    ).mock(return_value=httpx.Response(200, json={"status": "OK", "data": {"stockPorSku": [{"sku": "SKU-1", "stock": 12}]}}))
+
+    adapter = BIMSERPAdapter(bims_client)
+    snapshots = await adapter.list_products(tenant)
+
+    import json
+
+    parsed = json.loads(stock_route.calls.last.request.content)
+    assert parsed["warehouse_ids"] == [24, 25, 26, 27]
+    assert snapshots[0].stock == 12
+
+
+@respx.mock
+async def test_stock_lookup_falls_back_to_bims_warehouse_id_when_ids_empty(bims_client, tenant):
+    """`bims_warehouse_ids` empty (the default) must fall back to the single
+    `bims_warehouse_id`, preserving existing single-warehouse behavior."""
+    assert tenant.bims_warehouse_ids == []
+    respx.get(f"{tenant.bims_base_url}/api/products/index.json").mock(
+        side_effect=[
+            httpx.Response(
+                200, json={"status": "ok", "count": "1", "data": [_product(id=1, code2="SKU-1")]}
+            ),
+            httpx.Response(200, json={"status": "ok", "count": "1", "data": []}),
+        ]
+    )
+    stock_route = respx.post(
+        f"{tenant.bims_base_url}/api/products_stocks/stock_fenicio.json"
+    ).mock(return_value=httpx.Response(200, json={"status": "OK", "data": {"stockPorSku": [{"sku": "SKU-1", "stock": 3}]}}))
+
+    adapter = BIMSERPAdapter(bims_client)
+    await adapter.list_products(tenant)
+
+    import json
+
+    parsed = json.loads(stock_route.calls.last.request.content)
+    assert parsed["warehouse_ids"] == [25]
+
+
+@respx.mock
+async def test_negative_aggregated_stock_is_clamped_to_zero_and_logged(bims_client, tenant):
+    """Aggregated stock across multiple warehouses can go negative (observed
+    live: -1). Merchants must never see negative Shopify availability, so
+    the adapter clamps to 0 and logs the count of clamped SKUs."""
+    import structlog
+
+    tenant.bims_warehouse_ids = [24, 25, 26, 27]
+    respx.get(f"{tenant.bims_base_url}/api/products/index.json").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "count": "2",
+                    "data": [_product(id=1, code2="NEG-1"), _product(id=2, code2="OK-2")],
+                },
+            ),
+            httpx.Response(200, json={"status": "ok", "count": "2", "data": []}),
+        ]
+    )
+    respx.post(f"{tenant.bims_base_url}/api/products_stocks/stock_fenicio.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "data": {
+                    "stockPorSku": [
+                        {"sku": "NEG-1", "stock": -1},
+                        {"sku": "OK-2", "stock": 4},
+                    ]
+                },
+            },
+        )
+    )
+
+    adapter = BIMSERPAdapter(bims_client)
+    with structlog.testing.capture_logs() as captured:
+        snapshots = await adapter.list_products(tenant)
+
+    by_sku = {s.sku: s.stock for s in snapshots}
+    assert by_sku["NEG-1"] == 0.0
+    assert by_sku["OK-2"] == 4.0
+    warnings = [entry for entry in captured if entry.get("event") == "negative_stock_clamped"]
+    assert len(warnings) == 1
+    assert warnings[0]["clamped_count"] == 1
+    assert warnings[0]["tenant"] == "acme"

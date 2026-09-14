@@ -37,6 +37,7 @@ class TenantModel(Base):
     shopify_location_id: Mapped[str] = mapped_column(String(120), default="")
     bims_posale_id: Mapped[int] = mapped_column(Integer, default=0)
     bims_warehouse_id: Mapped[int] = mapped_column(Integer, default=0)
+    bims_warehouse_ids: Mapped[list] = mapped_column(JSON, default=list)
     bims_company_id: Mapped[int] = mapped_column(Integer, default=0)
     bims_currency_id: Mapped[int] = mapped_column(Integer, default=0)
     bims_payment_method_id: Mapped[int] = mapped_column(Integer, default=0)

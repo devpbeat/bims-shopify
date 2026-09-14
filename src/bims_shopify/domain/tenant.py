@@ -39,6 +39,7 @@ class Tenant:
     bims_currency_id: int
     bims_payment_method_id: int
     default_customer_contact_id: int
+    bims_warehouse_ids: list[int] = field(default_factory=list)
     reorder_threshold: float = 0.0
     reorder_strategy: ReorderStrategy = ReorderStrategy.NONE
     bims_timezone: str = "America/Asuncion"
@@ -56,3 +57,12 @@ class Tenant:
         already contains the tenant prefix.
         """
         return self.bims_api_key
+
+    @property
+    def stock_warehouse_ids(self) -> list[int]:
+        """Warehouse ids to scope stock lookups to.
+
+        Falls back to ``[bims_warehouse_id]`` when ``bims_warehouse_ids`` is
+        empty, so single-warehouse tenants keep working unchanged.
+        """
+        return list(self.bims_warehouse_ids) if self.bims_warehouse_ids else [self.bims_warehouse_id]

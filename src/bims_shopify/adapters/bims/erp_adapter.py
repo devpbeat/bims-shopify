@@ -7,12 +7,15 @@ from typing import Any
 from bims_shopify.domain.product import ProductSnapshot
 from bims_shopify.domain.sale import SaleOrder, SaleResult, SaleResultKind
 from bims_shopify.domain.tenant import Tenant
+from bims_shopify.logging import get_logger
 
 from .client import BIMSClient
 from .timezones import to_bims_local
 
 PAGE_LIMIT = 250
 STOCK_BATCH_SIZE = 200
+
+logger = get_logger(__name__)
 
 
 def _extract_sku(product: dict[str, Any], field_mappings: dict[str, Any]) -> str | None:
@@ -112,20 +115,40 @@ class BIMSERPAdapter:
         return products
 
     async def fetch_stock_levels(self, tenant: Tenant, skus: list[str]) -> dict[str, float]:
-        """Fetch per-SKU stock scoped to ``tenant.bims_warehouse_id``, batched."""
+        """Fetch per-SKU stock aggregated across ``tenant.stock_warehouse_ids``, batched.
+
+        BIMS's stock_fenicio endpoint aggregates stock across the given
+        warehouse_ids and can return a negative total (e.g. -1) when
+        warehouse-level ledgers disagree. Negative values are clamped to 0
+        here so merchants never see negative Shopify availability; the
+        count of clamped SKUs is logged per run for observability.
+        """
         result: dict[str, float] = {}
         unique_skus = list(dict.fromkeys(skus))
+        warehouse_ids = tenant.stock_warehouse_ids
+        clamped_count = 0
         for i in range(0, len(unique_skus), STOCK_BATCH_SIZE):
             batch = unique_skus[i : i + STOCK_BATCH_SIZE]
             if not batch:
                 continue
             response = await self._client.stock_fenicio(
                 skus=batch,
-                warehouse_ids=[tenant.bims_warehouse_id],
+                warehouse_ids=warehouse_ids,
                 request_id=f"bims-shopify-{i}",
             )
             for row in (response.get("data") or {}).get("stockPorSku") or []:
-                result[str(row["sku"])] = float(row.get("stock") or 0)
+                stock = float(row.get("stock") or 0)
+                if stock < 0:
+                    clamped_count += 1
+                    stock = 0.0
+                result[str(row["sku"])] = stock
+        if clamped_count:
+            logger.warning(
+                "negative_stock_clamped",
+                tenant=tenant.slug,
+                clamped_count=clamped_count,
+                warehouse_ids=warehouse_ids,
+            )
         return result
 
     async def create_or_update_sale(self, tenant: Tenant, sale: SaleOrder) -> SaleResult:
