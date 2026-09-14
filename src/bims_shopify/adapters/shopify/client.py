@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -40,6 +41,28 @@ _ORDER_MARK_AS_PAID = """
 mutation OrderMarkAsPaid($input: OrderMarkAsPaidInput!) {
   orderMarkAsPaid(input: $input) {
     order { id displayFinancialStatus }
+    userErrors { field message }
+  }
+}
+"""
+
+_LIST_ALL_VARIANTS = """
+query ListAllVariants($cursor: String) {
+  productVariants(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      sku
+      product { id title }
+    }
+  }
+}
+"""
+
+_VARIANTS_BULK_UPDATE = """
+mutation ProductVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+  productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+    productVariants { id sku }
     userErrors { field message }
   }
 }
@@ -200,6 +223,30 @@ class ShopifyClient:
     async def get_order(self, tenant: Tenant, order_id: str) -> dict[str, Any] | None:
         data = await self._graphql(_GET_ORDER, {"id": order_id})
         return data.get("order")
+
+    async def iter_all_variants(self) -> AsyncIterator[dict[str, Any]]:
+        """Page through every product variant in the shop.
+
+        Yields raw GraphQL nodes shaped ``{id, sku, product: {id, title}}``.
+        Used by ops scripts that need a full-catalog scan (e.g. rekey_skus).
+        """
+        cursor: str | None = None
+        while True:
+            data = await self._graphql(_LIST_ALL_VARIANTS, {"cursor": cursor})
+            connection = data["productVariants"]
+            for node in connection["nodes"]:
+                yield node
+            page_info = connection["pageInfo"]
+            if not page_info["hasNextPage"]:
+                return
+            cursor = page_info["endCursor"]
+
+    async def bulk_update_variants(self, product_id: str, variants: list[dict[str, Any]]) -> None:
+        """Update multiple variants of a single product via productVariantsBulkUpdate."""
+        data = await self._graphql(
+            _VARIANTS_BULK_UPDATE, {"productId": product_id, "variants": variants}
+        )
+        self._check_user_errors(data.get("productVariantsBulkUpdate"))
 
 
 class ShopifyGraphQLError(RuntimeError):
