@@ -268,7 +268,7 @@ async def test_transient_lookup_failure_is_unresolved_and_does_not_abort_scan(te
         if sku == "broken-lookup":
             raise httpx.ConnectError("connection refused", request=request)
         if sku == "12345":
-            return httpx.Response(200, json={"status": "ok", "data": {"code2": "SKU-999", "name": "Blue Widget"}})
+            return httpx.Response(200, json={"status": "ok", "data": {"Product": {"code2": "SKU-999", "name": "Blue Widget"}}})
         return httpx.Response(200, json={"status": "error", "code": "404", "message": "not found"})
 
     respx.get(f"{BIMS_URL}/api/products/view.json").mock(side_effect=responder)

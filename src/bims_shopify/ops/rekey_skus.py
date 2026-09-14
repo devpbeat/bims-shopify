@@ -149,7 +149,9 @@ async def fetch_company_code2_set(bims_client: BIMSClient, company_id: int) -> s
         )
         page = body.get("data") or []
         for item in page:
-            code2 = item.get("code2")
+            # mode=simple rows are wrapped as {"Product": {...}}.
+            product = item.get("Product") or item
+            code2 = product.get("code2")
             if code2 not in (None, ""):
                 code2_values.add(str(code2))
         if len(page) < BIMS_INDEX_PAGE_LIMIT:
@@ -179,6 +181,9 @@ async def _lookup_bims_product(
         except _TRANSIENT_LOOKUP_EXCEPTIONS as exc:
             return None, f"{type(exc).__name__}: {exc}"
     data = body.get("data") if isinstance(body, dict) else None
+    if isinstance(data, dict):
+        # view.json wraps the record as {"Product": {...}}.
+        data = data.get("Product") or data
     return data or None, None
 
 
