@@ -4,12 +4,16 @@ when:
 steps:
   update:
     image: alpine/git
+    environment:
+      HOME: /tmp # git needs a writable HOME; the checkout must not be it
+      GIT_SSH_COMMAND: ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no
     volumes:
       - /home/ubuntu/apps/bims-shopify:/srv/app
       - /home/ubuntu/apps:/srv/parent:ro
       - /home/ubuntu/.ssh:/home/ubuntu/.ssh:ro
     commands:
       - OWNER=$(stat -c '%u:%g' /srv/parent)
+      - echo "restoring checkout ownership to $OWNER"
       - chown -R "$OWNER" /srv/app
       - cd /srv/app
       - git -c safe.directory=/srv/app fetch --prune origin
