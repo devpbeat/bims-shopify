@@ -1,6 +1,8 @@
 """CRUD router for tenants, protected by a static admin bearer token."""
 from __future__ import annotations
 
+import hashlib
+import secrets
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -125,3 +127,27 @@ async def delete_tenant(slug: str, repo: SqlAlchemyTenantRepository = Depends(ge
     if existing is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
     await repo.delete(existing.id)
+
+
+class PortalTokenOut(BaseModel):
+    portal_token: str
+
+
+@router.post("/{slug}/portal-token", response_model=PortalTokenOut)
+async def create_portal_token(
+    slug: str, repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository)
+):
+    """Mint a new merchant-portal bearer token for this tenant.
+
+    Only the SHA-256 hash is persisted; the plaintext token is returned
+    exactly once and cannot be recovered afterwards. Minting a new token
+    invalidates any previously issued one (it overwrites the stored hash).
+    """
+    tenant = await repo.get_by_slug(slug)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    await repo.set_portal_token_hash(tenant.id, token_hash)
+    return PortalTokenOut(portal_token=token)

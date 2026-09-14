@@ -112,3 +112,14 @@ class SqlAlchemyTenantRepository:
         if model is not None:
             await self._session.delete(model)
             await self._session.commit()
+
+    async def set_portal_token_hash(self, tenant_id: int, token_hash: str) -> None:
+        model = await self._session.get(TenantModel, tenant_id)
+        if model is None:
+            raise ValueError(f"Tenant {tenant_id} not found")
+        model.portal_token_hash = token_hash
+        await self._session.commit()
+
+    async def get_portal_token_hash(self, tenant_id: int) -> str | None:
+        model = await self._session.get(TenantModel, tenant_id)
+        return model.portal_token_hash if model is not None else None

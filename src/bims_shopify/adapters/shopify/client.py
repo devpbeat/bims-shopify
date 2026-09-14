@@ -68,6 +68,15 @@ mutation ProductVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsB
 }
 """
 
+_VARIANTS_BULK_DELETE = """
+mutation ProductVariantsBulkDelete($productId: ID!, $variantsIds: [ID!]!) {
+  productVariantsBulkDelete(productId: $productId, variantsIds: $variantsIds) {
+    product { id }
+    userErrors { field message }
+  }
+}
+"""
+
 _GET_ORDER = """
 query GetOrder($id: ID!) {
   order(id: $id) {
@@ -247,6 +256,13 @@ class ShopifyClient:
             _VARIANTS_BULK_UPDATE, {"productId": product_id, "variants": variants}
         )
         self._check_user_errors(data.get("productVariantsBulkUpdate"))
+
+    async def bulk_delete_variants(self, product_id: str, variant_ids: list[str]) -> None:
+        """Delete multiple variants of a single product via productVariantsBulkDelete."""
+        data = await self._graphql(
+            _VARIANTS_BULK_DELETE, {"productId": product_id, "variantsIds": variant_ids}
+        )
+        self._check_user_errors(data.get("productVariantsBulkDelete"))
 
 
 class ShopifyGraphQLError(RuntimeError):

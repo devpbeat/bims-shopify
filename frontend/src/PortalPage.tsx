@@ -1,0 +1,207 @@
+import { useEffect, useMemo, useState } from 'react'
+import { useParams } from 'react-router-dom'
+import { ApiError, getRekeyReport, getSyncStatus, postRekeyResolutions } from './api/client'
+import type { PendingQueue, RekeyReport, Resolution, SyncStatus } from './api/types'
+import { ApplyFooter } from './components/ApplyFooter'
+import { DuplicatesTab } from './components/DuplicatesTab'
+import { NameMismatchTab } from './components/NameMismatchTab'
+import { PortalHeader } from './components/PortalHeader'
+import { TokenGate } from './components/TokenGate'
+import { UnresolvedTab } from './components/UnresolvedTab'
+import { clearToken, loadToken, saveToken } from './session'
+
+type Tab = 'duplicates' | 'unresolved' | 'mismatches'
+
+function tokenFromUrl(): string | null {
+  return new URLSearchParams(window.location.search).get('token')
+}
+
+export function PortalPage() {
+  const { slug = '' } = useParams<{ slug: string }>()
+  const [token, setToken] = useState<string | null>(() => tokenFromUrl() ?? loadToken(slug))
+  const [report, setReport] = useState<RekeyReport | null>(null)
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
+  const [resolutions, setResolutions] = useState<Resolution[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [tab, setTab] = useState<Tab>('duplicates')
+  const [pending, setPending] = useState<PendingQueue>({})
+  const [applying, setApplying] = useState(false)
+
+  useEffect(() => {
+    if (token) saveToken(slug, token)
+  }, [slug, token])
+
+  useEffect(() => {
+    if (!token) return
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+
+    Promise.all([getRekeyReport(slug, token), getSyncStatus(slug, token)])
+      .then(([reportData, syncData]) => {
+        if (cancelled) return
+        setReport(reportData)
+        setResolutions(reportData.resolutions)
+        setSyncStatus(syncData)
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        if (err instanceof ApiError && err.status === 401) {
+          clearToken(slug)
+          setToken(null)
+          setError('Session expired or invalid token. Please re-enter your access token.')
+        } else {
+          setError(err instanceof Error ? err.message : 'Failed to load the rekey report.')
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [slug, token])
+
+  const pendingCount = useMemo(() => Object.keys(pending).length, [pending])
+
+  function queue(variantId: string, action: PendingQueue[string]['action'], note?: string) {
+    setPending((prev) => ({ ...prev, [variantId]: { action, note } }))
+  }
+
+  function unqueue(variantId: string) {
+    setPending((prev) => {
+      if (!(variantId in prev)) return prev
+      const next = { ...prev }
+      delete next[variantId]
+      return next
+    })
+  }
+
+  function handlePickSurvivor(survivorVariantId: string, siblingVariantIds: string[]) {
+    queue(survivorVariantId, 'keep')
+    for (const siblingId of siblingVariantIds) {
+      queue(siblingId, 'delete')
+    }
+  }
+
+  async function handleApply() {
+    if (!token || pendingCount === 0) return
+    setApplying(true)
+    setError(null)
+    try {
+      const body = Object.entries(pending).map(([variant_id, entry]) => ({
+        variant_id,
+        action: entry.action,
+        ...(entry.note ? { note: entry.note } : {}),
+      }))
+      const { results } = await postRekeyResolutions(slug, token, body)
+      setResolutions((prev) => {
+        const byVariant = new Map(prev.map((resolution) => [resolution.variant_id, resolution]))
+        for (const result of results) {
+          byVariant.set(result.variant_id, {
+            variant_id: result.variant_id,
+            action: result.action as Resolution['action'],
+            status: result.status,
+            error: result.error,
+          })
+        }
+        return [...byVariant.values()]
+      })
+      for (const result of results) {
+        if (result.status !== 'failed') unqueue(result.variant_id)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to apply resolutions.')
+    } finally {
+      setApplying(false)
+    }
+  }
+
+  if (!token) {
+    return (
+      <TokenGate
+        slug={slug}
+        onSubmit={(value) => {
+          saveToken(slug, value)
+          setToken(value)
+        }}
+      />
+    )
+  }
+
+  if (loading && !report) {
+    return (
+      <div className="centered-page">
+        <p>Loading rekey report…</p>
+      </div>
+    )
+  }
+
+  if (error && !report) {
+    return (
+      <div className="centered-page">
+        <p className="error-text">{error}</p>
+      </div>
+    )
+  }
+
+  if (!report) {
+    return (
+      <div className="centered-page">
+        <p className="empty-state">No rekey report found for this tenant.</p>
+      </div>
+    )
+  }
+
+  const payload = report.payload
+  const duplicates = payload.duplicate_target ?? []
+  const unresolved = payload.unresolved ?? []
+  const mismatches = payload.name_mismatch ?? []
+
+  return (
+    <div className="portal-page">
+      <PortalHeader slug={slug} reportDate={report.created_at} syncStatus={syncStatus} />
+
+      {error && <p className="error-banner">{error}</p>}
+
+      <nav className="tabs">
+        <button type="button" className={tab === 'duplicates' ? 'tab active' : 'tab'} onClick={() => setTab('duplicates')}>
+          Duplicates ({duplicates.length})
+        </button>
+        <button type="button" className={tab === 'unresolved' ? 'tab active' : 'tab'} onClick={() => setTab('unresolved')}>
+          Unresolved ({unresolved.length})
+        </button>
+        <button type="button" className={tab === 'mismatches' ? 'tab active' : 'tab'} onClick={() => setTab('mismatches')}>
+          Name mismatches ({mismatches.length})
+        </button>
+      </nav>
+
+      <main className="tab-content">
+        {tab === 'duplicates' && (
+          <DuplicatesTab rows={duplicates} resolutions={resolutions} pending={pending} onPick={handlePickSurvivor} />
+        )}
+        {tab === 'unresolved' && (
+          <UnresolvedTab
+            rows={unresolved}
+            resolutions={resolutions}
+            pending={pending}
+            onIgnore={(variantId, note) => queue(variantId, 'ignore', note || undefined)}
+          />
+        )}
+        {tab === 'mismatches' && (
+          <NameMismatchTab
+            rows={mismatches}
+            resolutions={resolutions}
+            pending={pending}
+            onApprove={(variantId) => queue(variantId, 'approve_sku')}
+            onIgnore={(variantId) => queue(variantId, 'ignore')}
+          />
+        )}
+      </main>
+
+      <ApplyFooter pendingCount={pendingCount} applying={applying} onApply={handleApply} />
+    </div>
+  )
+}

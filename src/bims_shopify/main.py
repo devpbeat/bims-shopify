@@ -8,6 +8,7 @@ from pathlib import Path
 
 from alembic.config import Config
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 
 from alembic import command
 from bims_shopify.adapters.persistence.crypto import SecretBox
@@ -15,7 +16,7 @@ from bims_shopify.adapters.persistence.database import create_engine_and_session
 from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
-from bims_shopify.api import health, payments, shopify_oauth, sync, tenants, webhooks
+from bims_shopify.api import health, payments, portal, shopify_oauth, sync, tenants, webhooks
 from bims_shopify.config import get_settings
 from bims_shopify.logging import configure_logging, get_logger
 from bims_shopify.scheduler import TenantSyncScheduler
@@ -39,6 +40,7 @@ def _find_repo_root() -> Path:
 
 
 _REPO_ROOT = _find_repo_root()
+_FRONTEND_DIST = (_REPO_ROOT / "frontend" / "dist").resolve()
 
 
 def _run_migrations(database_url: str) -> None:
@@ -125,7 +127,33 @@ def create_app() -> FastAPI:
     app.include_router(payments.router)
     app.include_router(sync.router)
     app.include_router(shopify_oauth.router)
+    app.include_router(portal.router)
+    _mount_portal_spa(app)
     return app
+
+
+def _mount_portal_spa(app: FastAPI) -> None:
+    """Serve the built merchant portal (`frontend/dist`) with client-side routing.
+
+    The SPA owns every `/portal` and `/portal/{path}` URL: known built assets
+    (JS/CSS/favicon under `dist/`) are served as-is, and anything else falls
+    back to `index.html` so React Router can render `/portal/{slug}` without
+    a matching filesystem path. This is a plain route rather than
+    `StaticFiles` mounted at `/portal` because a mount would 404 on unknown
+    paths (e.g. `/portal/mystore`) instead of falling back to the SPA shell.
+    """
+    index_path = _FRONTEND_DIST / "index.html"
+
+    @app.get("/portal")
+    async def portal_root() -> FileResponse:
+        return FileResponse(index_path)
+
+    @app.get("/portal/{full_path:path}")
+    async def portal_spa(full_path: str) -> FileResponse:
+        candidate = (_FRONTEND_DIST / full_path).resolve()
+        if candidate.is_file() and candidate.is_relative_to(_FRONTEND_DIST):
+            return FileResponse(candidate)
+        return FileResponse(index_path)
 
 
 app = create_app()

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -50,6 +50,7 @@ class TenantModel(Base):
     field_mappings: Mapped[dict] = mapped_column(JSON, default=dict)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     push_orders_to_bims: Mapped[bool] = mapped_column(Boolean, default=True)
+    portal_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class SyncStateModel(Base):
@@ -81,6 +82,28 @@ class RekeyReportModel(Base):
     tenant_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class RekeyResolutionModel(Base):
+    """A merchant-portal decision applied to one variant from a rekey report.
+
+    ``(report_id, variant_id)`` is unique so a resolution is idempotent per
+    report: re-posting the same decision is detected and returned as
+    "already_resolved" rather than re-applied (see the portal API).
+    """
+
+    __tablename__ = "rekey_resolutions"
+    __table_args__ = (UniqueConstraint("report_id", "variant_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, ForeignKey("tenants.id"), index=True)
+    report_id: Mapped[int] = mapped_column(Integer, ForeignKey("rekey_reports.id"), index=True)
+    variant_id: Mapped[str] = mapped_column(String(255))
+    action: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(40))
+    error: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    note: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
 
 
 class ProcessedEventModel(Base):
