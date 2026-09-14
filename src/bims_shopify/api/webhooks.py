@@ -225,6 +225,19 @@ async def _process_order_webhook(
         if not claimed:
             return
 
+        if not tenant.push_orders_to_bims:
+            # BIMS is the source of truth for this tenant: staff invoice
+            # manually in BIMS, and the periodic sync feeds Shopify
+            # inventory from BIMS. Do NOT create a Sale or run reorder
+            # logic here; still record the event for idempotency/audit.
+            logger.info(
+                "order_push_disabled",
+                tenant=tenant.slug,
+                order_id=order_id,
+            )
+            await sync_state_repo.mark_event_status(tenant.id, "shopify_webhook", order_id, "processed")
+            return
+
         sale = build_sale_from_webhook_payload(tenant, payload)
 
         client = BIMSClient(tenant)

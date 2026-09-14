@@ -38,6 +38,7 @@ class TenantCreate(BaseModel):
     provider_config: dict = {}
     field_mappings: dict = {}
     active: bool = True
+    push_orders_to_bims: bool = True
 
     @field_validator("bims_timezone")
     @classmethod
@@ -62,6 +63,7 @@ class TenantOut(BaseModel):
     bims_timezone: str
     payment_provider: PaymentProvider | None
     active: bool
+    push_orders_to_bims: bool
 
     @classmethod
     def from_domain(cls, tenant: Tenant) -> TenantOut:
@@ -78,6 +80,7 @@ class TenantOut(BaseModel):
             bims_timezone=tenant.bims_timezone,
             payment_provider=tenant.payment_provider,
             active=tenant.active,
+            push_orders_to_bims=tenant.push_orders_to_bims,
         )
 
 

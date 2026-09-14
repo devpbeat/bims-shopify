@@ -47,6 +47,7 @@ class Tenant:
     provider_config: dict[str, Any] = field(default_factory=dict)
     field_mappings: dict[str, Any] = field(default_factory=dict)
     active: bool = True
+    push_orders_to_bims: bool = True
 
     @property
     def bims_auth_header(self) -> str:

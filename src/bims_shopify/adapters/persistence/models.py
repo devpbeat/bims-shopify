@@ -49,6 +49,7 @@ class TenantModel(Base):
     provider_config: Mapped[dict] = mapped_column(JSON, default=dict)
     field_mappings: Mapped[dict] = mapped_column(JSON, default=dict)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    push_orders_to_bims: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class SyncStateModel(Base):
