@@ -7,13 +7,30 @@ second scan after a rewrite, and product-grouping of bulk-update calls.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
+import pytest
 import respx
+from openpyxl import load_workbook
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from bims_shopify.adapters.bims.client import BIMSClient
+from bims_shopify.adapters.persistence.models import RekeyReportModel
 from bims_shopify.adapters.shopify.client import ShopifyClient
-from bims_shopify.ops.rekey_skus import apply_rewrites, partition_duplicate_targets, scan
+from bims_shopify.ops.rekey_skus import (
+    ScanResult,
+    apply_rewrites,
+    build_report_workbook,
+    partition_duplicate_targets,
+    persist_rekey_report,
+    scan,
+    write_report_xlsx,
+)
 
 GRAPHQL_URL = "https://acme.myshopify.com/admin/api/2025-07/graphql.json/"
 BIMS_URL = "https://bims.example.com"
@@ -402,6 +419,298 @@ async def test_shopify_variant_pagination_yields_every_variant_across_pages(tena
     assert result.total_variants == 2
     assert result.already_keyed == 2
     assert calls["count"] == 2
+
+
+def _fixture_scan_result(*, duplicates: int, unresolved: int, name_mismatch: int) -> ScanResult:
+    result = ScanResult(total_variants=100, empty_sku=5, already_keyed=10)
+    for i in range(duplicates):
+        product_title = "Blue Widget" if i % 2 == 0 else "Ant Widget"
+        new_sku = "SKU-DUP-A" if i % 2 == 0 else "SKU-DUP-B"
+        result.duplicate_target.append(
+            {
+                "variant_id": f"gid://shopify/ProductVariant/dup{i}",
+                "product_id": f"gid://shopify/Product/dup{i}",
+                "product_title": product_title,
+                "old_sku": f"old-dup-{i}",
+                "new_sku": new_sku,
+                "bims_name": f"Bims Name {i}",
+            }
+        )
+    for i in range(unresolved):
+        result.unresolved.append(
+            {
+                "variant_id": f"gid://shopify/ProductVariant/unres{i}",
+                "product_title": f"Unresolved Product {i}",
+                "sku": f"unresolved-sku-{i}",
+            }
+        )
+    for i in range(name_mismatch):
+        result.name_mismatch.append(
+            {
+                "variant_id": f"gid://shopify/ProductVariant/mismatch{i}",
+                "product_id": f"gid://shopify/Product/mismatch{i}",
+                "product_title": f"Shopify Title {i}",
+                "old_sku": f"old-mismatch-{i}",
+                "new_sku": f"SKU-MISMATCH-{i}",
+                "bims_name": f"Bims Name {i}",
+            }
+        )
+    return result
+
+
+def test_build_report_workbook_has_exactly_four_sheets():
+    result = _fixture_scan_result(duplicates=15, unresolved=12, name_mismatch=12)
+    workbook = build_report_workbook(
+        result,
+        shop_domain="acme.myshopify.com",
+        tenant_slug="acme",
+        scanned_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    assert workbook.sheetnames == ["Summary", "Duplicates", "Unresolved", "Name mismatch"]
+
+
+def test_build_report_workbook_does_not_truncate_full_lists():
+    result = _fixture_scan_result(duplicates=15, unresolved=12, name_mismatch=12)
+    workbook = build_report_workbook(
+        result,
+        shop_domain="acme.myshopify.com",
+        tenant_slug="acme",
+        scanned_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    # header row + one row per item, no 10-item preview truncation.
+    assert workbook["Duplicates"].max_row - 1 == 15
+    assert workbook["Unresolved"].max_row - 1 == 12
+    assert workbook["Name mismatch"].max_row - 1 == 12
+
+
+def test_build_report_workbook_duplicates_sheet_header_bold_and_frozen():
+    result = _fixture_scan_result(duplicates=2, unresolved=0, name_mismatch=0)
+    workbook = build_report_workbook(
+        result,
+        shop_domain="acme.myshopify.com",
+        tenant_slug="acme",
+        scanned_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    ws = workbook["Duplicates"]
+
+    assert [cell.value for cell in ws[1]] == [
+        "product_title",
+        "size/bims_name",
+        "old_sku",
+        "target_code2(new_sku)",
+        "variant_id",
+        "product_id",
+        "KEEP? (YES/NO)",
+    ]
+    assert all(cell.font.bold for cell in ws[1])
+    assert ws.freeze_panes == "A2"
+
+
+def test_build_report_workbook_name_mismatch_sheet_header_order():
+    result = _fixture_scan_result(duplicates=0, unresolved=0, name_mismatch=1)
+    workbook = build_report_workbook(
+        result,
+        shop_domain="acme.myshopify.com",
+        tenant_slug="acme",
+        scanned_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    ws = workbook["Name mismatch"]
+
+    assert [cell.value for cell in ws[1]] == [
+        "product_title",
+        "bims_name",
+        "old_sku",
+        "proposed_code2",
+        "variant_id",
+        "APPROVE? (YES/NO)",
+    ]
+    assert ws.freeze_panes == "A2"
+    assert all(cell.font.bold for cell in ws[1])
+
+
+def test_build_report_workbook_duplicates_sheet_grouped_by_product_title_and_new_sku():
+    result = _fixture_scan_result(duplicates=4, unresolved=0, name_mismatch=0)
+    workbook = build_report_workbook(
+        result,
+        shop_domain="acme.myshopify.com",
+        tenant_slug="acme",
+        scanned_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    ws = workbook["Duplicates"]
+
+    rows = [(row[0].value, row[3].value) for row in ws.iter_rows(min_row=2)]
+    assert rows == sorted(rows)
+
+
+def test_write_report_xlsx_round_trips_via_tmp_path(tmp_path):
+    result = _fixture_scan_result(duplicates=1, unresolved=1, name_mismatch=1)
+    path = tmp_path / "report.xlsx"
+
+    write_report_xlsx(
+        result,
+        str(path),
+        shop_domain="acme.myshopify.com",
+        tenant_slug="acme",
+        scanned_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    assert path.exists()
+    workbook = load_workbook(str(path))
+    assert workbook.sheetnames == ["Summary", "Duplicates", "Unresolved", "Name mismatch"]
+
+
+@pytest.fixture
+async def rekey_reports_session_factory(monkeypatch):
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as db_file:
+        pass
+    database_url = f"sqlite+aiosqlite:///{db_file.name}"
+
+    from alembic import command
+    from alembic.config import Config
+
+    repo_root = Path(__file__).resolve().parents[2]
+    cfg = Config(str(repo_root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(repo_root / "alembic"))
+    os.environ["ALEMBIC_DATABASE_URL"] = database_url
+    try:
+        await __import__("asyncio").to_thread(command.upgrade, cfg, "head")
+    finally:
+        os.environ.pop("ALEMBIC_DATABASE_URL", None)
+
+    from bims_shopify.config import Settings
+
+    monkeypatch.setattr(
+        "bims_shopify.ops.rekey_skus.get_settings",
+        lambda: Settings(database_url=database_url),
+    )
+
+    engine = create_async_engine(database_url, future=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
+        Path(db_file.name).unlink(missing_ok=True)
+
+
+async def test_persist_rekey_report_writes_row_with_tenant_id_and_payload(
+    rekey_reports_session_factory,
+):
+    payload = {"total_variants": 3, "duplicate_target": []}
+
+    await persist_rekey_report(7, payload)
+
+    async with rekey_reports_session_factory() as session:
+        rows = (await session.execute(select(RekeyReportModel))).scalars().all()
+
+    assert len(rows) == 1
+    assert rows[0].tenant_id == 7
+    assert rows[0].payload == payload
+
+
+@respx.mock
+async def test_run_with_report_xlsx_includes_report_path_in_json_summary(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHOPIFY_TOKEN", "shpat_test")
+    monkeypatch.setenv("BIMS_KEY", "bims_secret")
+
+    _mock_graphql_variants(
+        [_variant("gid://shopify/ProductVariant/1", "SKU-100", "gid://shopify/Product/1", "Widget")]
+    )
+    _mock_company6_index(["SKU-100"])
+    _mock_view_lookup({})
+
+    from bims_shopify.ops import rekey_skus as rekey_skus_module
+
+    report_path = tmp_path / "report.xlsx"
+    parser = rekey_skus_module._build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--standalone",
+            "--shop",
+            "acme.myshopify.com",
+            "--shopify-token-env",
+            "SHOPIFY_TOKEN",
+            "--bims-key-env",
+            "BIMS_KEY",
+            "--bims-url",
+            BIMS_URL,
+            "--report-xlsx",
+            str(report_path),
+        ]
+    )
+
+    summary = await rekey_skus_module._run(args)
+
+    assert summary["report_path"] == str(report_path)
+    assert report_path.exists()
+
+
+@respx.mock
+async def test_run_standalone_does_not_persist_rekey_report(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHOPIFY_TOKEN", "shpat_test")
+    monkeypatch.setenv("BIMS_KEY", "bims_secret")
+
+    _mock_graphql_variants(
+        [_variant("gid://shopify/ProductVariant/1", "SKU-100", "gid://shopify/Product/1", "Widget")]
+    )
+    _mock_company6_index(["SKU-100"])
+    _mock_view_lookup({})
+
+    from bims_shopify.ops import rekey_skus as rekey_skus_module
+
+    async def _fail_if_called(*args, **kwargs):
+        raise AssertionError("persist_rekey_report must not be called in standalone mode")
+
+    monkeypatch.setattr(rekey_skus_module, "persist_rekey_report", _fail_if_called)
+
+    parser = rekey_skus_module._build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--standalone",
+            "--shop",
+            "acme.myshopify.com",
+            "--shopify-token-env",
+            "SHOPIFY_TOKEN",
+            "--bims-key-env",
+            "BIMS_KEY",
+            "--bims-url",
+            BIMS_URL,
+        ]
+    )
+
+    await rekey_skus_module._run(args)
+
+
+@respx.mock
+async def test_run_db_mode_persists_rekey_report(tenant, monkeypatch):
+    _mock_graphql_variants(
+        [_variant("gid://shopify/ProductVariant/1", "SKU-100", "gid://shopify/Product/1", "Widget")]
+    )
+    _mock_company6_index(["SKU-100"])
+    _mock_view_lookup({})
+
+    from bims_shopify.ops import rekey_skus as rekey_skus_module
+
+    async def _fake_load_tenant_from_db(tenant_slug: str):
+        return tenant
+
+    calls: list[tuple[int, dict]] = []
+
+    async def _fake_persist(tenant_id: int, payload: dict) -> None:
+        calls.append((tenant_id, payload))
+
+    monkeypatch.setattr(rekey_skus_module, "_load_tenant_from_db", _fake_load_tenant_from_db)
+    monkeypatch.setattr(rekey_skus_module, "persist_rekey_report", _fake_persist)
+
+    parser = rekey_skus_module._build_arg_parser()
+    args = parser.parse_args(["acme"])
+
+    await rekey_skus_module._run(args)
+
+    assert len(calls) == 1
+    assert calls[0][0] == tenant.id
 
 
 @respx.mock

@@ -19,6 +19,7 @@ dependencies = [
     "aiosqlite>=0.20",
     "asyncpg>=0.29",
     "pagopar-sdk>=0.1.1",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]

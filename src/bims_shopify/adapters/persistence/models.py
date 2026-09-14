@@ -74,6 +74,15 @@ class OAuthStateModel(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class RekeyReportModel(Base):
+    __tablename__ = "rekey_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class ProcessedEventModel(Base):
     __tablename__ = "processed_events"
     __table_args__ = (UniqueConstraint("tenant_id", "source", "external_id"),)

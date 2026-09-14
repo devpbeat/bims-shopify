@@ -28,13 +28,18 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+from openpyxl import Workbook
+from openpyxl.styles import Font
+from openpyxl.worksheet.worksheet import Worksheet
 
 from bims_shopify.adapters.bims.client import BIMSAPIError, BIMSClient
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.adapters.persistence.database import create_engine_and_sessionmaker
+from bims_shopify.adapters.persistence.models import RekeyReportModel
 from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
 from bims_shopify.adapters.shopify.client import ShopifyClient, ShopifyGraphQLError
 from bims_shopify.config import get_settings
@@ -318,6 +323,158 @@ async def apply_rewrites(
     return result
 
 
+_HEADER_FONT = Font(bold=True)
+
+
+def _write_header_row(ws: Worksheet, headers: list[str], column_widths: list[int]) -> None:
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = _HEADER_FONT
+    ws.freeze_panes = "A2"
+    for index, width in enumerate(column_widths, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=index).column_letter].width = width
+
+
+def build_report_workbook(
+    result: ScanResult,
+    *,
+    shop_domain: str,
+    tenant_slug: str,
+    scanned_at: datetime,
+) -> Workbook:
+    """Build the full (untruncated) rekey_skus report as an xlsx workbook."""
+    workbook = Workbook()
+
+    summary_ws = workbook.active
+    summary_ws.title = "Summary"
+    _write_header_row(summary_ws, ["Metric", "Value"], [30, 40])
+    summary_rows = [
+        ("total_variants", result.total_variants),
+        ("empty_sku", result.empty_sku),
+        ("already_keyed", result.already_keyed),
+        ("planned_rewrites", len(result.planned_rewrites)),
+        ("name_mismatch", len(result.name_mismatch)),
+        ("unresolved", len(result.unresolved)),
+        ("duplicate_target", len(result.duplicate_target)),
+        ("scanned_at", scanned_at.isoformat()),
+        ("shop_domain", shop_domain),
+        ("tenant_slug", tenant_slug),
+    ]
+    for row in summary_rows:
+        summary_ws.append(row)
+
+    duplicates_ws = workbook.create_sheet("Duplicates")
+    _write_header_row(
+        duplicates_ws,
+        [
+            "product_title",
+            "size/bims_name",
+            "old_sku",
+            "target_code2(new_sku)",
+            "variant_id",
+            "product_id",
+            "KEEP? (YES/NO)",
+        ],
+        [30, 20, 15, 20, 30, 30, 16],
+    )
+    for item in sorted(
+        result.duplicate_target, key=lambda item: (item["product_title"], item["new_sku"])
+    ):
+        duplicates_ws.append(
+            [
+                item["product_title"],
+                item["bims_name"],
+                item["old_sku"],
+                item["new_sku"],
+                item["variant_id"],
+                item["product_id"],
+                None,
+            ]
+        )
+
+    unresolved_ws = workbook.create_sheet("Unresolved")
+    _write_header_row(
+        unresolved_ws,
+        ["product_title", "sku", "variant_id", "ACTION"],
+        [30, 20, 30, 16],
+    )
+    for item in result.unresolved:
+        unresolved_ws.append(
+            [item["product_title"], item["sku"], item["variant_id"], None]
+        )
+
+    name_mismatch_ws = workbook.create_sheet("Name mismatch")
+    _write_header_row(
+        name_mismatch_ws,
+        [
+            "product_title",
+            "bims_name",
+            "old_sku",
+            "proposed_code2",
+            "variant_id",
+            "APPROVE? (YES/NO)",
+        ],
+        [30, 30, 15, 20, 30, 18],
+    )
+    for item in result.name_mismatch:
+        name_mismatch_ws.append(
+            [
+                item["product_title"],
+                item["bims_name"],
+                item["old_sku"],
+                item["new_sku"],
+                item["variant_id"],
+                None,
+            ]
+        )
+
+    return workbook
+
+
+def write_report_xlsx(
+    result: ScanResult,
+    path: str,
+    *,
+    shop_domain: str,
+    tenant_slug: str,
+    scanned_at: datetime,
+) -> None:
+    workbook = build_report_workbook(
+        result, shop_domain=shop_domain, tenant_slug=tenant_slug, scanned_at=scanned_at
+    )
+    workbook.save(path)
+
+
+def _full_result_payload(result: ScanResult) -> dict[str, Any]:
+    """Full, untruncated scan result — used for DB persistence, not stdout."""
+    return {
+        "total_variants": result.total_variants,
+        "empty_sku": result.empty_sku,
+        "already_keyed": result.already_keyed,
+        "planned_rewrites": result.planned_rewrites,
+        "name_mismatch": result.name_mismatch,
+        "unresolved": result.unresolved,
+        "duplicate_target": result.duplicate_target,
+    }
+
+
+async def persist_rekey_report(tenant_id: int, payload: dict[str, Any]) -> None:
+    """Persist the full scan result for a DB-mode tenant into ``rekey_reports``.
+
+    Opens a short-lived engine/session scoped to this single write, kept
+    separate from the tenant-loading session so callers do not need to
+    thread a shared session through the whole scan/apply/rescan flow.
+    """
+    settings = get_settings()
+    engine, session_factory = create_engine_and_sessionmaker(settings)
+    try:
+        async with session_factory() as session:
+            session.add(RekeyReportModel(tenant_id=tenant_id, payload=payload))
+            await session.commit()
+    finally:
+        await engine.dispose()
+
+
 def _build_standalone_tenant(args: argparse.Namespace) -> Tenant:
     missing = [
         flag
@@ -389,6 +546,22 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             summary["apply"] = apply_result.to_summary()
             result = await scan(shopify_client, bims_client, target_company_id=args.company)
             summary["rescan"] = result.to_summary()
+
+        scanned_at = datetime.now(UTC)
+        report_summary = _full_result_payload(result)
+        if args.report_xlsx:
+            write_report_xlsx(
+                result,
+                args.report_xlsx,
+                shop_domain=tenant.shopify_shop_domain,
+                tenant_slug=tenant.slug,
+                scanned_at=scanned_at,
+            )
+            summary["report_path"] = args.report_xlsx
+
+        if not args.standalone and tenant.id is not None:
+            await persist_rekey_report(tenant.id, report_summary)
+
         return summary
     finally:
         await shopify_client.aclose()
@@ -430,6 +603,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="BIMS company id treated as the source-of-truth SKU catalog (default: 6).",
     )
     parser.add_argument("--bims-url", help="BIMS base URL (standalone mode).")
+    parser.add_argument(
+        "--report-xlsx",
+        dest="report_xlsx",
+        help="Write a full (untruncated) xlsx report of the scan result to this path.",
+    )
     return parser
 
 
