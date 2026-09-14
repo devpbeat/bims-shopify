@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bims_shopify.adapters.bims.client import BIMSClient
 from bims_shopify.adapters.bims.erp_adapter import BIMSERPAdapter
+from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.sync_state_repository import (
     SqlAlchemySyncStateRepository,
 )
@@ -75,6 +76,7 @@ async def run_sync(
 
 async def _do_run_sync(tenant, dry_run: bool, session: AsyncSession):
     sync_state_repo = SqlAlchemySyncStateRepository(session)
+    audit = SqlAlchemyAuditLogger(session)
     client = BIMSClient(tenant)
     started_at = datetime.now(UTC)
     try:
@@ -125,6 +127,13 @@ async def _do_run_sync(tenant, dry_run: bool, session: AsyncSession):
                 error=str(exc),
             )
             await sync_state_repo.set_last_error(tenant.id, str(exc))
+            await audit.log(
+                actor="system",
+                action="sync.error",
+                entity="sync_run",
+                tenant_id=tenant.id,
+                payload={"dry_run": dry_run, "error": str(exc)},
+            )
             raise
 
         duration = (datetime.now(UTC) - started_at).total_seconds()
@@ -140,6 +149,17 @@ async def _do_run_sync(tenant, dry_run: bool, session: AsyncSession):
                 skipped_unresolved_stock=report.skipped_unresolved_stock,
                 duration_seconds=duration,
             )
+            await audit.log(
+                actor="system",
+                action="sync.dry_run",
+                entity="sync_run",
+                tenant_id=tenant.id,
+                payload={
+                    "total_products": report.total_products,
+                    "would_update": report.would_update,
+                    "skipped_unresolved_stock": report.skipped_unresolved_stock,
+                },
+            )
             return {"dry_run": True, "report": asdict(report)}
 
         if isinstance(result, NeedsConfirmation):
@@ -152,6 +172,18 @@ async def _do_run_sync(tenant, dry_run: bool, session: AsyncSession):
                 matched_count=result.matched_count,
                 threshold=result.threshold,
                 duration_seconds=duration,
+            )
+            await audit.log(
+                actor="system",
+                action="sync.needs_confirmation",
+                entity="sync_run",
+                tenant_id=tenant.id,
+                payload={
+                    "reason": result.reason,
+                    "zero_count": result.zero_count,
+                    "matched_count": result.matched_count,
+                    "threshold": result.threshold,
+                },
             )
             # last_sync must NOT advance: nothing was pushed.
             return {
@@ -184,6 +216,13 @@ async def _do_run_sync(tenant, dry_run: bool, session: AsyncSession):
             matched=len(deltas),
             updated=len(deltas),
             duration_seconds=duration,
+        )
+        await audit.log(
+            actor="system",
+            action="sync.completed",
+            entity="sync_run",
+            tenant_id=tenant.id,
+            payload={"matched": len(deltas), "updated": len(deltas)},
         )
         return {"status": "ok", "synced_deltas": len(deltas)}
     finally:

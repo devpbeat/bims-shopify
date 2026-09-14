@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
@@ -28,6 +29,12 @@ async def get_tenant_repository(
     settings: Settings = Depends(get_settings),
 ) -> SqlAlchemyTenantRepository:
     return SqlAlchemyTenantRepository(session, SecretBox(settings.fernet_key))
+
+
+async def get_audit_logger(
+    session: AsyncSession = Depends(get_db_session),
+) -> SqlAlchemyAuditLogger:
+    return SqlAlchemyAuditLogger(session)
 
 
 async def require_admin(

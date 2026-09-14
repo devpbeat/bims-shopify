@@ -73,3 +73,19 @@ export interface PendingEntry {
 
 export type PendingQueue = Record<string, PendingEntry>
 
+export type AuditActor = 'admin' | 'portal' | 'system' | 'shopify'
+
+export interface AuditEntry {
+  id: number
+  actor: AuditActor
+  action: string
+  entity: string
+  entity_id: string | null
+  payload: Record<string, unknown> | null
+  created_at: string
+}
+
+export interface AuditLog {
+  entries: AuditEntry[]
+}
+

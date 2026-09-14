@@ -19,6 +19,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bims_shopify.adapters.persistence.audit_repository import (
+    DEFAULT_AUDIT_LIMIT,
+    MAX_AUDIT_LIMIT,
+    SqlAlchemyAuditLogger,
+)
 from bims_shopify.adapters.persistence.rekey_repository import SqlAlchemyRekeyRepository
 from bims_shopify.adapters.persistence.sync_state_repository import (
     SqlAlchemySyncStateRepository,
@@ -31,7 +36,7 @@ from bims_shopify.datetime_utils import ensure_aware_utc
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
-from .deps import get_db_session, get_tenant_repository
+from .deps import get_audit_logger, get_db_session, get_tenant_repository
 
 router = APIRouter(prefix="/api/portal/{slug}", tags=["portal"])
 logger = get_logger(__name__)
@@ -188,6 +193,7 @@ async def post_rekey_resolutions(
     body: ResolutionsIn,
     tenant: Tenant = Depends(get_portal_tenant),
     session: AsyncSession = Depends(get_db_session),
+    audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
 ):
     repo = SqlAlchemyRekeyRepository(session)
     report = await repo.get_latest_report(tenant.id)
@@ -245,6 +251,18 @@ async def post_rekey_resolutions(
                     variant_id=item.variant_id, action=item.action, status=status, error=error
                 )
             )
+            await audit.log(
+                actor="portal",
+                action="rekey.resolution",
+                entity="rekey_resolution",
+                tenant_id=tenant.id,
+                entity_id=item.variant_id,
+                payload={
+                    "report_id": report.id,
+                    "action": item.action,
+                    "status": status,
+                },
+            )
     finally:
         await shopify_client.aclose()
 
@@ -258,3 +276,34 @@ async def get_portal_sync_status(
 ):
     sync_state_repo = SqlAlchemySyncStateRepository(session)
     return await sync_state_repo.get_status(tenant.id)
+
+
+@router.get("/audit")
+async def get_portal_audit_log(
+    tenant: Tenant = Depends(get_portal_tenant),
+    session: AsyncSession = Depends(get_db_session),
+    limit: int = DEFAULT_AUDIT_LIMIT,
+):
+    """Tenant-scoped activity feed for the merchant portal.
+
+    Always scoped to the authenticated tenant (via `get_portal_tenant`) —
+    there is no `tenant` query param, so a valid token can never be used to
+    read another tenant's audit trail.
+    """
+    clamped_limit = max(1, min(limit, MAX_AUDIT_LIMIT))
+    audit_repo = SqlAlchemyAuditLogger(session)
+    entries = await audit_repo.list_entries(tenant_id=tenant.id, limit=clamped_limit)
+    return {
+        "entries": [
+            {
+                "id": entry.id,
+                "actor": entry.actor,
+                "action": entry.action,
+                "entity": entry.entity,
+                "entity_id": entry.entity_id,
+                "payload": entry.payload,
+                "created_at": ensure_aware_utc(entry.created_at).isoformat(),
+            }
+            for entry in entries
+        ]
+    }

@@ -3,7 +3,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -103,6 +113,24 @@ class RekeyResolutionModel(Base):
     status: Mapped[str] = mapped_column(String(40))
     error: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     note: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
+
+
+class AuditLogModel(Base):
+    """Append-only audit trail. See alembic/versions/0009_audit_logs.py."""
+
+    __tablename__ = "audit_logs"
+    __table_args__ = (Index("ix_audit_logs_tenant_id_created_at", "tenant_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("tenants.id"), nullable=True
+    )
+    actor: Mapped[str] = mapped_column(String(40))
+    action: Mapped[str] = mapped_column(String(120))
+    entity: Mapped[str] = mapped_column(String(120))
+    entity_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
 
 

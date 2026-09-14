@@ -1,4 +1,4 @@
-import type { RekeyReport, ResolutionRequest, ResolutionResult, SyncStatus } from './types'
+import type { AuditLog, RekeyReport, ResolutionRequest, ResolutionResult, SyncStatus } from './types'
 
 export class ApiError extends Error {
   status: number
@@ -40,6 +40,10 @@ export function getRekeyReport(slug: string, token: string): Promise<RekeyReport
 
 export function getSyncStatus(slug: string, token: string): Promise<SyncStatus> {
   return portalFetch<SyncStatus>(slug, token, '/sync-status')
+}
+
+export function getAuditLog(slug: string, token: string, limit: number): Promise<AuditLog> {
+  return portalFetch<AuditLog>(slug, token, `/audit?limit=${encodeURIComponent(String(limit))}`)
 }
 
 export function postRekeyResolutions(

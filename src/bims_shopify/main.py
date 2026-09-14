@@ -16,7 +16,16 @@ from bims_shopify.adapters.persistence.database import create_engine_and_session
 from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
-from bims_shopify.api import health, payments, portal, shopify_oauth, sync, tenants, webhooks
+from bims_shopify.api import (
+    audit,
+    health,
+    payments,
+    portal,
+    shopify_oauth,
+    sync,
+    tenants,
+    webhooks,
+)
 from bims_shopify.config import get_settings
 from bims_shopify.logging import configure_logging, get_logger
 from bims_shopify.scheduler import TenantSyncScheduler
@@ -128,6 +137,7 @@ def create_app() -> FastAPI:
     app.include_router(sync.router)
     app.include_router(shopify_oauth.router)
     app.include_router(portal.router)
+    app.include_router(audit.router)
     _mount_portal_spa(app)
     return app
 

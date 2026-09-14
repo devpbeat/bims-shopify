@@ -37,6 +37,7 @@ from openpyxl.styles import Font
 from openpyxl.worksheet.worksheet import Worksheet
 
 from bims_shopify.adapters.bims.client import BIMSAPIError, BIMSClient
+from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.adapters.persistence.database import create_engine_and_sessionmaker
 from bims_shopify.adapters.persistence.models import RekeyReportModel
@@ -458,7 +459,9 @@ def _full_result_payload(result: ScanResult) -> dict[str, Any]:
     }
 
 
-async def persist_rekey_report(tenant_id: int, payload: dict[str, Any]) -> None:
+async def persist_rekey_report(
+    tenant_id: int, payload: dict[str, Any], summary: dict[str, Any] | None = None
+) -> None:
     """Persist the full scan result for a DB-mode tenant into ``rekey_reports``.
 
     Opens a short-lived engine/session scoped to this single write, kept
@@ -471,6 +474,24 @@ async def persist_rekey_report(tenant_id: int, payload: dict[str, Any]) -> None:
         async with session_factory() as session:
             session.add(RekeyReportModel(tenant_id=tenant_id, payload=payload))
             await session.commit()
+
+            audit = SqlAlchemyAuditLogger(session)
+            compact_summary = {
+                "total_variants": payload.get("total_variants"),
+                "planned_rewrites": len(payload.get("planned_rewrites") or []),
+                "name_mismatch": len(payload.get("name_mismatch") or []),
+                "unresolved": len(payload.get("unresolved") or []),
+                "duplicate_target": len(payload.get("duplicate_target") or []),
+            }
+            if summary and "apply" in summary:
+                compact_summary["apply"] = summary["apply"]
+            await audit.log(
+                actor="system",
+                action="rekey.scan_completed",
+                entity="rekey_report",
+                tenant_id=tenant_id,
+                payload=compact_summary,
+            )
     finally:
         await engine.dispose()
 
@@ -560,7 +581,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             summary["report_path"] = args.report_xlsx
 
         if not args.standalone and tenant.id is not None:
-            await persist_rekey_report(tenant.id, report_summary)
+            await persist_rekey_report(tenant.id, report_summary, summary)
 
         return summary
     finally:

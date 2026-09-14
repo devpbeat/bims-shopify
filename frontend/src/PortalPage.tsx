@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { ApiError, getRekeyReport, getSyncStatus, postRekeyResolutions } from './api/client'
 import type { PendingQueue, RekeyReport, Resolution, SyncStatus } from './api/types'
+import { ActivityTab } from './components/ActivityTab'
 import { ApplyFooter } from './components/ApplyFooter'
 import { DuplicatesTab } from './components/DuplicatesTab'
 import { NameMismatchTab } from './components/NameMismatchTab'
@@ -10,7 +11,7 @@ import { TokenGate } from './components/TokenGate'
 import { UnresolvedTab } from './components/UnresolvedTab'
 import { clearToken, loadToken, saveToken } from './session'
 
-type Tab = 'duplicates' | 'unresolved' | 'mismatches'
+type Tab = 'duplicates' | 'unresolved' | 'mismatches' | 'activity'
 
 function tokenFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get('token')
@@ -176,6 +177,9 @@ export function PortalPage() {
         <button type="button" className={tab === 'mismatches' ? 'tab active' : 'tab'} onClick={() => setTab('mismatches')}>
           Name mismatches ({mismatches.length})
         </button>
+        <button type="button" className={tab === 'activity' ? 'tab active' : 'tab'} onClick={() => setTab('activity')}>
+          Activity
+        </button>
       </nav>
 
       <main className="tab-content">
@@ -199,6 +203,7 @@ export function PortalPage() {
             onIgnore={(variantId) => queue(variantId, 'ignore')}
           />
         )}
+        {tab === 'activity' && <ActivityTab slug={slug} token={token} />}
       </main>
 
       <ApplyFooter pendingCount={pendingCount} applying={applying} onApply={handleApply} />

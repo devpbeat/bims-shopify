@@ -8,12 +8,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 
+from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
 from bims_shopify.domain.tenant import PaymentProvider, ReorderStrategy, Tenant
 
-from .deps import get_tenant_repository, require_admin
+from .deps import get_audit_logger, get_tenant_repository, require_admin
 
 router = APIRouter(prefix="/tenants", tags=["tenants"], dependencies=[Depends(require_admin)])
 
@@ -94,10 +95,20 @@ async def list_tenants(repo: SqlAlchemyTenantRepository = Depends(get_tenant_rep
 
 @router.post("", response_model=TenantOut, status_code=201)
 async def create_tenant(
-    body: TenantCreate, repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository)
+    body: TenantCreate,
+    repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
 ):
     tenant = Tenant(id=None, **body.model_dump())
     created = await repo.create(tenant)
+    await audit.log(
+        actor="admin",
+        action="tenant.create",
+        entity="tenant",
+        tenant_id=created.id,
+        entity_id=created.slug,
+        payload={"slug": created.slug},
+    )
     return TenantOut.from_domain(created)
 
 
@@ -111,21 +122,46 @@ async def get_tenant(slug: str, repo: SqlAlchemyTenantRepository = Depends(get_t
 
 @router.put("/{slug}", response_model=TenantOut)
 async def update_tenant(
-    slug: str, body: TenantCreate, repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository)
+    slug: str,
+    body: TenantCreate,
+    repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
 ):
     existing = await repo.get_by_slug(slug)
     if existing is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
     updated = Tenant(id=existing.id, **body.model_dump())
     saved = await repo.update(updated)
+    await audit.log(
+        actor="admin",
+        action="tenant.update",
+        entity="tenant",
+        tenant_id=saved.id,
+        entity_id=saved.slug,
+        payload={"slug": saved.slug},
+    )
     return TenantOut.from_domain(saved)
 
 
 @router.delete("/{slug}", status_code=204)
-async def delete_tenant(slug: str, repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository)):
+async def delete_tenant(
+    slug: str,
+    repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
+):
     existing = await repo.get_by_slug(slug)
     if existing is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # Logged before the delete (not after): audit_logs.tenant_id is a real FK
+    # to tenants.id, so inserting it once the tenant row is gone would fail.
+    await audit.log(
+        actor="admin",
+        action="tenant.delete",
+        entity="tenant",
+        tenant_id=existing.id,
+        entity_id=existing.slug,
+        payload={"slug": existing.slug},
+    )
     await repo.delete(existing.id)
 
 
@@ -135,7 +171,9 @@ class PortalTokenOut(BaseModel):
 
 @router.post("/{slug}/portal-token", response_model=PortalTokenOut)
 async def create_portal_token(
-    slug: str, repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository)
+    slug: str,
+    repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
 ):
     """Mint a new merchant-portal bearer token for this tenant.
 
@@ -150,4 +188,12 @@ async def create_portal_token(
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     await repo.set_portal_token_hash(tenant.id, token_hash)
+    # Never log the token itself, only that a mint happened.
+    await audit.log(
+        actor="admin",
+        action="tenant.portal_token_mint",
+        entity="tenant",
+        tenant_id=tenant.id,
+        entity_id=tenant.slug,
+    )
     return PortalTokenOut(portal_token=token)

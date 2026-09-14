@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from bims_shopify.adapters.bims.client import BIMSClient
 from bims_shopify.adapters.bims.erp_adapter import BIMSERPAdapter
+from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.sync_state_repository import (
     SqlAlchemySyncStateRepository,
     hash_payload,
@@ -205,6 +206,7 @@ async def _process_order_webhook(
     async with session_factory() as session:
         tenant_repo = SqlAlchemyTenantRepository(session, SecretBox(settings.fernet_key))
         sync_state_repo = SqlAlchemySyncStateRepository(session)
+        audit = SqlAlchemyAuditLogger(session)
 
         tenant = await tenant_repo.get_by_slug(tenant_slug)
         if tenant is None or not tenant.active:
@@ -213,6 +215,15 @@ async def _process_order_webhook(
         order_id = str(payload.get("id", ""))
         if not order_id:
             return
+
+        await audit.log(
+            actor="shopify",
+            action="webhook.order_received",
+            entity="order",
+            tenant_id=tenant.id,
+            entity_id=order_id,
+            payload={"topic": topic},
+        )
 
         # Atomically claim this (tenant, source, external_id) via the DB
         # unique constraint. This closes the race where two concurrent
@@ -234,6 +245,13 @@ async def _process_order_webhook(
                 "order_push_disabled",
                 tenant=tenant.slug,
                 order_id=order_id,
+            )
+            await audit.log(
+                actor="shopify",
+                action="webhook.order_push_disabled",
+                entity="order",
+                tenant_id=tenant.id,
+                entity_id=order_id,
             )
             await sync_state_repo.mark_event_status(tenant.id, "shopify_webhook", order_id, "processed")
             return

@@ -698,7 +698,7 @@ async def test_run_db_mode_persists_rekey_report(tenant, monkeypatch):
 
     calls: list[tuple[int, dict]] = []
 
-    async def _fake_persist(tenant_id: int, payload: dict) -> None:
+    async def _fake_persist(tenant_id: int, payload: dict, summary: dict | None = None) -> None:
         calls.append((tenant_id, payload))
 
     monkeypatch.setattr(rekey_skus_module, "_load_tenant_from_db", _fake_load_tenant_from_db)

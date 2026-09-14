@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bims_shopify.adapters.bims.client import BIMSAPIError, BIMSClient
+from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.oauth_state_repository import (
     SqlAlchemyOAuthStateRepository,
 )
@@ -37,7 +38,7 @@ from bims_shopify.config import Settings
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
-from .deps import get_db_session, get_settings, get_tenant_repository
+from .deps import get_audit_logger, get_db_session, get_settings, get_tenant_repository
 
 router = APIRouter(prefix="/shopify", tags=["shopify-oauth"])
 logger = get_logger(__name__)
@@ -237,6 +238,7 @@ async def callback(
     settings: Settings = Depends(get_settings),
     state_repo: SqlAlchemyOAuthStateRepository = Depends(get_oauth_state_repository),
     tenant_repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
 ) -> HTMLResponse:
     if not is_valid_shop_domain(shop):
         raise HTTPException(status_code=400, detail="Invalid shop domain")
@@ -276,6 +278,14 @@ async def callback(
         tenant = await tenant_repo.update(tenant)
 
     logger.info("shopify_app_installed", shop=shop, slug=tenant.slug, created=created)
+    await audit.log(
+        actor="system",
+        action="oauth.install_linked",
+        entity="tenant",
+        tenant_id=tenant.id,
+        entity_id=tenant.slug,
+        payload={"shop": shop, "created": created},
+    )
 
     activated_now = False
     has_bims_config = bool(tenant.bims_base_url) and bool(tenant.bims_api_key)
@@ -286,6 +296,13 @@ async def callback(
             activated_now = True
             logger.info(
                 "tenant_auto_activated", tenant_slug=tenant.slug, tenant_id=tenant.id
+            )
+            await audit.log(
+                actor="system",
+                action="oauth.install_activated",
+                entity="tenant",
+                tenant_id=tenant.id,
+                entity_id=tenant.slug,
             )
         else:
             logger.info(
