@@ -104,6 +104,20 @@ body {
   background: var(--color-bg);
 }
 
+.btn-link {
+  background: none;
+  border: none;
+  color: var(--color-primary);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 4px 0;
+  text-align: center;
+}
+
+.btn-link:hover {
+  text-decoration: underline;
+}
+
 .portal-page {
   max-width: 1040px;
   margin: 0 auto;

@@ -9,12 +9,21 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
+from bims_shopify.adapters.persistence.portal_user_repository import (
+    SqlAlchemyPortalUserRepository,
+)
 from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
+from bims_shopify.api.portal_auth import hash_password
 from bims_shopify.domain.tenant import PaymentProvider, ReorderStrategy, Tenant
 
-from .deps import get_audit_logger, get_tenant_repository, require_admin
+from .deps import (
+    get_audit_logger,
+    get_portal_user_repository,
+    get_tenant_repository,
+    require_admin,
+)
 
 router = APIRouter(prefix="/tenants", tags=["tenants"], dependencies=[Depends(require_admin)])
 
@@ -197,3 +206,68 @@ async def create_portal_token(
         entity_id=tenant.slug,
     )
     return PortalTokenOut(portal_token=token)
+
+
+class PortalUserIn(BaseModel):
+    email: str
+    password: str
+    name: str | None = None
+
+    @field_validator("email")
+    @classmethod
+    def _normalize_email(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if "@" not in normalized:
+            raise ValueError("email must be a valid address")
+        return normalized
+
+    @field_validator("password")
+    @classmethod
+    def _validate_password(cls, value: str) -> str:
+        if len(value) < 8:
+            raise ValueError("password must be at least 8 characters")
+        return value
+
+
+class PortalUserOut(BaseModel):
+    id: int
+    email: str
+    name: str | None
+    active: bool
+
+
+@router.post("/{slug}/portal-users", response_model=PortalUserOut, status_code=201)
+async def create_portal_user(
+    slug: str,
+    body: PortalUserIn,
+    tenant_repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    user_repo: SqlAlchemyPortalUserRepository = Depends(get_portal_user_repository),
+    audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
+):
+    """Create or update (upsert by email) a named per-user portal login.
+
+    Upserting rather than erroring on an existing email lets an admin reset
+    a forgotten password by re-posting the same email with a new one. The
+    password is bcrypt-hashed before it ever touches the repository/DB —
+    the plaintext is never persisted or logged, only that a
+    create/update happened (see the audit entry below).
+    """
+    tenant = await tenant_repo.get_by_slug(slug)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    password_hash = hash_password(body.password)
+    user = await user_repo.upsert(
+        tenant_id=tenant.id,
+        email=body.email,
+        password_hash=password_hash,
+        name=body.name,
+    )
+    await audit.log(
+        actor="admin",
+        action="tenant.portal_user_upsert",
+        entity="portal_user",
+        tenant_id=tenant.id,
+        entity_id=body.email,
+    )
+    return PortalUserOut(id=user.id, email=user.email, name=user.name, active=user.active)

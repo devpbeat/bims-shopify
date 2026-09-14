@@ -5,6 +5,7 @@ import type { PendingQueue, RekeyReport, Resolution, SyncStatus } from './api/ty
 import { ActivityTab } from './components/ActivityTab'
 import { ApplyFooter } from './components/ApplyFooter'
 import { DuplicatesTab } from './components/DuplicatesTab'
+import { LoginCard } from './components/LoginCard'
 import { NameMismatchTab } from './components/NameMismatchTab'
 import { PortalHeader } from './components/PortalHeader'
 import { TokenGate } from './components/TokenGate'
@@ -28,6 +29,15 @@ export function PortalPage() {
   const [tab, setTab] = useState<Tab>('duplicates')
   const [pending, setPending] = useState<PendingQueue>({})
   const [applying, setApplying] = useState(false)
+  const [useAccessKey, setUseAccessKey] = useState(false)
+
+  function handleLogout() {
+    clearToken(slug)
+    setToken(null)
+    setReport(null)
+    setSyncStatus(null)
+    setUseAccessKey(false)
+  }
 
   useEffect(() => {
     if (token) saveToken(slug, token)
@@ -51,7 +61,7 @@ export function PortalPage() {
         if (err instanceof ApiError && err.status === 401) {
           clearToken(slug)
           setToken(null)
-          setError('Session expired or invalid token. Please re-enter your access token.')
+          setError('Session expired or invalid credentials. Please sign in again.')
         } else {
           setError(err instanceof Error ? err.message : 'Failed to load the rekey report.')
         }
@@ -121,13 +131,26 @@ export function PortalPage() {
   }
 
   if (!token) {
+    if (useAccessKey) {
+      return (
+        <TokenGate
+          slug={slug}
+          onSubmit={(value) => {
+            saveToken(slug, value)
+            setToken(value)
+          }}
+          onBackToLogin={() => setUseAccessKey(false)}
+        />
+      )
+    }
     return (
-      <TokenGate
+      <LoginCard
         slug={slug}
-        onSubmit={(value) => {
+        onSuccess={(value) => {
           saveToken(slug, value)
           setToken(value)
         }}
+        onUseAccessKey={() => setUseAccessKey(true)}
       />
     )
   }
@@ -163,7 +186,12 @@ export function PortalPage() {
 
   return (
     <div className="portal-page">
-      <PortalHeader slug={slug} reportDate={report.created_at} syncStatus={syncStatus} />
+      <PortalHeader
+        slug={slug}
+        reportDate={report.created_at}
+        syncStatus={syncStatus}
+        onLogout={handleLogout}
+      />
 
       {error && <p className="error-banner">{error}</p>}
 

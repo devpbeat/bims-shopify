@@ -4,9 +4,10 @@ import type { FormEvent } from 'react'
 interface TokenGateProps {
   slug: string
   onSubmit: (token: string) => void
+  onBackToLogin?: () => void
 }
 
-export function TokenGate({ slug, onSubmit }: TokenGateProps) {
+export function TokenGate({ slug, onSubmit, onBackToLogin }: TokenGateProps) {
   const [value, setValue] = useState('')
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -30,6 +31,11 @@ export function TokenGate({ slug, onSubmit }: TokenGateProps) {
         <button type="submit" className="btn btn-primary" disabled={!value.trim()}>
           Continue
         </button>
+        {onBackToLogin && (
+          <button type="button" className="btn-link" onClick={onBackToLogin}>
+            Back to email + password login
+          </button>
+        )}
       </form>
     </div>
   )

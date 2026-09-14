@@ -134,6 +134,27 @@ class AuditLogModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
 
 
+class PortalUserModel(Base):
+    """A named per-user login for the merchant self-service portal.
+
+    See alembic/versions/0010_portal_users.py. Coexists with the older
+    shared ``tenants.portal_token_hash`` access key; either credential is
+    accepted by the portal API (see ``api/portal.py``).
+    """
+
+    __tablename__ = "portal_users"
+    __table_args__ = (UniqueConstraint("tenant_id", "email", name="uq_portal_users_tenant_email"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, ForeignKey("tenants.id"), index=True)
+    email: Mapped[str] = mapped_column(String(255))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ProcessedEventModel(Base):
     __tablename__ = "processed_events"
     __table_args__ = (UniqueConstraint("tenant_id", "source", "external_id"),)

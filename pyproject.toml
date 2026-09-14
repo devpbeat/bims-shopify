@@ -20,6 +20,8 @@ dependencies = [
     "asyncpg>=0.29",
     "pagopar-sdk>=0.1.1",
     "openpyxl>=3.1",
+    "bcrypt>=4.1",
+    "pyjwt>=2.9",
 ]
 
 [project.optional-dependencies]

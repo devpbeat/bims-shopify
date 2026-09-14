@@ -34,6 +34,32 @@ async function portalFetch<T>(slug: string, token: string, path: string, init?: 
   return (await response.json()) as T
 }
 
+export interface LoginResponse {
+  token: string
+  expires_in: number
+}
+
+export async function login(slug: string, email: string, password: string): Promise<LoginResponse> {
+  const response = await fetch(`/api/portal/${encodeURIComponent(slug)}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  })
+
+  if (!response.ok) {
+    let detail = response.statusText
+    try {
+      const body = (await response.json()) as { detail?: string }
+      if (body.detail) detail = body.detail
+    } catch {
+      // ignore non-JSON error bodies
+    }
+    throw new ApiError(response.status, detail)
+  }
+
+  return (await response.json()) as LoginResponse
+}
+
 export function getRekeyReport(slug: string, token: string): Promise<RekeyReport> {
   return portalFetch<RekeyReport>(slug, token, '/rekey-report')
 }

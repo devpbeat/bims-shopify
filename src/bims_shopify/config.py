@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     shopify_api_secret: str = ""
     public_base_url: str = "https://mystoresync.ignitesolutions.click"
 
+    # Signing secret for merchant-portal login session JWTs (see
+    # api/portal_auth.py). Left blank by default so it can be *derived*
+    # from `fernet_key` (already a per-deployment secret) rather than
+    # forcing yet another env var everywhere; set it explicitly to rotate
+    # session signing independently of the encryption key.
+    portal_session_secret: str = ""
+
 
 def get_settings() -> Settings:
     return Settings()

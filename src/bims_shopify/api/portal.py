@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from datetime import timedelta
 from typing import Any, Literal
 
 import httpx
@@ -24,6 +25,9 @@ from bims_shopify.adapters.persistence.audit_repository import (
     MAX_AUDIT_LIMIT,
     SqlAlchemyAuditLogger,
 )
+from bims_shopify.adapters.persistence.portal_user_repository import (
+    SqlAlchemyPortalUserRepository,
+)
 from bims_shopify.adapters.persistence.rekey_repository import SqlAlchemyRekeyRepository
 from bims_shopify.adapters.persistence.sync_state_repository import (
     SqlAlchemySyncStateRepository,
@@ -32,11 +36,27 @@ from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
 from bims_shopify.adapters.shopify.client import ShopifyClient, ShopifyGraphQLError
+from bims_shopify.api.portal_auth import (
+    LoginRateLimiter,
+    SessionTokenError,
+    create_session_token,
+    decode_session_token,
+    get_portal_session_secret,
+    verify_password,
+)
+from bims_shopify.config import Settings
 from bims_shopify.datetime_utils import ensure_aware_utc
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
-from .deps import get_audit_logger, get_db_session, get_tenant_repository
+from .deps import (
+    get_audit_logger,
+    get_db_session,
+    get_login_rate_limiter,
+    get_portal_user_repository,
+    get_settings,
+    get_tenant_repository,
+)
 
 router = APIRouter(prefix="/api/portal/{slug}", tags=["portal"])
 logger = get_logger(__name__)
@@ -55,13 +75,24 @@ async def get_portal_tenant(
     slug: str,
     authorization: str = Header(default=""),
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    settings: Settings = Depends(get_settings),
 ) -> Tenant:
     """Resolve and authenticate the tenant addressed by the ``{slug}`` path segment.
 
     Looking the tenant up by slug (rather than by reversing the token) means
-    a valid token for tenant A can never be accepted against tenant B's
-    slug — there is no cross-tenant lookup path, only a same-tenant hash
-    comparison.
+    a valid credential for tenant A can never be accepted against tenant
+    B's slug — there is no cross-tenant lookup path, only same-tenant
+    comparisons.
+
+    Two credential shapes are accepted on the same ``Authorization: Bearer``
+    header, checked in order:
+
+    1. The legacy shared portal access token, hashed and compared against
+       ``tenants.portal_token_hash`` with ``hmac.compare_digest``.
+    2. A per-user session JWT minted by ``POST /api/portal/{slug}/login``,
+       verified for signature, expiry, and that its ``tenant_id`` claim
+       matches *this* tenant (a valid session for store A can't be replayed
+       against store B's slug even though JWTs aren't tenant-scoped by URL).
     """
     tenant = await repo.get_by_slug(slug)
     if tenant is None:
@@ -74,14 +105,89 @@ async def get_portal_tenant(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     stored_hash = await repo.get_portal_token_hash(tenant.id)
-    if not stored_hash:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if stored_hash:
+        presented_hash = hashlib.sha256(presented.encode("utf-8")).hexdigest()
+        if hmac.compare_digest(presented_hash, stored_hash):
+            return tenant
 
-    presented_hash = hashlib.sha256(presented.encode("utf-8")).hexdigest()
-    if not hmac.compare_digest(presented_hash, stored_hash):
+    secret = get_portal_session_secret(settings)
+    try:
+        claims = decode_session_token(secret=secret, token=presented)
+    except SessionTokenError:
+        raise HTTPException(status_code=401, detail="Unauthorized") from None
+
+    if claims.get("tenant_id") != tenant.id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     return tenant
+
+
+class PortalLoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class PortalLoginOut(BaseModel):
+    token: str
+    expires_in: int
+
+
+@router.post("/login", response_model=PortalLoginOut)
+async def portal_login(
+    slug: str,
+    body: PortalLoginIn,
+    tenant_repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    user_repo: SqlAlchemyPortalUserRepository = Depends(get_portal_user_repository),
+    audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
+    settings: Settings = Depends(get_settings),
+    limiter: LoginRateLimiter = Depends(get_login_rate_limiter),
+):
+    """Email + password login for the merchant portal.
+
+    Rate-limited per ``{slug}+{email}`` (5/min) to blunt naive
+    credential-stuffing without needing a shared cache. Never logs the
+    password — only success/failure and the email are recorded, in both
+    structured logs and the audit trail.
+    """
+    email = body.email.strip().lower()
+    rate_key = f"{slug}:{email}"
+    if not limiter.check(rate_key):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again shortly.")
+
+    tenant = await tenant_repo.get_by_slug(slug)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    user = await user_repo.get_by_tenant_and_email(tenant.id, email)
+    if (
+        user is None
+        or not user.active
+        or user.tenant_id != tenant.id
+        or not verify_password(body.password, user.password_hash)
+    ):
+        logger.warning("portal_login_failed", tenant_slug=slug, email=email)
+        await audit.log(
+            actor="portal",
+            action="portal.login_failed",
+            entity="portal_user",
+            tenant_id=tenant.id,
+            entity_id=email,
+        )
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    await user_repo.record_login(user.id)
+    logger.info("portal_login_success", tenant_slug=slug, email=email, user_id=user.id)
+    await audit.log(
+        actor="portal",
+        action="portal.login_success",
+        entity="portal_user",
+        tenant_id=tenant.id,
+        entity_id=email,
+    )
+
+    secret = get_portal_session_secret(settings)
+    token = create_session_token(secret=secret, tenant_id=tenant.id, user_id=user.id)
+    return PortalLoginOut(token=token, expires_in=int(timedelta(hours=24).total_seconds()))
 
 
 def _index_report_variants(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
