@@ -52,6 +52,7 @@ BIMS_LOOKUP_CONCURRENCY = 5
 BIMS_LOOKUP_TIMEOUT_SECONDS = 30.0
 NAME_MATCH_RATIO_THRESHOLD = 0.6
 _DETAIL_PREVIEW_COUNT = 10
+MAX_SCAN_AGE_SECONDS = 24 * 60 * 60
 
 _TRAILING_PARENTHETICAL_RE = re.compile(r"\s*\([^()]*\)\s*$")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -102,6 +103,11 @@ class ScanResult:
     name_mismatch: list[dict[str, Any]] = field(default_factory=list)
     unresolved: list[dict[str, Any]] = field(default_factory=list)
     duplicate_target: list[dict[str, Any]] = field(default_factory=list)
+    #: product_id -> number of variants seen for that product in this scan.
+    #: Used by auto-resolve to detect "last remaining variant" before deleting.
+    product_variant_counts: dict[str, int] = field(default_factory=dict)
+    #: company-6 code2 -> BIMS company-1 Product id, when the index row carried one.
+    code2_to_bims_id: dict[str, str] = field(default_factory=dict)
 
     def to_summary(self) -> dict[str, Any]:
         return {
@@ -139,9 +145,38 @@ class ApplyResult:
         }
 
 
-async def fetch_company_code2_set(bims_client: BIMSClient, company_id: int) -> set[str]:
-    """Page through BIMS ``/api/products/index.json`` and collect every ``code2``."""
+@dataclass
+class AutoResolveResult:
+    """Outcome of :func:`auto_resolve_conflicts`."""
+
+    survivors: list[dict[str, Any]] = field(default_factory=list)
+    deleted_variants: list[dict[str, Any]] = field(default_factory=list)
+    drafted_products: list[dict[str, Any]] = field(default_factory=list)
+    mismatch_rewrites: list[dict[str, Any]] = field(default_factory=list)
+    failures: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_summary(self) -> dict[str, Any]:
+        return {
+            "survivors": len(self.survivors),
+            "deleted_variants": len(self.deleted_variants),
+            "drafted_products": len(self.drafted_products),
+            "mismatch_rewrites": len(self.mismatch_rewrites),
+            "failures": self.failures,
+        }
+
+
+async def fetch_company6_catalog(
+    bims_client: BIMSClient, company_id: int
+) -> tuple[set[str], dict[str, str]]:
+    """Page through BIMS ``/api/products/index.json`` for the company-6 catalog.
+
+    Returns ``(code2_values, code2_to_bims_id)``: the full set of valid
+    ``code2`` SKUs, and a mapping from ``code2`` to the BIMS product ``id``
+    that owns it (when the index row carries an id). The id map is used by
+    auto-resolve to break duplicate-target ties deterministically.
+    """
     code2_values: set[str] = set()
+    code2_to_bims_id: dict[str, str] = {}
     offset = 0
     while True:
         body = await bims_client.get(
@@ -160,9 +195,18 @@ async def fetch_company_code2_set(bims_client: BIMSClient, company_id: int) -> s
             code2 = product.get("code2")
             if code2 not in (None, ""):
                 code2_values.add(str(code2))
+                bims_id = product.get("id")
+                if bims_id not in (None, ""):
+                    code2_to_bims_id[str(code2)] = str(bims_id)
         if len(page) < BIMS_INDEX_PAGE_LIMIT:
-            return code2_values
+            return code2_values, code2_to_bims_id
         offset += BIMS_INDEX_PAGE_LIMIT
+
+
+async def fetch_company_code2_set(bims_client: BIMSClient, company_id: int) -> set[str]:
+    """Backwards-compatible wrapper returning just the ``code2`` set."""
+    code2_values, _ = await fetch_company6_catalog(bims_client, company_id)
+    return code2_values
 
 
 async def _lookup_bims_product(
@@ -200,16 +244,22 @@ async def scan(
 ) -> ScanResult:
     """Run the full decision-table scan over every Shopify variant."""
     result = ScanResult()
-    code2_set = await fetch_company_code2_set(bims_client, target_company_id)
+    code2_set, code2_to_bims_id = await fetch_company6_catalog(bims_client, target_company_id)
+    result.code2_to_bims_id = code2_to_bims_id
 
     pending: list[dict[str, Any]] = []
     async for variant in shopify_client.iter_all_variants():
         result.total_variants += 1
         sku = (variant.get("sku") or "").strip()
         product = variant.get("product") or {}
+        product_id = product.get("id")
+        if product_id is not None:
+            result.product_variant_counts[product_id] = (
+                result.product_variant_counts.get(product_id, 0) + 1
+            )
         entry = {
             "variant_id": variant.get("id"),
-            "product_id": product.get("id"),
+            "product_id": product_id,
             "product_title": product.get("title") or "",
             "sku": sku,
         }
@@ -321,6 +371,171 @@ async def apply_rewrites(
                     "variant_ids": [item["variant_id"] for item in items],
                 }
             )
+    return result
+
+
+async def auto_resolve_conflicts(
+    shopify_client: ShopifyClient,
+    scan_result: ScanResult,
+) -> AutoResolveResult:
+    """Automatically resolve conflicts in duplicate_target and unresolved entries.
+
+    For duplicate_target groups:
+    - Find survivor: variant whose old_sku matches code2_to_bims_id[code2], else lowest variant_id
+    - Rewrite survivor's SKU to the code2 value
+    - Delete all sibling variants
+
+    For unresolved entries:
+    - Delete the variant
+    - If deleting the last variant of a product, set product status to DRAFT instead
+
+    For name_mismatch entries:
+    - Include them in the SKU rewrite batch
+    """
+    result = AutoResolveResult()
+
+    # Rewrite batch: survivors from duplicates + all name_mismatches
+    rewrite_batch: list[dict[str, Any]] = []
+
+    # Group duplicate_target by new_sku (each group has multiple variants targeting same code2)
+    duplicates_by_sku: dict[str, list[dict[str, Any]]] = {}
+    for item in scan_result.duplicate_target:
+        duplicates_by_sku.setdefault(item["new_sku"], []).append(item)
+
+    # Process each duplicate group
+    for code2, variants in duplicates_by_sku.items():
+        # Find survivor: prefer one whose old_sku equals the BIMS product id for this code2
+        bims_id = scan_result.code2_to_bims_id.get(code2)
+        survivor = None
+        if bims_id:
+            for v in variants:
+                if v["old_sku"] == bims_id:
+                    survivor = v
+                    break
+        # If no BIMS id match, use lowest variant_id
+        if survivor is None:
+            survivor = min(variants, key=lambda v: v["variant_id"])
+
+        result.survivors.append(
+            {
+                "variant_id": survivor["variant_id"],
+                "product_id": survivor["product_id"],
+                "old_sku": survivor["old_sku"],
+                "new_sku": survivor["new_sku"],
+            }
+        )
+        rewrite_batch.append(
+            {
+                "variant_id": survivor["variant_id"],
+                "product_id": survivor["product_id"],
+                "new_sku": survivor["new_sku"],
+            }
+        )
+
+        # Delete all siblings
+        product_id = survivor["product_id"]
+        siblings_to_delete = [v["variant_id"] for v in variants if v["variant_id"] != survivor["variant_id"]]
+        for variant_id in siblings_to_delete:
+            result.deleted_variants.append({"variant_id": variant_id, "product_id": product_id})
+
+        # Delete sibling variants
+        try:
+            await shopify_client.bulk_delete_variants(product_id, siblings_to_delete)
+        except (ShopifyGraphQLError, httpx.TransportError, TimeoutError) as exc:
+            for variant_id in siblings_to_delete:
+                result.failures.append(
+                    {
+                        "variant_id": variant_id,
+                        "error": f"delete: {type(exc).__name__}: {exc}",
+                    }
+                )
+
+    # Process unresolved entries: delete or draft
+    by_product_unresolved: dict[str, list[dict[str, Any]]] = {}
+    for item in scan_result.unresolved:
+        product_id = item.get("product_id")
+        if product_id:
+            by_product_unresolved.setdefault(product_id, []).append(item)
+
+    for product_id, unresolved_variants in by_product_unresolved.items():
+        total_variants = scan_result.product_variant_counts.get(product_id, 0)
+        variants_to_delete = unresolved_variants
+
+        # Check if deleting all these variants would remove the last variant of the product
+        if len(variants_to_delete) >= total_variants:
+            # Keep one variant, set product to DRAFT
+            variants_to_delete = variants_to_delete[1:]  # Delete all but first
+
+            try:
+                await shopify_client.set_product_status(product_id, "DRAFT")
+                result.drafted_products.append({"product_id": product_id})
+            except (ShopifyGraphQLError, httpx.TransportError, TimeoutError) as exc:
+                result.failures.append(
+                    {
+                        "product_id": product_id,
+                        "error": f"draft: {type(exc).__name__}: {exc}",
+                    }
+                )
+        else:
+            # Safe to delete all unresolved variants
+            pass
+
+        # Delete the variants
+        if variants_to_delete:
+            try:
+                await shopify_client.bulk_delete_variants(
+                    product_id, [v["variant_id"] for v in variants_to_delete]
+                )
+                for variant in variants_to_delete:
+                    result.deleted_variants.append(
+                        {"variant_id": variant["variant_id"], "product_id": product_id}
+                    )
+            except (ShopifyGraphQLError, httpx.TransportError, TimeoutError) as exc:
+                for variant in variants_to_delete:
+                    result.failures.append(
+                        {
+                            "variant_id": variant["variant_id"],
+                            "error": f"delete: {type(exc).__name__}: {exc}",
+                        }
+                    )
+
+    # Add name_mismatch entries to rewrite batch
+    for item in scan_result.name_mismatch:
+        result.mismatch_rewrites.append(
+            {
+                "variant_id": item["variant_id"],
+                "product_id": item["product_id"],
+                "old_sku": item["old_sku"],
+                "new_sku": item["new_sku"],
+            }
+        )
+        rewrite_batch.append(
+            {
+                "variant_id": item["variant_id"],
+                "product_id": item["product_id"],
+                "new_sku": item["new_sku"],
+            }
+        )
+
+    # Apply all rewrites (survivors + name_mismatches)
+    if rewrite_batch:
+        by_product_rewrite: dict[str, list[dict[str, Any]]] = {}
+        for item in rewrite_batch:
+            by_product_rewrite.setdefault(item["product_id"], []).append(item)
+
+        for product_id, items in by_product_rewrite.items():
+            variants_input = [{"id": item["variant_id"], "sku": item["new_sku"]} for item in items]
+            try:
+                await shopify_client.bulk_update_variants(product_id, variants_input)
+            except (ShopifyGraphQLError, httpx.TransportError, TimeoutError) as exc:
+                for item in items:
+                    result.failures.append(
+                        {
+                            "variant_id": item["variant_id"],
+                            "error": f"rewrite: {type(exc).__name__}: {exc}",
+                        }
+                    )
+
     return result
 
 
@@ -550,6 +765,9 @@ async def _load_tenant_from_db(tenant_slug: str) -> Tenant:
 
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.auto_resolve and not args.apply:
+        raise SystemExit("--auto-resolve requires --apply")
+
     if args.standalone:
         tenant = _build_standalone_tenant(args)
     else:
@@ -562,9 +780,16 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     try:
         result = await scan(shopify_client, bims_client, target_company_id=args.company)
         summary = result.to_summary()
-        if args.apply and result.planned_rewrites:
-            apply_result = await apply_rewrites(shopify_client, result.planned_rewrites)
-            summary["apply"] = apply_result.to_summary()
+        if args.apply:
+            if args.auto_resolve:
+                # Auto-resolve all conflicts
+                auto_resolve_result = await auto_resolve_conflicts(shopify_client, result)
+                summary["auto_resolved"] = auto_resolve_result.to_summary()
+            elif result.planned_rewrites:
+                # Apply only safe rewrites
+                apply_result = await apply_rewrites(shopify_client, result.planned_rewrites)
+                summary["apply"] = apply_result.to_summary()
+
             result = await scan(shopify_client, bims_client, target_company_id=args.company)
             summary["rescan"] = result.to_summary()
 
@@ -602,6 +827,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help="Execute planned rewrites (default: dry run, prints the plan only).",
+    )
+    parser.add_argument(
+        "--auto-resolve",
+        action="store_true",
+        help="Automatically resolve duplicates, unresolved, and name_mismatch entries (requires --apply).",
     )
     parser.add_argument(
         "--standalone",

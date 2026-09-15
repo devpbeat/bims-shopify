@@ -77,6 +77,15 @@ mutation ProductVariantsBulkDelete($productId: ID!, $variantsIds: [ID!]!) {
 }
 """
 
+_PRODUCT_UPDATE_STATUS = """
+mutation ProductUpdateStatus($input: ProductInput!) {
+  productUpdate(input: $input) {
+    product { id status }
+    userErrors { field message }
+  }
+}
+"""
+
 _GET_ORDER = """
 query GetOrder($id: ID!) {
   order(id: $id) {
@@ -263,6 +272,13 @@ class ShopifyClient:
             _VARIANTS_BULK_DELETE, {"productId": product_id, "variantsIds": variant_ids}
         )
         self._check_user_errors(data.get("productVariantsBulkDelete"))
+
+    async def set_product_status(self, product_id: str, status: str) -> None:
+        """Set a product's status (e.g. 'DRAFT', 'ACTIVE') via productUpdate."""
+        data = await self._graphql(
+            _PRODUCT_UPDATE_STATUS, {"input": {"id": product_id, "status": status}}
+        )
+        self._check_user_errors(data.get("productUpdate"))
 
 
 class ShopifyGraphQLError(RuntimeError):

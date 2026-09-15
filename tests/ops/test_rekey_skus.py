@@ -25,6 +25,7 @@ from bims_shopify.adapters.shopify.client import ShopifyClient
 from bims_shopify.ops.rekey_skus import (
     ScanResult,
     apply_rewrites,
+    auto_resolve_conflicts,
     build_report_workbook,
     partition_duplicate_targets,
     persist_rekey_report,
@@ -745,3 +746,249 @@ async def test_bims_company6_index_pagination_collects_code2_across_pages(tenant
 
     assert result.already_keyed == 1
     assert result.unresolved == []
+
+
+def _bulk_delete_result() -> dict:
+    return {
+        "data": {
+            "productVariantsBulkDelete": {
+                "product": {"id": "gid://shopify/Product/1"},
+                "userErrors": [],
+            }
+        }
+    }
+
+
+def _product_update_result() -> dict:
+    return {
+        "data": {
+            "productUpdate": {
+                "product": {"id": "gid://shopify/Product/1", "status": "DRAFT"},
+                "userErrors": [],
+            }
+        }
+    }
+
+
+@respx.mock
+async def test_auto_resolve_selects_survivor_by_code2_to_bims_id_match(tenant):
+    """Survivor in duplicate group is the variant whose old_sku matches code2_to_bims_id."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "ProductVariantsBulkDelete" in body["query"]:
+            return httpx.Response(200, json=_bulk_delete_result())
+        elif "ProductVariantsBulkUpdate" in body["query"]:
+            variant_ids = [v["id"] for v in body["variables"]["variants"]]
+            return httpx.Response(200, json=_bulk_update_result(variant_ids))
+        raise AssertionError(f"unexpected operation: {body['query']}")
+
+    respx.post(GRAPHQL_URL).mock(side_effect=responder)
+
+    shopify_client = ShopifyClient(tenant)
+    result = ScanResult(total_variants=3)
+    result.code2_to_bims_id = {"SKU-DUP": "bims-123"}
+    result.product_variant_counts = {"gid://shopify/Product/1": 2}
+    result.duplicate_target = [
+        {
+            "variant_id": "gid://shopify/ProductVariant/1",
+            "product_id": "gid://shopify/Product/1",
+            "product_title": "Widget",
+            "old_sku": "bims-123",  # This matches code2_to_bims_id, so this is survivor
+            "new_sku": "SKU-DUP",
+            "bims_name": "Widget",
+        },
+        {
+            "variant_id": "gid://shopify/ProductVariant/2",
+            "product_id": "gid://shopify/Product/1",
+            "product_title": "Widget",
+            "old_sku": "other-sku",
+            "new_sku": "SKU-DUP",
+            "bims_name": "Widget",
+        },
+    ]
+
+    ar_result = await auto_resolve_conflicts(shopify_client, result)
+
+    assert len(ar_result.survivors) == 1
+    assert ar_result.survivors[0]["variant_id"] == "gid://shopify/ProductVariant/1"
+    assert ar_result.survivors[0]["old_sku"] == "bims-123"
+    assert len(ar_result.deleted_variants) == 1
+    assert ar_result.deleted_variants[0]["variant_id"] == "gid://shopify/ProductVariant/2"
+
+
+@respx.mock
+async def test_auto_resolve_selects_survivor_by_lowest_variant_id_fallback(tenant):
+    """When code2_to_bims_id doesn't match any old_sku, survivor is variant with lowest variant_id."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "ProductVariantsBulkDelete" in body["query"]:
+            return httpx.Response(200, json=_bulk_delete_result())
+        elif "ProductVariantsBulkUpdate" in body["query"]:
+            variant_ids = [v["id"] for v in body["variables"]["variants"]]
+            return httpx.Response(200, json=_bulk_update_result(variant_ids))
+        raise AssertionError(f"unexpected operation: {body['query']}")
+
+    respx.post(GRAPHQL_URL).mock(side_effect=responder)
+
+    shopify_client = ShopifyClient(tenant)
+    result = ScanResult(total_variants=3)
+    result.code2_to_bims_id = {"SKU-DUP": "nonexistent-bims-id"}
+    result.product_variant_counts = {"gid://shopify/Product/1": 2}
+    result.duplicate_target = [
+        {
+            "variant_id": "gid://shopify/ProductVariant/99",
+            "product_id": "gid://shopify/Product/1",
+            "product_title": "Widget",
+            "old_sku": "sku-a",
+            "new_sku": "SKU-DUP",
+            "bims_name": "Widget",
+        },
+        {
+            "variant_id": "gid://shopify/ProductVariant/1",
+            "product_id": "gid://shopify/Product/1",
+            "product_title": "Widget",
+            "old_sku": "sku-b",
+            "new_sku": "SKU-DUP",
+            "bims_name": "Widget",
+        },
+    ]
+
+    ar_result = await auto_resolve_conflicts(shopify_client, result)
+
+    # Lowest variant_id is "gid://shopify/ProductVariant/1"
+    assert len(ar_result.survivors) == 1
+    assert ar_result.survivors[0]["variant_id"] == "gid://shopify/ProductVariant/1"
+
+
+@respx.mock
+async def test_auto_resolve_deletes_unresolved_variants(tenant):
+    """Unresolved variants are deleted."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "ProductVariantsBulkDelete" in body["query"]:
+            return httpx.Response(200, json=_bulk_delete_result())
+        raise AssertionError(f"unexpected operation: {body['query']}")
+
+    respx.post(GRAPHQL_URL).mock(side_effect=responder)
+
+    shopify_client = ShopifyClient(tenant)
+    result = ScanResult(total_variants=2)
+    result.product_variant_counts = {"gid://shopify/Product/1": 2}
+    result.unresolved = [
+        {
+            "variant_id": "gid://shopify/ProductVariant/1",
+            "product_id": "gid://shopify/Product/1",
+            "product_title": "Unknown Product",
+            "sku": "unknown-sku",
+        }
+    ]
+
+    ar_result = await auto_resolve_conflicts(shopify_client, result)
+
+    assert len(ar_result.deleted_variants) == 1
+    assert ar_result.deleted_variants[0]["variant_id"] == "gid://shopify/ProductVariant/1"
+    assert len(ar_result.drafted_products) == 0
+
+
+@respx.mock
+async def test_auto_resolve_drafts_product_when_last_variant_would_be_deleted(tenant):
+    """When all unresolved variants are the only variants of a product, set product to DRAFT instead."""
+
+    delete_calls: list = []
+    draft_calls: list = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "ProductVariantsBulkDelete" in body["query"]:
+            delete_calls.append(body["variables"])
+            return httpx.Response(200, json=_bulk_delete_result())
+        elif "ProductUpdateStatus" in body["query"]:
+            draft_calls.append(body["variables"])
+            return httpx.Response(200, json=_product_update_result())
+        raise AssertionError(f"unexpected operation: {body['query']}")
+
+    respx.post(GRAPHQL_URL).mock(side_effect=responder)
+
+    shopify_client = ShopifyClient(tenant)
+    result = ScanResult(total_variants=1)
+    result.product_variant_counts = {"gid://shopify/Product/1": 1}
+    result.unresolved = [
+        {
+            "variant_id": "gid://shopify/ProductVariant/1",
+            "product_id": "gid://shopify/Product/1",
+            "product_title": "Unknown Product",
+            "sku": "unknown-sku",
+        }
+    ]
+
+    ar_result = await auto_resolve_conflicts(shopify_client, result)
+
+    assert len(ar_result.drafted_products) == 1
+    assert ar_result.drafted_products[0]["product_id"] == "gid://shopify/Product/1"
+    # Verify draft was called before delete (or at least was called)
+    assert len(draft_calls) >= 1
+
+
+@respx.mock
+async def test_auto_resolve_includes_name_mismatch_in_rewrite_batch(tenant):
+    """Name mismatch entries are included in the rewrite batch."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "ProductVariantsBulkUpdate" in body["query"]:
+            variant_ids = [v["id"] for v in body["variables"]["variants"]]
+            return httpx.Response(200, json=_bulk_update_result(variant_ids))
+        raise AssertionError(f"unexpected operation: {body['query']}")
+
+    respx.post(GRAPHQL_URL).mock(side_effect=responder)
+
+    shopify_client = ShopifyClient(tenant)
+    result = ScanResult(total_variants=1)
+    result.name_mismatch = [
+        {
+            "variant_id": "gid://shopify/ProductVariant/1",
+            "product_id": "gid://shopify/Product/1",
+            "product_title": "Red Sneakers",
+            "old_sku": "12345",
+            "new_sku": "SKU-999",
+            "bims_name": "Blue Widget",
+        }
+    ]
+
+    ar_result = await auto_resolve_conflicts(shopify_client, result)
+
+    assert len(ar_result.mismatch_rewrites) == 1
+    assert ar_result.mismatch_rewrites[0]["new_sku"] == "SKU-999"
+
+
+@respx.mock
+async def test_auto_resolve_without_apply_exits_with_error(monkeypatch):
+    """--auto-resolve without --apply must raise SystemExit."""
+    monkeypatch.setenv("SHOPIFY_TOKEN", "shpat_test")
+    monkeypatch.setenv("BIMS_KEY", "bims_secret")
+
+    from bims_shopify.ops import rekey_skus as rekey_skus_module
+
+    parser = rekey_skus_module._build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--standalone",
+            "--shop",
+            "acme.myshopify.com",
+            "--shopify-token-env",
+            "SHOPIFY_TOKEN",
+            "--bims-key-env",
+            "BIMS_KEY",
+            "--bims-url",
+            BIMS_URL,
+            "--auto-resolve",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        await rekey_skus_module._run(args)
+
+    assert "--auto-resolve requires --apply" in str(exc_info.value)
