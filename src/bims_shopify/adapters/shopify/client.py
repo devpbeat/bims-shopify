@@ -77,6 +77,39 @@ mutation ProductVariantsBulkDelete($productId: ID!, $variantsIds: [ID!]!) {
 }
 """
 
+_PRODUCTS_COUNT = """
+query ProductsCount {
+  productsCount { count }
+}
+"""
+
+_LIST_ALL_PRODUCTS = """
+query ListAllProducts($cursor: String) {
+  products(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes { id title }
+  }
+}
+"""
+
+_PRODUCT_DELETE = """
+mutation ProductDelete($input: ProductDeleteInput!) {
+  productDelete(input: $input, synchronous: true) {
+    deletedProductId
+    userErrors { field message }
+  }
+}
+"""
+
+_PRODUCT_SET = """
+mutation ProductSet($input: ProductSetInput!) {
+  productSet(input: $input, synchronous: true) {
+    product { id title }
+    userErrors { field message code }
+  }
+}
+"""
+
 _PRODUCT_UPDATE_STATUS = """
 mutation ProductUpdateStatus($input: ProductInput!) {
   productUpdate(input: $input) {
@@ -279,6 +312,36 @@ class ShopifyClient:
             _PRODUCT_UPDATE_STATUS, {"input": {"id": product_id, "status": status}}
         )
         self._check_user_errors(data.get("productUpdate"))
+
+    async def products_count(self) -> int:
+        """Return the total number of products in the shop via productsCount."""
+        data = await self._graphql(_PRODUCTS_COUNT, {})
+        return int(data["productsCount"]["count"])
+
+    async def iter_all_products(self) -> AsyncIterator[dict[str, Any]]:
+        """Page through every product in the shop, yielding ``{id, title}`` nodes."""
+        cursor: str | None = None
+        while True:
+            data = await self._graphql(_LIST_ALL_PRODUCTS, {"cursor": cursor})
+            connection = data["products"]
+            for node in connection["nodes"]:
+                yield node
+            page_info = connection["pageInfo"]
+            if not page_info["hasNextPage"]:
+                return
+            cursor = page_info["endCursor"]
+
+    async def delete_product(self, product_id: str) -> None:
+        """Delete a single product (and all its variants) via productDelete."""
+        data = await self._graphql(_PRODUCT_DELETE, {"input": {"id": product_id}})
+        self._check_user_errors(data.get("productDelete"))
+
+    async def product_set(self, product_input: dict[str, Any]) -> dict[str, Any] | None:
+        """Create or update a product (with options + variants in one call) via productSet."""
+        data = await self._graphql(_PRODUCT_SET, {"input": product_input})
+        result = data.get("productSet")
+        self._check_user_errors(result)
+        return (result or {}).get("product")
 
 
 class ShopifyGraphQLError(RuntimeError):
