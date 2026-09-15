@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react'
 import { getAuditLog } from '../api/client'
 import type { AuditEntry } from '../api/types'
+import { useT } from '../i18n'
 
 const PAGE_SIZE = 25
 
-function formatDateTime(value: string): string {
+function formatDateTime(value: string, locale: string): string {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
-  return date.toLocaleString()
+  return date.toLocaleString(locale === 'es' ? 'es-419' : 'en-US')
 }
 
 function summarizeDetail(entry: AuditEntry): string {
@@ -23,6 +24,7 @@ interface ActivityTabProps {
 }
 
 export function ActivityTab({ slug, token }: ActivityTabProps) {
+  const { t, locale } = useT()
   const [entries, setEntries] = useState<AuditEntry[]>([])
   const [limit, setLimit] = useState(PAGE_SIZE)
   const [loading, setLoading] = useState(false)
@@ -38,7 +40,7 @@ export function ActivityTab({ slug, token }: ActivityTabProps) {
         if (!cancelled) setEntries(log.entries)
       })
       .catch((err: unknown) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load activity.')
+        if (!cancelled) setError(err instanceof Error ? err.message : t.common.loadFailed)
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
@@ -47,10 +49,10 @@ export function ActivityTab({ slug, token }: ActivityTabProps) {
     return () => {
       cancelled = true
     }
-  }, [slug, token, limit])
+  }, [slug, token, limit, t.common.loadFailed])
 
   if (loading && entries.length === 0) {
-    return <p className="muted">Loading activity…</p>
+    return <p className="muted">{t.common.loadingActivity}</p>
   }
 
   if (error) {
@@ -58,7 +60,7 @@ export function ActivityTab({ slug, token }: ActivityTabProps) {
   }
 
   if (entries.length === 0) {
-    return <p className="empty-state">No activity recorded yet.</p>
+    return <p className="empty-state">{t.common.noActivity}</p>
   }
 
   return (
@@ -66,16 +68,16 @@ export function ActivityTab({ slug, token }: ActivityTabProps) {
       <table className="data-table">
         <thead>
           <tr>
-            <th>Time</th>
-            <th>Actor</th>
-            <th>Action</th>
-            <th>Detail</th>
+            <th>{t.activity.colTime}</th>
+            <th>{t.activity.colActor}</th>
+            <th>{t.activity.colAction}</th>
+            <th>{t.activity.colDetail}</th>
           </tr>
         </thead>
         <tbody>
           {entries.map((entry) => (
             <tr key={entry.id}>
-              <td>{formatDateTime(entry.created_at)}</td>
+              <td>{formatDateTime(entry.created_at, locale)}</td>
               <td>
                 <span className={`badge badge-actor-${entry.actor}`}>{entry.actor}</span>
               </td>
@@ -93,7 +95,7 @@ export function ActivityTab({ slug, token }: ActivityTabProps) {
           onClick={() => setLimit((prev) => prev + PAGE_SIZE)}
           disabled={loading}
         >
-          {loading ? 'Loading…' : 'Load more'}
+          {loading ? t.common.loading : t.common.loadMore}
         </button>
       )}
     </div>

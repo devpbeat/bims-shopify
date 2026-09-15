@@ -4,12 +4,15 @@ import { ApiError, getRekeyReport, getSyncStatus, postRekeyResolutions } from '.
 import type { PendingQueue, RekeyReport, Resolution, SyncStatus } from './api/types'
 import { ActivityTab } from './components/ActivityTab'
 import { ApplyFooter } from './components/ApplyFooter'
+import { AutoReconcileBanner } from './components/AutoReconcileBanner'
 import { DuplicatesTab } from './components/DuplicatesTab'
+import { HelpModal } from './components/HelpModal'
 import { LoginCard } from './components/LoginCard'
 import { NameMismatchTab } from './components/NameMismatchTab'
 import { PortalHeader } from './components/PortalHeader'
 import { TokenGate } from './components/TokenGate'
 import { UnresolvedTab } from './components/UnresolvedTab'
+import { useT } from './i18n'
 import { clearToken, loadToken, saveToken } from './session'
 
 type Tab = 'duplicates' | 'unresolved' | 'mismatches' | 'activity'
@@ -19,6 +22,7 @@ function tokenFromUrl(): string | null {
 }
 
 export function PortalPage() {
+  const { t } = useT()
   const { slug = '' } = useParams<{ slug: string }>()
   const [token, setToken] = useState<string | null>(() => tokenFromUrl() ?? loadToken(slug))
   const [report, setReport] = useState<RekeyReport | null>(null)
@@ -30,6 +34,7 @@ export function PortalPage() {
   const [pending, setPending] = useState<PendingQueue>({})
   const [applying, setApplying] = useState(false)
   const [useAccessKey, setUseAccessKey] = useState(false)
+  const [guideOpen, setGuideOpen] = useState(false)
 
   function handleLogout() {
     clearToken(slug)
@@ -61,9 +66,9 @@ export function PortalPage() {
         if (err instanceof ApiError && err.status === 401) {
           clearToken(slug)
           setToken(null)
-          setError('Session expired or invalid credentials. Please sign in again.')
+          setError(t.common.sessionExpired)
         } else {
-          setError(err instanceof Error ? err.message : 'Failed to load the rekey report.')
+          setError(err instanceof Error ? err.message : t.common.loadFailed)
         }
       })
       .finally(() => {
@@ -124,7 +129,7 @@ export function PortalPage() {
         if (result.status !== 'failed') unqueue(result.variant_id)
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to apply resolutions.')
+      setError(err instanceof Error ? err.message : t.common.applyFailed)
     } finally {
       setApplying(false)
     }
@@ -158,7 +163,7 @@ export function PortalPage() {
   if (loading && !report) {
     return (
       <div className="centered-page">
-        <p>Loading rekey report…</p>
+        <p>{t.common.loadingReport}</p>
       </div>
     )
   }
@@ -174,7 +179,7 @@ export function PortalPage() {
   if (!report) {
     return (
       <div className="centered-page">
-        <p className="empty-state">No rekey report found for this tenant.</p>
+        <p className="empty-state">{t.common.noReport}</p>
       </div>
     )
   }
@@ -183,6 +188,9 @@ export function PortalPage() {
   const duplicates = payload.duplicate_target ?? []
   const unresolved = payload.unresolved ?? []
   const mismatches = payload.name_mismatch ?? []
+
+  const guideSection =
+    tab === 'unresolved' ? t.help.unresolved : tab === 'mismatches' ? t.help.mismatches : t.help.duplicates
 
   return (
     <div className="portal-page">
@@ -195,18 +203,21 @@ export function PortalPage() {
 
       {error && <p className="error-banner">{error}</p>}
 
+      <AutoReconcileBanner onViewGuide={() => setGuideOpen(true)} />
+      {guideOpen && <HelpModal section={guideSection} onClose={() => setGuideOpen(false)} />}
+
       <nav className="tabs">
         <button type="button" className={tab === 'duplicates' ? 'tab active' : 'tab'} onClick={() => setTab('duplicates')}>
-          Duplicates ({duplicates.length})
+          {t.tabs.duplicates} ({duplicates.length})
         </button>
         <button type="button" className={tab === 'unresolved' ? 'tab active' : 'tab'} onClick={() => setTab('unresolved')}>
-          Unresolved ({unresolved.length})
+          {t.tabs.unresolved} ({unresolved.length})
         </button>
         <button type="button" className={tab === 'mismatches' ? 'tab active' : 'tab'} onClick={() => setTab('mismatches')}>
-          Name mismatches ({mismatches.length})
+          {t.tabs.mismatches} ({mismatches.length})
         </button>
         <button type="button" className={tab === 'activity' ? 'tab active' : 'tab'} onClick={() => setTab('activity')}>
-          Activity
+          {t.tabs.activity}
         </button>
       </nav>
 

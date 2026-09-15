@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
 import { ApiError, login } from '../api/client'
+import { useT } from '../i18n'
+import { LanguageToggle } from './LanguageToggle'
 
 interface LoginCardProps {
   slug: string
@@ -9,6 +11,7 @@ interface LoginCardProps {
 }
 
 export function LoginCard({ slug, onSuccess, onUseAccessKey }: LoginCardProps) {
+  const { t } = useT()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -24,11 +27,11 @@ export function LoginCard({ slug, onSuccess, onUseAccessKey }: LoginCardProps) {
       onSuccess(token)
     } catch (err) {
       if (err instanceof ApiError && err.status === 429) {
-        setError('Too many login attempts. Please wait a minute and try again.')
+        setError(t.login.tooManyAttempts)
       } else if (err instanceof ApiError && err.status === 401) {
-        setError('Invalid email or password.')
+        setError(t.login.invalidCredentials)
       } else {
-        setError(err instanceof Error ? err.message : 'Login failed.')
+        setError(err instanceof Error ? err.message : t.login.loginFailedGeneric)
       }
     } finally {
       setSubmitting(false)
@@ -38,19 +41,22 @@ export function LoginCard({ slug, onSuccess, onUseAccessKey }: LoginCardProps) {
   return (
     <div className="centered-page">
       <form className="token-card" onSubmit={handleSubmit}>
-        <h1>Store portal</h1>
-        <p className="muted">Sign in to &ldquo;{slug}&rdquo; with your email and password.</p>
+        <div className="token-card-top">
+          <h1>{t.login.title}</h1>
+          <LanguageToggle />
+        </div>
+        <p className="muted">{t.login.subtitle(slug)}</p>
         <input
           type="email"
           autoFocus
-          placeholder="Email"
+          placeholder={t.login.emailPlaceholder}
           value={email}
           autoComplete="username"
           onChange={(event) => setEmail(event.target.value)}
         />
         <input
           type="password"
-          placeholder="Password"
+          placeholder={t.login.passwordPlaceholder}
           value={password}
           autoComplete="current-password"
           onChange={(event) => setPassword(event.target.value)}
@@ -61,10 +67,10 @@ export function LoginCard({ slug, onSuccess, onUseAccessKey }: LoginCardProps) {
           className="btn btn-primary"
           disabled={submitting || !email.trim() || !password}
         >
-          {submitting ? 'Signing in…' : 'Sign in'}
+          {submitting ? t.common.signingIn : t.common.signIn}
         </button>
         <button type="button" className="btn-link" onClick={onUseAccessKey}>
-          Have an access key?
+          {t.common.haveAccessKey}
         </button>
       </form>
     </div>

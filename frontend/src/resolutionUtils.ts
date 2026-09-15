@@ -1,4 +1,5 @@
 import type { Resolution } from './api/types'
+import type { Messages } from './i18n/types'
 
 /** Latest resolution for a variant, if the report already has one. */
 export function findResolution(resolutions: Resolution[], variantId: string): Resolution | undefined {
@@ -11,16 +12,16 @@ export function isLocked(resolutions: Resolution[], variantId: string): boolean 
   return resolution !== undefined && resolution.status !== 'failed'
 }
 
-export function statusLabel(status: string): string {
+export function statusLabel(status: string, t: Messages): string {
   switch (status) {
     case 'applied':
-      return 'Applied'
+      return t.status.applied
     case 'recorded':
-      return 'Recorded'
+      return t.status.recorded
     case 'failed':
-      return 'Failed'
+      return t.status.failed
     case 'already_resolved':
-      return 'Already resolved'
+      return t.status.already_resolved
     default:
       return status
   }

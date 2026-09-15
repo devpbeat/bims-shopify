@@ -1,5 +1,7 @@
+import { useT } from '../i18n'
 import { statusLabel } from '../resolutionUtils'
 
 export function StatusBadge({ status }: { status: string }) {
-  return <span className={`badge badge-${status}`}>{statusLabel(status)}</span>
+  const { t } = useT()
+  return <span className={`badge badge-${status}`}>{statusLabel(status, t)}</span>
 }

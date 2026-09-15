@@ -1,5 +1,7 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
+import { useT } from '../i18n'
+import { LanguageToggle } from './LanguageToggle'
 
 interface TokenGateProps {
   slug: string
@@ -8,6 +10,7 @@ interface TokenGateProps {
 }
 
 export function TokenGate({ slug, onSubmit, onBackToLogin }: TokenGateProps) {
+  const { t } = useT()
   const [value, setValue] = useState('')
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -19,21 +22,24 @@ export function TokenGate({ slug, onSubmit, onBackToLogin }: TokenGateProps) {
   return (
     <div className="centered-page">
       <form className="token-card" onSubmit={handleSubmit}>
-        <h1>Store portal</h1>
-        <p className="muted">Enter the access token for &ldquo;{slug}&rdquo; to continue.</p>
+        <div className="token-card-top">
+          <h1>{t.login.title}</h1>
+          <LanguageToggle />
+        </div>
+        <p className="muted">{t.login.accessKeyPrompt(slug)}</p>
         <input
           type="password"
           autoFocus
-          placeholder="Portal access token"
+          placeholder={t.login.accessKeyPlaceholder}
           value={value}
           onChange={(event) => setValue(event.target.value)}
         />
         <button type="submit" className="btn btn-primary" disabled={!value.trim()}>
-          Continue
+          {t.common.continueLabel}
         </button>
         {onBackToLogin && (
           <button type="button" className="btn-link" onClick={onBackToLogin}>
-            Back to email + password login
+            {t.common.backToLogin}
           </button>
         )}
       </form>
