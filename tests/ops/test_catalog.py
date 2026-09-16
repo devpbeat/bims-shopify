@@ -118,8 +118,14 @@ def test_build_product_set_input_with_size_option():
 def test_build_product_set_input_single_variant_no_options():
     group = group_rows([BimsRow("1", "Mug", "SKU-MUG", 5000)]).groups[0]
     payload = build_product_set_input(group, status="ACTIVE")
-    assert "productOptions" not in payload
-    assert payload["variants"] == [{"sku": "SKU-MUG", "price": "5000"}]
+    assert payload["productOptions"] == [{"name": "Title", "values": [{"name": "Default Title"}]}]
+    assert payload["variants"] == [
+        {
+            "sku": "SKU-MUG",
+            "price": "5000",
+            "optionValues": [{"optionName": "Title", "name": "Default Title"}],
+        }
+    ]
 
 
 # -- idempotent skip / apply isolation ----------------------------------------

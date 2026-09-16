@@ -255,7 +255,16 @@ def build_product_set_input(group: ProductGroup, *, status: str) -> dict[str, An
         ]
     else:
         variant = group.variants[0]
-        product_input["variants"] = [{"sku": variant.sku, "price": str(variant.price)}]
+        product_input["productOptions"] = [
+            {"name": "Title", "values": [{"name": "Default Title"}]}
+        ]
+        product_input["variants"] = [
+            {
+                "sku": variant.sku,
+                "price": str(variant.price),
+                "optionValues": [{"optionName": "Title", "name": "Default Title"}],
+            }
+        ]
     return product_input
 
 
