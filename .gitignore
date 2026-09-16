@@ -20,3 +20,4 @@ htmlcov/
 
 # Local development override (published ports, no Traefik) — never deploy it
 docker-compose.override.yml
+*.log
