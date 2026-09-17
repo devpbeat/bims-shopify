@@ -99,6 +99,49 @@ def test_group_rows_splits_groups_over_100_variants():
         assert len(group.variants) <= 100
 
 
+def test_group_rows_dedupes_same_size_duplicates_keeps_first_and_reports_shadowed():
+    rows = [
+        BimsRow("1", "Shirt (S)", "SKU-S", 1000),
+        BimsRow("2", "Shirt (M)", "SKU-M1", 1000),
+        BimsRow("3", "Shirt (M)", "SKU-M2", 1000),
+        BimsRow("4", "Shirt (L)", "SKU-L", 1000),
+    ]
+    report = group_rows(rows)
+    assert len(report.groups) == 1
+    group = report.groups[0]
+    # First "(M)" occurrence wins; the duplicate is dropped, not the whole product.
+    assert {v.sku for v in group.variants} == {"SKU-S", "SKU-M1", "SKU-L"}
+    assert report.shadowed_size_duplicates == [
+        {"title": "Shirt", "size": "M", "kept_sku": "SKU-M1", "shadowed_skus": ["SKU-M2"]}
+    ]
+
+
+def test_group_rows_dedupes_default_title_collision_for_no_suffix_rows():
+    rows = [
+        BimsRow("1", "Mug", "SKU-MUG1", 5000),
+        BimsRow("2", "Mug", "SKU-MUG2", 5000),
+    ]
+    report = group_rows(rows)
+    assert len(report.groups) == 1
+    group = report.groups[0]
+    assert not group.has_size_option
+    assert [v.sku for v in group.variants] == ["SKU-MUG1"]
+    assert report.shadowed_size_duplicates == [
+        {"title": "Mug", "size": "Default", "kept_sku": "SKU-MUG1", "shadowed_skus": ["SKU-MUG2"]}
+    ]
+
+
+def test_group_rows_multi_size_without_duplicates_is_unaffected():
+    rows = [
+        BimsRow("1", "Shirt (S)", "SKU-S", 1000),
+        BimsRow("2", "Shirt (M)", "SKU-M", 1000),
+        BimsRow("3", "Shirt (L)", "SKU-L", 1000),
+    ]
+    report = group_rows(rows)
+    assert report.shadowed_size_duplicates == []
+    assert {v.sku for v in report.groups[0].variants} == {"SKU-S", "SKU-M", "SKU-L"}
+
+
 # -- productSet payload shape -------------------------------------------------
 
 

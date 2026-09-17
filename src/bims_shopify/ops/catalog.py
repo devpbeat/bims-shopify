@@ -108,6 +108,7 @@ class GroupingReport:
     duplicate_code2: list[dict[str, Any]] = field(default_factory=list)
     filtered_out: int = 0
     split_products: list[dict[str, Any]] = field(default_factory=list)
+    shadowed_size_duplicates: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _is_truthy(value: Any) -> bool:
@@ -147,6 +148,46 @@ def filter_and_dedupe_rows(raw_rows: list[dict[str, Any]]) -> tuple[list[BimsRow
     return list(seen.values()), duplicates
 
 
+def _option_value_for(variant: VariantRow) -> str:
+    """The Shopify option value a variant would be built with (size or 'Default')."""
+    return variant.size or "Default"
+
+
+def _dedupe_variants_by_option_value(
+    title: str, variants: list[VariantRow]
+) -> tuple[list[VariantRow], list[dict[str, Any]]]:
+    """Drop variants that collide on the same option value within a product group.
+
+    BIMS can carry duplicate article rows that share the same size token (or,
+    for no-suffix rows, the same normalized title collapsing to "Default").
+    Shopify's ``productSet`` rejects the whole product if two variants have
+    identical ``optionValues``, so we keep the first occurrence (catalog
+    order) and report the rest as shadowed duplicates instead of failing the
+    entire product.
+    """
+    kept: list[VariantRow] = []
+    kept_by_value: dict[str, VariantRow] = {}
+    shadowed_by_value: dict[str, list[str]] = {}
+    for variant in variants:
+        value = _option_value_for(variant)
+        if value not in kept_by_value:
+            kept_by_value[value] = variant
+            kept.append(variant)
+        else:
+            shadowed_by_value.setdefault(value, []).append(variant.sku)
+
+    shadowed_entries = [
+        {
+            "title": title,
+            "size": value,
+            "kept_sku": kept_by_value[value].sku,
+            "shadowed_skus": skus,
+        }
+        for value, skus in shadowed_by_value.items()
+    ]
+    return kept, shadowed_entries
+
+
 def group_rows(rows: list[BimsRow]) -> GroupingReport:
     """Group BIMS rows into Shopify products, splitting oversized groups."""
     report = GroupingReport()
@@ -166,8 +207,9 @@ def group_rows(rows: list[BimsRow]) -> GroupingReport:
         )
 
     for key in order:
-        variants = by_base[key]
         title = titles[key]
+        variants, shadowed_entries = _dedupe_variants_by_option_value(title, by_base[key])
+        report.shadowed_size_duplicates.extend(shadowed_entries)
         if len(variants) <= MAX_VARIANTS_PER_PRODUCT:
             report.groups.append(ProductGroup(title=title, variants=variants))
             continue
@@ -404,6 +446,10 @@ async def _run_import(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any
             "variants": sum(len(g.variants) for g in groups),
             "duplicate_code2": len(duplicates),
             "split_products": grouping.split_products,
+            "shadowed_size_duplicates": {
+                "count": len(grouping.shadowed_size_duplicates),
+                "items": grouping.shadowed_size_duplicates,
+            },
         }
 
         if not args.apply:
