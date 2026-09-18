@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+from dataclasses import replace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -55,6 +56,53 @@ class TenantCreate(BaseModel):
     @field_validator("bims_timezone")
     @classmethod
     def _validate_bims_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Unknown IANA timezone: {value!r}") from exc
+        return value
+
+
+class TenantPatch(BaseModel):
+    """Partial update payload: every field is optional and omitted fields
+    are left untouched, including secrets (bims_api_key,
+    shopify_access_token, shopify_webhook_secret)."""
+
+    slug: str | None = None
+    bims_base_url: str | None = None
+    bims_api_key: str | None = None
+    shopify_shop_domain: str | None = None
+    shopify_access_token: str | None = None
+    shopify_webhook_secret: str | None = None
+    shopify_location_id: str | None = None
+    bims_posale_id: int | None = None
+    bims_warehouse_id: int | None = None
+    bims_warehouse_ids: list[int] | None = None
+    bims_company_id: int | None = None
+    bims_currency_id: int | None = None
+    bims_payment_method_id: int | None = None
+    default_customer_contact_id: int | None = None
+    reorder_threshold: float | None = None
+    reorder_strategy: ReorderStrategy | None = None
+    bims_timezone: str | None = None
+    payment_provider: PaymentProvider | None = None
+    provider_config: dict | None = None
+    field_mappings: dict | None = None
+    active: bool | None = None
+    push_orders_to_bims: bool | None = None
+
+    @field_validator("bims_api_key", "shopify_access_token", "shopify_webhook_secret")
+    @classmethod
+    def _reject_empty_secret(cls, value: str | None) -> str | None:
+        if value == "":
+            raise ValueError("secret fields cannot be set to an empty string")
+        return value
+
+    @field_validator("bims_timezone")
+    @classmethod
+    def _validate_bims_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
         try:
             ZoneInfo(value)
         except ZoneInfoNotFoundError as exc:
@@ -148,6 +196,37 @@ async def update_tenant(
         tenant_id=saved.id,
         entity_id=saved.slug,
         payload={"slug": saved.slug},
+    )
+    return TenantOut.from_domain(saved)
+
+
+@router.patch("/{slug}", response_model=TenantOut)
+async def patch_tenant(
+    slug: str,
+    body: TenantPatch,
+    repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
+):
+    """Partially update a tenant: only fields present in the payload are
+    changed. Omitted fields — especially secrets (bims_api_key,
+    shopify_access_token, shopify_webhook_secret) — are left untouched, so
+    callers never need to resend secrets they aren't rotating.
+    """
+    existing = await repo.get_by_slug(slug)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    changes = body.model_dump(exclude_unset=True)
+    updated = replace(existing, **changes)
+    saved = await repo.update(updated)
+    await audit.log(
+        actor="admin",
+        action="tenant.update",
+        entity="tenant",
+        tenant_id=saved.id,
+        entity_id=saved.slug,
+        # Field NAMES only, never values, so secrets never land in the audit log.
+        payload={"fields": sorted(changes.keys())},
     )
     return TenantOut.from_domain(saved)
 
