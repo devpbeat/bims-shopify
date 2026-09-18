@@ -56,6 +56,7 @@ async def run_sync(
     tenant_slug: str,
     request: Request,
     dry_run: bool = True,
+    full: bool = False,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     session: AsyncSession = _Depends(get_db_session),
 ):
@@ -71,10 +72,10 @@ async def run_sync(
         )
 
     async with lock:
-        return await _do_run_sync(tenant, dry_run, session)
+        return await _do_run_sync(tenant, dry_run, session, full=full)
 
 
-async def _do_run_sync(tenant, dry_run: bool, session: AsyncSession):
+async def _do_run_sync(tenant, dry_run: bool, session: AsyncSession, full: bool = False):
     sync_state_repo = SqlAlchemySyncStateRepository(session)
     audit = SqlAlchemyAuditLogger(session)
     client = BIMSClient(tenant)
@@ -85,7 +86,9 @@ async def _do_run_sync(tenant, dry_run: bool, session: AsyncSession):
         use_case = SyncInventoryToShopify(erp, storefront)
 
         last_run = await sync_state_repo.get_last_run(tenant.id)
-        since = (last_run - INCREMENTAL_OVERLAP) if last_run else None
+        # full=True forces a complete catalog pull (e.g. initial stock push
+        # after a catalog import), ignoring the incremental watermark.
+        since = None if full else ((last_run - INCREMENTAL_OVERLAP) if last_run else None)
 
         if since is not None:
             try:
