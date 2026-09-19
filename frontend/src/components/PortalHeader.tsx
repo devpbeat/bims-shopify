@@ -7,9 +7,18 @@ interface PortalHeaderProps {
   reportDate: string | null
   syncStatus: SyncStatus | null
   onLogout: () => void
+  isOperator: boolean
+  onOperatorClick: () => void
 }
 
-export function PortalHeader({ slug, reportDate, syncStatus, onLogout }: PortalHeaderProps) {
+export function PortalHeader({
+  slug,
+  reportDate,
+  syncStatus,
+  onLogout,
+  isOperator,
+  onOperatorClick,
+}: PortalHeaderProps) {
   const { t, locale } = useT()
 
   function formatDate(value: string | null | undefined): string {
@@ -35,6 +44,9 @@ export function PortalHeader({ slug, reportDate, syncStatus, onLogout }: PortalH
           <span>{formatDate(syncStatus?.last_run as string | undefined)}</span>
         </div>
         <LanguageToggle />
+        <button type="button" className="btn-link" onClick={onOperatorClick}>
+          {isOperator ? t.operator.exit : t.operator.entryLabel}
+        </button>
         <button type="button" className="btn btn-secondary" onClick={onLogout}>
           {t.common.logout}
         </button>

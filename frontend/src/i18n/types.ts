@@ -115,4 +115,53 @@ export interface Messages {
     unresolved: HelpSection
     mismatches: HelpSection
   }
+  operator: {
+    entryLabel: string
+    gateTitle: string
+    gatePrompt: (slug: string) => string
+    tokenPlaceholder: string
+    enter: string
+    invalidToken: string
+    exit: string
+    tabLabel: string
+    jobHistoryTitle: string
+    noJobs: string
+    resultLabel: string
+    runButton: string
+    running: string
+    jobAlreadyRunning: string
+    confirmTitle: string
+    confirmCancel: string
+    confirmProceed: string
+    advancedDisclosure: string
+    dryRun: string
+    apply: string
+    onlyWithStock: string
+    publish: string
+    limit: string
+    force: string
+    forceWarning: string
+    autoResolve: string
+    typeDomainToConfirm: (domain: string) => string
+    domainMismatch: string
+    commands: {
+      status: { title: string; description: string }
+      import: { title: string; description: string; confirmApply: string }
+      dedupe: { title: string; description: string; confirmApply: string }
+      wipe: { title: string; description: string; confirmApply: string }
+      rekey: { title: string; description: string; confirmApply: string }
+    }
+    jobStatus: {
+      queued: string
+      running: string
+      succeeded: string
+      failed: string
+      interrupted: string
+    }
+    columns: {
+      command: string
+      status: string
+      time: string
+    }
+  }
 }

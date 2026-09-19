@@ -531,3 +531,174 @@ code {
   margin: 0 auto;
   box-shadow: 0 -1px 4px rgba(16, 24, 40, 0.06);
 }
+
+.btn-danger {
+  background: var(--color-danger);
+  color: white;
+}
+
+.btn-danger:not(:disabled):hover {
+  background: #b91c1c;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.operator-gate-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(16, 24, 40, 0.5);
+  z-index: 20;
+}
+
+.ops-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ops-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ops-card h3 {
+  margin: 0;
+}
+
+.ops-card-danger {
+  border-color: var(--color-danger);
+}
+
+.ops-danger-zone {
+  border: 1px dashed var(--color-danger);
+  border-radius: var(--radius);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ops-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.ops-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 14px;
+  max-width: 280px;
+}
+
+.ops-field input {
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  font-size: 14px;
+}
+
+.ops-job-panel {
+  border-top: 1px solid var(--color-border);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ops-job-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ops-progress {
+  position: relative;
+  background: var(--color-bg);
+  border-radius: var(--radius);
+  height: 18px;
+  overflow: hidden;
+}
+
+.ops-progress-bar {
+  background: var(--color-primary);
+  height: 100%;
+  transition: width 0.3s ease;
+}
+
+.ops-progress-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--color-text);
+}
+
+.ops-result-json {
+  background: var(--color-bg);
+  border-radius: var(--radius);
+  padding: 12px;
+  font-size: 12px;
+  overflow-x: auto;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.ops-history-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.ops-history-table th {
+  text-align: left;
+  font-size: 12px;
+  color: var(--color-muted);
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.ops-history-row {
+  cursor: pointer;
+}
+
+.ops-history-row:hover {
+  background: var(--color-bg);
+}
+
+.ops-history-table td {
+  padding: 8px;
+  border-bottom: 1px solid var(--color-border);
+  font-size: 14px;
+}
+
+.badge-ops-queued,
+.badge-ops-running {
+  background: rgba(37, 99, 235, 0.12);
+  color: var(--color-primary);
+}
+
+.badge-ops-succeeded {
+  background: rgba(22, 163, 74, 0.12);
+  color: var(--color-success);
+}
+
+.badge-ops-failed,
+.badge-ops-interrupted {
+  background: rgba(220, 38, 38, 0.12);
+  color: var(--color-danger);
+}

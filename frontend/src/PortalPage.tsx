@@ -9,13 +9,16 @@ import { DuplicatesTab } from './components/DuplicatesTab'
 import { HelpModal } from './components/HelpModal'
 import { LoginCard } from './components/LoginCard'
 import { NameMismatchTab } from './components/NameMismatchTab'
+import { OperationsTab } from './components/OperationsTab'
+import { OperatorGate } from './components/OperatorGate'
 import { PortalHeader } from './components/PortalHeader'
 import { TokenGate } from './components/TokenGate'
 import { UnresolvedTab } from './components/UnresolvedTab'
 import { useT } from './i18n'
+import { clearAdminToken, loadAdminToken, saveAdminToken } from './adminSession'
 import { clearToken, loadToken, saveToken } from './session'
 
-type Tab = 'duplicates' | 'unresolved' | 'mismatches' | 'activity'
+type Tab = 'duplicates' | 'unresolved' | 'mismatches' | 'activity' | 'operations'
 
 function tokenFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get('token')
@@ -35,6 +38,9 @@ export function PortalPage() {
   const [applying, setApplying] = useState(false)
   const [useAccessKey, setUseAccessKey] = useState(false)
   const [guideOpen, setGuideOpen] = useState(false)
+  const [adminToken, setAdminToken] = useState<string | null>(() => loadAdminToken(slug))
+  const [operatorGateOpen, setOperatorGateOpen] = useState(false)
+  const [operatorError, setOperatorError] = useState<string | null>(null)
 
   function handleLogout() {
     clearToken(slug)
@@ -42,6 +48,33 @@ export function PortalPage() {
     setReport(null)
     setSyncStatus(null)
     setUseAccessKey(false)
+  }
+
+  function handleOperatorClick() {
+    if (adminToken) {
+      clearAdminToken(slug)
+      setAdminToken(null)
+      if (tab === 'operations') setTab('duplicates')
+    } else {
+      setOperatorError(null)
+      setOperatorGateOpen(true)
+    }
+  }
+
+  function handleOperatorSubmit(value: string) {
+    saveAdminToken(slug, value)
+    setAdminToken(value)
+    setOperatorError(null)
+    setOperatorGateOpen(false)
+    setTab('operations')
+  }
+
+  function handleOperatorUnauthorized() {
+    clearAdminToken(slug)
+    setAdminToken(null)
+    setOperatorError(t.operator.invalidToken)
+    setOperatorGateOpen(true)
+    if (tab === 'operations') setTab('duplicates')
   }
 
   useEffect(() => {
@@ -199,7 +232,15 @@ export function PortalPage() {
         reportDate={report.created_at}
         syncStatus={syncStatus}
         onLogout={handleLogout}
+        isOperator={!!adminToken}
+        onOperatorClick={handleOperatorClick}
       />
+
+      {operatorGateOpen && (
+        <div className="operator-gate-overlay">
+          <OperatorGate slug={slug} error={operatorError} onSubmit={handleOperatorSubmit} />
+        </div>
+      )}
 
       {error && <p className="error-banner">{error}</p>}
 
@@ -219,6 +260,15 @@ export function PortalPage() {
         <button type="button" className={tab === 'activity' ? 'tab active' : 'tab'} onClick={() => setTab('activity')}>
           {t.tabs.activity}
         </button>
+        {adminToken && (
+          <button
+            type="button"
+            className={tab === 'operations' ? 'tab active' : 'tab'}
+            onClick={() => setTab('operations')}
+          >
+            {t.operator.tabLabel}
+          </button>
+        )}
       </nav>
 
       <main className="tab-content">
@@ -243,6 +293,9 @@ export function PortalPage() {
           />
         )}
         {tab === 'activity' && <ActivityTab slug={slug} token={token} />}
+        {tab === 'operations' && adminToken && (
+          <OperationsTab slug={slug} adminToken={adminToken} onUnauthorized={handleOperatorUnauthorized} />
+        )}
       </main>
 
       <ApplyFooter pendingCount={pendingCount} applying={applying} onApply={handleApply} />
