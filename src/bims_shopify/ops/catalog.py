@@ -6,6 +6,7 @@ Usage::
     python -m bims_shopify.ops.catalog <tenant_slug> import [--apply] [--publish] \\
         [--only-with-stock] [--limit N]
     python -m bims_shopify.ops.catalog <tenant_slug> status
+    python -m bims_shopify.ops.catalog <tenant_slug> dedupe [--apply] [--force]
 
 ``wipe`` deletes every product in the tenant's Shopify store. ``import``
 rebuilds the catalog from the tenant's BIMS company (``tenant.bims_company_id``):
@@ -15,7 +16,17 @@ option; rows without a size suffix become single-variant products.
 
 ``import`` defaults to a dry run (prints a plan, writes nothing); pass
 ``--apply`` to actually create products in Shopify. New products are created
-as DRAFT unless ``--publish`` is passed.
+as DRAFT unless ``--publish`` is passed. A product group is skipped (treated
+as already imported) if ANY of its variant SKUs already exists anywhere in
+the shop, not only when all of them do -- this is what makes re-running
+``import`` after a partial failure idempotent instead of re-creating
+products under a shifted set of "surviving" variants.
+
+``dedupe`` finds products that are full duplicates of an earlier product
+(every one of their SKUs was already seen on an earlier product, by id) and
+deletes them with ``--apply``; without it, it only prints a JSON report. It
+refuses to delete more than 60% of the catalog in one run unless ``--force``
+is passed.
 
 ``status`` pulls both sides (BIMS-eligible rows, Shopify's live catalog) and
 prints a reconciliation report: counts on each side, SKUs present in one but
@@ -53,8 +64,12 @@ STOCK_BATCH_SIZE = 200
 MAX_VARIANTS_PER_PRODUCT = 100
 WIPE_PROGRESS_EVERY = 50
 IMPORT_PROGRESS_EVERY = 25
+DEDUPE_PROGRESS_EVERY = 50
 SAMPLE_GROUP_COUNT = 5
 RECONCILIATION_SAMPLE_SIZE = 20
+DEDUPE_DUPLICATES_SAMPLE_SIZE = 20
+DEDUPE_PARTIAL_OVERLAP_SAMPLE_SIZE = 10
+DEDUPE_MAX_DELETE_RATIO = 0.6
 
 #: A trailing parenthetical of 1-6 chars, e.g. " (XL)", " (32)", " (M)".
 _SIZE_SUFFIX_RE = re.compile(r"\s*\(([^)]{1,6})\)\s*$")
@@ -371,7 +386,7 @@ async def apply_import(
     result = ImportResult()
     for index, group in enumerate(groups, start=1):
         skus = group_skus(group)
-        if skus and skus.issubset(existing_skus):
+        if skus and (skus & existing_skus):
             result.skipped_existing.append(group.title)
         else:
             product_input = build_product_set_input(group, status=status)
@@ -411,6 +426,105 @@ async def wipe_catalog(shopify_client: ShopifyClient) -> WipeResult:
             result.deleted += 1
         if processed % WIPE_PROGRESS_EVERY == 0:
             print(f"  ... {processed} products processed")
+    return result
+
+
+@dataclass
+class DedupePlan:
+    total_products: int = 0
+    kept: int = 0
+    duplicates_to_delete: list[dict[str, Any]] = field(default_factory=list)
+    partial_overlap: list[dict[str, Any]] = field(default_factory=list)
+
+
+def compute_dedupe_plan(products: list[dict[str, Any]]) -> DedupePlan:
+    """Detect duplicate products from a stable (id-ascending) product scan.
+
+    For each product, in order: if it has at least one SKU and every one of
+    its SKUs was already claimed by an earlier *kept* product, it is a full
+    duplicate (mark for deletion, do not claim its SKUs). Otherwise it is
+    kept and all its SKUs are claimed; if some (but not all) of its SKUs
+    were already claimed, it is reported as a partial overlap (kept, not
+    deleted — this usually means a legitimate distinct product that happens
+    to share a shadowed/duplicate SKU with another one).
+
+    A product with zero SKUs is always kept (nothing to compare).
+    """
+    plan = DedupePlan(total_products=len(products))
+    claimed: set[str] = set()
+    for product in products:
+        skus = {s for s in (product.get("skus") or []) if s}
+        product_id = product.get("id")
+        title = product.get("title")
+        if skus and skus.issubset(claimed):
+            plan.duplicates_to_delete.append(
+                {"product_id": product_id, "title": title, "skus": sorted(skus)}
+            )
+            continue
+
+        plan.kept += 1
+        overlap = skus & claimed
+        if overlap:
+            plan.partial_overlap.append(
+                {
+                    "product_id": product_id,
+                    "title": title,
+                    "skus": sorted(skus),
+                    "overlapping_skus": sorted(overlap),
+                }
+            )
+        claimed |= skus
+
+    return plan
+
+
+def build_dedupe_report(plan: DedupePlan) -> dict[str, Any]:
+    return {
+        "total_products": plan.total_products,
+        "kept": plan.kept,
+        "duplicates_to_delete": {
+            "count": len(plan.duplicates_to_delete),
+            "sample": plan.duplicates_to_delete[:DEDUPE_DUPLICATES_SAMPLE_SIZE],
+        },
+        "partial_overlap": {
+            "count": len(plan.partial_overlap),
+            "sample": plan.partial_overlap[:DEDUPE_PARTIAL_OVERLAP_SAMPLE_SIZE],
+        },
+    }
+
+
+async def fetch_products_with_skus(shopify_client: ShopifyClient) -> list[dict[str, Any]]:
+    products: list[dict[str, Any]] = []
+    async for product in shopify_client.iter_all_products_with_skus():
+        products.append(product)
+    return products
+
+
+@dataclass
+class DedupeApplyResult:
+    deleted: int = 0
+    failed: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_summary(self) -> dict[str, Any]:
+        return {"deleted": self.deleted, "failed": self.failed}
+
+
+async def apply_dedupe(
+    shopify_client: ShopifyClient, duplicates: list[dict[str, Any]]
+) -> DedupeApplyResult:
+    """Delete every product marked as a duplicate, isolating per-product failures."""
+    result = DedupeApplyResult()
+    for index, duplicate in enumerate(duplicates, start=1):
+        try:
+            await shopify_client.delete_product(duplicate["product_id"])
+        except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
+            result.failed.append(
+                {"product_id": duplicate["product_id"], "error": f"{type(exc).__name__}: {exc}"}
+            )
+        else:
+            result.deleted += 1
+        if index % DEDUPE_PROGRESS_EVERY == 0:
+            print(f"  ... {index}/{len(duplicates)} duplicates processed")
     return result
 
 
@@ -508,6 +622,47 @@ async def _run_import(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any
         return summary
     finally:
         await bims_client.aclose()
+        await shopify_client.aclose()
+
+
+async def _run_dedupe(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any]:
+    shopify_client = ShopifyClient(tenant)
+    try:
+        products = await fetch_products_with_skus(shopify_client)
+        plan = compute_dedupe_plan(products)
+        report = build_dedupe_report(plan)
+
+        if not args.apply:
+            report["dry_run"] = True
+            return report
+
+        dup_count = len(plan.duplicates_to_delete)
+        if plan.total_products > 0 and not args.force:
+            ratio = dup_count / plan.total_products
+            if ratio > DEDUPE_MAX_DELETE_RATIO:
+                raise SystemExit(
+                    f"Safety guard: dedupe would delete {dup_count}/{plan.total_products} "
+                    f"products ({ratio:.0%}), exceeding the "
+                    f"{DEDUPE_MAX_DELETE_RATIO:.0%} threshold. Re-run with --force to override "
+                    "if this is expected."
+                )
+
+        apply_result = await apply_dedupe(shopify_client, plan.duplicates_to_delete)
+        report["apply"] = apply_result.to_summary()
+        await _audit(
+            tenant.id,
+            "catalog.dedupe",
+            {
+                "total_products": plan.total_products,
+                "kept": plan.kept,
+                "duplicates_found": dup_count,
+                "partial_overlap": len(plan.partial_overlap),
+                "deleted": apply_result.deleted,
+                "failed": len(apply_result.failed),
+            },
+        )
+        return report
+    finally:
         await shopify_client.aclose()
 
 
@@ -610,6 +765,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         return await _run_wipe(tenant, args)
     if args.command == "status":
         return await _run_status(tenant, args)
+    if args.command == "dedupe":
+        return await _run_dedupe(tenant, args)
     return await _run_import(tenant, args)
 
 
@@ -655,6 +812,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "status",
         help="Reconciliation report: BIMS-eligible catalog vs. what's actually in Shopify.",
+    )
+
+    dedupe_parser = subparsers.add_parser(
+        "dedupe",
+        help="Find (and optionally delete) duplicate products created by non-idempotent imports.",
+    )
+    dedupe_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Delete the detected duplicates (default: dry run, prints the report only).",
+    )
+    dedupe_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Override the safety guard that refuses to delete more than "
+        f"{DEDUPE_MAX_DELETE_RATIO:.0%} of the catalog in one run.",
     )
 
     return parser

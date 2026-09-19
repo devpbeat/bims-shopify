@@ -92,6 +92,21 @@ query ListAllProducts($cursor: String) {
 }
 """
 
+_LIST_ALL_PRODUCTS_WITH_SKUS = """
+query ListAllProductsWithSkus($cursor: String) {
+  products(first: 100, after: $cursor, sortKey: ID) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      title
+      variants(first: 100) {
+        nodes { sku }
+      }
+    }
+  }
+}
+"""
+
 _PRODUCT_DELETE = """
 mutation ProductDelete($input: ProductDeleteInput!) {
   productDelete(input: $input, synchronous: true) {
@@ -326,6 +341,33 @@ class ShopifyClient:
             connection = data["products"]
             for node in connection["nodes"]:
                 yield node
+            page_info = connection["pageInfo"]
+            if not page_info["hasNextPage"]:
+                return
+            cursor = page_info["endCursor"]
+
+    async def iter_all_products_with_skus(self) -> AsyncIterator[dict[str, Any]]:
+        """Page through every product, sorted by id ascending, with its variant SKUs.
+
+        Yields ``{id, title, skus}`` where ``skus`` is the list of non-blank
+        variant SKUs (order preserved, not deduped). Used by the ``dedupe``
+        ops command, which needs a stable full-catalog scan to detect
+        duplicate products created by non-idempotent import runs.
+        """
+        cursor: str | None = None
+        while True:
+            data = await self._graphql(_LIST_ALL_PRODUCTS_WITH_SKUS, {"cursor": cursor})
+            connection = data["products"]
+            for node in connection["nodes"]:
+                skus = [
+                    (v.get("sku") or "").strip()
+                    for v in (node.get("variants") or {}).get("nodes") or []
+                ]
+                yield {
+                    "id": node["id"],
+                    "title": node.get("title"),
+                    "skus": [s for s in skus if s],
+                }
             page_info = connection["pageInfo"]
             if not page_info["hasNextPage"]:
                 return

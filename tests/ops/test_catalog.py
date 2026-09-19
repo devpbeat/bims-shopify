@@ -21,8 +21,11 @@ from bims_shopify.config import Settings
 from bims_shopify.ops import catalog as catalog_ops
 from bims_shopify.ops.catalog import (
     BimsRow,
+    apply_dedupe,
     apply_import,
+    build_dedupe_report,
     build_product_set_input,
+    compute_dedupe_plan,
     fetch_existing_skus,
     filter_and_dedupe_rows,
     group_rows,
@@ -222,6 +225,34 @@ async def test_apply_import_skips_groups_whose_skus_all_exist():
         _NoCallShopifyClient(), [group], existing_skus={"SKU-MUG"}, status="DRAFT"
     )
     assert result.skipped_existing == ["Mug"]
+    assert result.created == []
+
+
+async def test_apply_import_skips_group_if_any_sku_already_exists():
+    """Regression test for the production duplicate-products incident.
+
+    The old rule skipped a group only when ALL its SKUs already existed.
+    Because which SKU "survives" per size can shift between runs (bugs
+    being fixed mid-rollout), a group could have some-but-not-all SKUs
+    present and get re-created as a brand new product, duplicating it.
+    """
+    group = group_rows(
+        [
+            BimsRow("1", "Shirt (S)", "SKU-S", 1000),
+            BimsRow("2", "Shirt (M)", "SKU-M", 1000),
+        ]
+    ).groups[0]
+
+    class _NoCallShopifyClient:
+        async def product_set(self, product_input):
+            raise AssertionError("product_set should not be called when any SKU already exists")
+
+    # Only SKU-S exists in Shopify; SKU-M does not. The old subset rule would
+    # have re-created this product. The fixed rule must still skip it.
+    result = await apply_import(
+        _NoCallShopifyClient(), [group], existing_skus={"SKU-S"}, status="DRAFT"
+    )
+    assert result.skipped_existing == ["Shirt"]
     assert result.created == []
 
 
@@ -436,3 +467,147 @@ async def test_run_status_prints_full_reconciliation_report(monkeypatch, tmp_pat
     assert len(entries) == 1
     assert "sample" not in json.dumps(entries[0].payload)
     assert entries[0].payload["reconciliation"]["matched_skus"] == 1
+
+
+# -- dedupe --------------------------------------------------------------
+
+
+def test_compute_dedupe_plan_marks_full_duplicate_for_deletion():
+    products = [
+        {"id": "p1", "title": "Shirt", "skus": ["SKU-S", "SKU-M"]},
+        {"id": "p2", "title": "Shirt", "skus": ["SKU-S", "SKU-M"]},
+    ]
+    plan = compute_dedupe_plan(products)
+    assert plan.total_products == 2
+    assert plan.kept == 1
+    assert [d["product_id"] for d in plan.duplicates_to_delete] == ["p2"]
+    assert plan.duplicates_to_delete[0]["skus"] == ["SKU-M", "SKU-S"]
+    assert plan.partial_overlap == []
+
+
+def test_compute_dedupe_plan_keeps_and_reports_partial_overlap():
+    products = [
+        {"id": "p1", "title": "Shirt", "skus": ["SKU-S", "SKU-M"]},
+        # Shares SKU-M with p1 but also introduces SKU-L -> not a full
+        # duplicate, must be kept, but flagged for manual review.
+        {"id": "p2", "title": "Shirt Variant", "skus": ["SKU-M", "SKU-L"]},
+    ]
+    plan = compute_dedupe_plan(products)
+    assert plan.kept == 2
+    assert plan.duplicates_to_delete == []
+    assert len(plan.partial_overlap) == 1
+    assert plan.partial_overlap[0]["product_id"] == "p2"
+    assert plan.partial_overlap[0]["overlapping_skus"] == ["SKU-M"]
+
+
+def test_compute_dedupe_plan_keeps_products_with_no_skus():
+    products = [{"id": "p1", "title": "Empty", "skus": []}]
+    plan = compute_dedupe_plan(products)
+    assert plan.kept == 1
+    assert plan.duplicates_to_delete == []
+
+
+def test_compute_dedupe_plan_second_pass_finds_no_duplicates():
+    """Idempotency: running dedupe again after duplicates were removed finds none."""
+    products = [
+        {"id": "p1", "title": "Shirt", "skus": ["SKU-S", "SKU-M"]},
+        {"id": "p3", "title": "Mug", "skus": ["SKU-MUG"]},
+    ]
+    plan = compute_dedupe_plan(products)
+    assert plan.duplicates_to_delete == []
+    assert plan.kept == 2
+
+
+def test_build_dedupe_report_shape_and_sample_caps():
+    duplicates = [
+        {"product_id": f"p{i}", "title": "X", "skus": [f"SKU-{i}"]} for i in range(25)
+    ]
+    plan_products = [{"id": "p-keep", "title": "Keep", "skus": ["SKU-KEEP"]}] + [
+        {"id": d["product_id"], "title": d["title"], "skus": ["SKU-KEEP"]} for d in duplicates
+    ]
+    plan = compute_dedupe_plan(plan_products)
+    report = build_dedupe_report(plan)
+    assert report["total_products"] == 26
+    assert report["kept"] == 1
+    assert report["duplicates_to_delete"]["count"] == 25
+    assert len(report["duplicates_to_delete"]["sample"]) == 20
+    assert report["partial_overlap"]["count"] == 0
+    assert report["partial_overlap"]["sample"] == []
+
+
+async def test_apply_dedupe_deletes_and_isolates_failures():
+    from bims_shopify.adapters.shopify.client import ShopifyGraphQLError
+
+    class _FakeShopifyClient:
+        async def delete_product(self, product_id):
+            if product_id == "p2":
+                raise ShopifyGraphQLError("boom")
+
+    duplicates = [
+        {"product_id": "p1", "title": "A", "skus": []},
+        {"product_id": "p2", "title": "B", "skus": []},
+    ]
+    result = await apply_dedupe(_FakeShopifyClient(), duplicates)
+    assert result.deleted == 1
+    assert len(result.failed) == 1
+    assert result.failed[0]["product_id"] == "p2"
+
+
+async def test_run_dedupe_dry_run_reports_without_deleting(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    class _FakeShopifyClient:
+        def __init__(self, tenant):
+            pass
+
+        async def iter_all_products_with_skus(self):
+            for pid, skus in [
+                ("p1", ["SKU-A"]),
+                ("p2", ["SKU-A"]),  # full duplicate of p1
+            ]:
+                yield {"id": pid, "title": "Widget", "skus": skus}
+
+        async def aclose(self):
+            pass
+
+    monkeypatch_target = catalog_ops.ShopifyClient
+    catalog_ops.ShopifyClient = _FakeShopifyClient  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(["acme", "dedupe"])
+        report = await catalog_ops._run_dedupe(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = monkeypatch_target  # type: ignore[assignment]
+
+    assert report["dry_run"] is True
+    assert report["duplicates_to_delete"]["count"] == 1
+    assert "apply" not in report
+
+
+async def test_run_dedupe_safety_guard_blocks_over_60_percent(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    class _FakeShopifyClient:
+        def __init__(self, tenant):
+            pass
+
+        async def iter_all_products_with_skus(self):
+            # 1 kept, 4 duplicates -> 80% of the catalog, over the 60% guard.
+            yield {"id": "p0", "title": "Base", "skus": ["SKU-A"]}
+            for i in range(1, 5):
+                yield {"id": f"p{i}", "title": "Base", "skus": ["SKU-A"]}
+
+        async def aclose(self):
+            pass
+
+    monkeypatch_target = catalog_ops.ShopifyClient
+    catalog_ops.ShopifyClient = _FakeShopifyClient  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(["acme", "dedupe", "--apply"])
+        try:
+            await catalog_ops._run_dedupe(tenant, args)
+        except SystemExit as exc:
+            assert "Safety guard" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit from the safety guard")
+    finally:
+        catalog_ops.ShopifyClient = monkeypatch_target  # type: ignore[assignment]
