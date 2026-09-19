@@ -24,9 +24,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import difflib
+import inspect
 import json
 import os
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -56,6 +58,17 @@ MAX_SCAN_AGE_SECONDS = 24 * 60 * 60
 
 _TRAILING_PARENTHETICAL_RE = re.compile(r"\s*\([^()]*\)\s*$")
 _WHITESPACE_RE = re.compile(r"\s+")
+
+#: Shared with ops/catalog.py's progress contract: (done, total-or-None, message).
+ProgressFn = Callable[[int, int | None, str], "Awaitable[None] | None"]
+
+
+async def _emit_progress(progress: ProgressFn | None, done: int, total: int | None, message: str) -> None:
+    if progress is None:
+        return
+    outcome = progress(done, total, message)
+    if inspect.isawaitable(outcome):
+        await outcome
 
 
 def normalize_name(name: str) -> str:
@@ -764,7 +777,7 @@ async def _load_tenant_from_db(tenant_slug: str) -> Tenant:
         await engine.dispose()
 
 
-async def _run(args: argparse.Namespace) -> dict[str, Any]:
+async def _run(args: argparse.Namespace, progress: ProgressFn | None = None) -> dict[str, Any]:
     if args.auto_resolve and not args.apply:
         raise SystemExit("--auto-resolve requires --apply")
 
@@ -775,21 +788,31 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             raise SystemExit("tenant_slug is required unless --standalone is used")
         tenant = await _load_tenant_from_db(args.tenant_slug)
 
+    return await _run_for_tenant(tenant, args, progress=progress)
+
+
+async def _run_for_tenant(
+    tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
+) -> dict[str, Any]:
     shopify_client = ShopifyClient(tenant)
     bims_client = BIMSClient(tenant)
     try:
+        await _emit_progress(progress, 0, None, "scanning Shopify variants against BIMS company-6")
         result = await scan(shopify_client, bims_client, target_company_id=args.company)
         summary = result.to_summary()
         if args.apply:
             if args.auto_resolve:
                 # Auto-resolve all conflicts
+                await _emit_progress(progress, 1, None, "auto-resolving conflicts")
                 auto_resolve_result = await auto_resolve_conflicts(shopify_client, result)
                 summary["auto_resolved"] = auto_resolve_result.to_summary()
             elif result.planned_rewrites:
                 # Apply only safe rewrites
+                await _emit_progress(progress, 1, None, "applying planned rewrites")
                 apply_result = await apply_rewrites(shopify_client, result.planned_rewrites)
                 summary["apply"] = apply_result.to_summary()
 
+            await _emit_progress(progress, 2, None, "rescanning after apply")
             result = await scan(shopify_client, bims_client, target_company_id=args.company)
             summary["rescan"] = result.to_summary()
 
@@ -812,6 +835,21 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         await shopify_client.aclose()
         await bims_client.aclose()
+
+
+# --- In-process entry point for the background JobRunner (api/ops.py) ---
+
+
+async def run_rekey(tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None) -> dict[str, Any]:
+    args = argparse.Namespace(
+        standalone=False,
+        tenant_slug=tenant.slug,
+        apply=bool(options.get("apply", False)),
+        auto_resolve=bool(options.get("auto_resolve", False)),
+        company=int(options.get("company", TARGET_COMPANY_ID)),
+        report_xlsx=None,
+    )
+    return await _run_for_tenant(tenant, args, progress=progress)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

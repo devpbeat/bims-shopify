@@ -19,6 +19,7 @@ from bims_shopify.adapters.persistence.tenant_repository import (
 from bims_shopify.api import (
     audit,
     health,
+    ops,
     payments,
     portal,
     shopify_oauth,
@@ -28,6 +29,7 @@ from bims_shopify.api import (
 )
 from bims_shopify.config import get_settings
 from bims_shopify.logging import configure_logging, get_logger
+from bims_shopify.ops.job_runner import JobRunner
 from bims_shopify.scheduler import TenantSyncScheduler
 
 logger = get_logger(__name__)
@@ -112,6 +114,11 @@ def create_app() -> FastAPI:
     async def lifespan(app: FastAPI):
         await asyncio.to_thread(_run_migrations, settings.database_url)
 
+        interrupted_count = await JobRunner.mark_interrupted_on_startup(session_factory)
+        if interrupted_count:
+            logger.warning("ops_jobs_marked_interrupted", count=interrupted_count)
+        app.state.job_runner = JobRunner(session_factory, settings)
+
         async with session_factory() as session:
             repo = SqlAlchemyTenantRepository(session, SecretBox(settings.fernet_key))
             scheduler = TenantSyncScheduler(
@@ -138,6 +145,7 @@ def create_app() -> FastAPI:
     app.include_router(shopify_oauth.router)
     app.include_router(portal.router)
     app.include_router(audit.router)
+    app.include_router(ops.router)
     _mount_portal_spa(app)
     return app
 

@@ -39,8 +39,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -70,6 +72,22 @@ RECONCILIATION_SAMPLE_SIZE = 20
 DEDUPE_DUPLICATES_SAMPLE_SIZE = 20
 DEDUPE_PARTIAL_OVERLAP_SAMPLE_SIZE = 10
 DEDUPE_MAX_DELETE_RATIO = 0.6
+
+#: Progress callback signature shared by the CLI and the background job
+#: runner: (done, total-or-None, human message). May be sync or async.
+ProgressFn = Callable[[int, int | None, str], "Awaitable[None] | None"]
+
+
+async def _emit_progress(progress: ProgressFn | None, done: int, total: int | None, message: str) -> None:
+    if progress is None:
+        return
+    outcome = progress(done, total, message)
+    if inspect.isawaitable(outcome):
+        await outcome
+
+
+def _print_progress(done: int, total: int | None, message: str) -> None:
+    print(f"  ... {message}")
 
 #: A trailing parenthetical of 1-6 chars, e.g. " (XL)", " (32)", " (M)".
 _SIZE_SUFFIX_RE = re.compile(r"\s*\(([^)]{1,6})\)\s*$")
@@ -381,6 +399,7 @@ async def apply_import(
     *,
     existing_skus: set[str],
     status: str,
+    progress: ProgressFn | None = None,
 ) -> ImportResult:
     """Create each product group via productSet, isolating failures per product."""
     result = ImportResult()
@@ -398,7 +417,9 @@ async def apply_import(
                 result.created.append({"title": group.title, "product_id": (product or {}).get("id")})
 
         if index % IMPORT_PROGRESS_EVERY == 0:
-            print(f"  ... {index}/{len(groups)} products processed")
+            message = f"{index}/{len(groups)} products processed"
+            print(f"  ... {message}")
+            await _emit_progress(progress, index, len(groups), message)
 
     return result
 
@@ -412,7 +433,9 @@ class WipeResult:
         return {"deleted": self.deleted, "failed": self.failed}
 
 
-async def wipe_catalog(shopify_client: ShopifyClient) -> WipeResult:
+async def wipe_catalog(
+    shopify_client: ShopifyClient, *, progress: ProgressFn | None = None
+) -> WipeResult:
     """Delete every product in the shop, isolating per-product failures."""
     result = WipeResult()
     processed = 0
@@ -425,7 +448,9 @@ async def wipe_catalog(shopify_client: ShopifyClient) -> WipeResult:
         else:
             result.deleted += 1
         if processed % WIPE_PROGRESS_EVERY == 0:
-            print(f"  ... {processed} products processed")
+            message = f"{processed} products processed"
+            print(f"  ... {message}")
+            await _emit_progress(progress, processed, None, message)
     return result
 
 
@@ -510,7 +535,10 @@ class DedupeApplyResult:
 
 
 async def apply_dedupe(
-    shopify_client: ShopifyClient, duplicates: list[dict[str, Any]]
+    shopify_client: ShopifyClient,
+    duplicates: list[dict[str, Any]],
+    *,
+    progress: ProgressFn | None = None,
 ) -> DedupeApplyResult:
     """Delete every product marked as a duplicate, isolating per-product failures."""
     result = DedupeApplyResult()
@@ -524,7 +552,9 @@ async def apply_dedupe(
         else:
             result.deleted += 1
         if index % DEDUPE_PROGRESS_EVERY == 0:
-            print(f"  ... {index}/{len(duplicates)} duplicates processed")
+            message = f"{index}/{len(duplicates)} duplicates processed"
+            print(f"  ... {message}")
+            await _emit_progress(progress, index, len(duplicates), message)
     return result
 
 
@@ -555,7 +585,9 @@ async def _audit(tenant_id: int | None, action: str, payload: dict[str, Any]) ->
         await engine.dispose()
 
 
-async def _run_wipe(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any]:
+async def _run_wipe(
+    tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
+) -> dict[str, Any]:
     if not args.yes_i_mean_it:
         raise SystemExit("wipe requires --yes-i-mean-it")
 
@@ -563,7 +595,8 @@ async def _run_wipe(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any]:
     try:
         count = await shopify_client.products_count()
         print(f"About to delete {count} product(s) from {tenant.shopify_shop_domain}")
-        result = await wipe_catalog(shopify_client)
+        await _emit_progress(progress, 0, count, f"about to delete {count} product(s)")
+        result = await wipe_catalog(shopify_client, progress=progress)
         summary = result.to_summary()
         await _audit(tenant.id, "catalog.wipe", summary)
         return summary
@@ -571,10 +604,13 @@ async def _run_wipe(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any]:
         await shopify_client.aclose()
 
 
-async def _run_import(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any]:
+async def _run_import(
+    tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
+) -> dict[str, Any]:
     bims_client = BIMSClient(tenant)
     shopify_client = ShopifyClient(tenant)
     try:
+        await _emit_progress(progress, 0, None, "pulling BIMS catalog")
         raw_rows = await fetch_bims_catalog_rows(bims_client, tenant.bims_company_id)
         rows, duplicates = filter_and_dedupe_rows(raw_rows)
         grouping = group_rows(rows)
@@ -613,9 +649,12 @@ async def _run_import(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any
             ]
             return summary
 
+        await _emit_progress(progress, 0, len(groups), "pulling existing Shopify SKUs")
         existing_skus = await fetch_existing_skus(shopify_client)
         status = "ACTIVE" if args.publish else "DRAFT"
-        result = await apply_import(shopify_client, groups, existing_skus=existing_skus, status=status)
+        result = await apply_import(
+            shopify_client, groups, existing_skus=existing_skus, status=status, progress=progress
+        )
         summary["apply"] = result.to_summary()
         await _audit(tenant.id, "catalog.import", summary)
         print("Reminder: stock levels will arrive via the regular inventory sync, not this import.")
@@ -625,9 +664,12 @@ async def _run_import(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any
         await shopify_client.aclose()
 
 
-async def _run_dedupe(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any]:
+async def _run_dedupe(
+    tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
+) -> dict[str, Any]:
     shopify_client = ShopifyClient(tenant)
     try:
+        await _emit_progress(progress, 0, None, "scanning products for duplicates")
         products = await fetch_products_with_skus(shopify_client)
         plan = compute_dedupe_plan(products)
         report = build_dedupe_report(plan)
@@ -647,7 +689,7 @@ async def _run_dedupe(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any
                     "if this is expected."
                 )
 
-        apply_result = await apply_dedupe(shopify_client, plan.duplicates_to_delete)
+        apply_result = await apply_dedupe(shopify_client, plan.duplicates_to_delete, progress=progress)
         report["apply"] = apply_result.to_summary()
         await _audit(
             tenant.id,
@@ -694,14 +736,18 @@ async def _fetch_last_activity(tenant_id: int) -> dict[str, Any]:
         await engine.dispose()
 
 
-async def _run_status(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any]:
+async def _run_status(
+    tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
+) -> dict[str, Any]:
     bims_client = BIMSClient(tenant)
     shopify_client = ShopifyClient(tenant)
     try:
+        await _emit_progress(progress, 0, None, "pulling BIMS catalog")
         raw_rows = await fetch_bims_catalog_rows(bims_client, tenant.bims_company_id)
         rows, duplicates = filter_and_dedupe_rows(raw_rows)
         grouping = group_rows(rows)
         bims_skus = {v.sku for g in grouping.groups for v in g.variants}
+        await _emit_progress(progress, 1, 2, "bims pull done, pulling Shopify catalog")
 
         shopify_products = 0
         async for _product in shopify_client.iter_all_products():
@@ -717,6 +763,7 @@ async def _run_status(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any
                 shopify_variants_with_sku += 1
                 shopify_skus.add(sku)
 
+        await _emit_progress(progress, 2, 2, "shopify pull done")
         reconciliation = reconciliation_diff(bims_skus, shopify_skus)
 
         report: dict[str, Any] = {
@@ -768,6 +815,43 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "dedupe":
         return await _run_dedupe(tenant, args)
     return await _run_import(tenant, args)
+
+
+# --- In-process entry points for the background JobRunner (api/ops.py) ---
+#
+# These accept a plain `options` dict (validated by the ops API) instead of
+# an argparse.Namespace, and an already-built `tenant`/clients-less `ctx`
+# (the tenant is enough here; each command builds its own BIMSClient /
+# ShopifyClient the same way the CLI does). They wrap the exact same
+# `_run_*` cores the CLI uses, so behavior never diverges between the two
+# entry points.
+
+
+async def run_status(tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None) -> dict[str, Any]:
+    return await _run_status(tenant, argparse.Namespace(**options), progress=progress)
+
+
+async def run_wipe(tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None) -> dict[str, Any]:
+    args = argparse.Namespace(yes_i_mean_it=bool(options.get("confirm", False)))
+    return await _run_wipe(tenant, args, progress=progress)
+
+
+async def run_import(tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None) -> dict[str, Any]:
+    args = argparse.Namespace(
+        apply=bool(options.get("apply", False)),
+        publish=bool(options.get("publish", False)),
+        only_with_stock=bool(options.get("only_with_stock", False)),
+        limit=options.get("limit"),
+    )
+    return await _run_import(tenant, args, progress=progress)
+
+
+async def run_dedupe(tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None) -> dict[str, Any]:
+    args = argparse.Namespace(
+        apply=bool(options.get("apply", False)),
+        force=bool(options.get("force", False)),
+    )
+    return await _run_dedupe(tenant, args, progress=progress)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

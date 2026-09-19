@@ -194,3 +194,29 @@ class ProcessedEventModel(Base):
     status: Mapped[str] = mapped_column(String(40), default="processed")
     payload_hash: Mapped[str] = mapped_column(String(128), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
+
+
+class OpsJobModel(Base):
+    """A background-run catalog/rekey ops command triggered via the admin API.
+
+    ``status`` transitions: queued -> running -> (succeeded|failed), or
+    running -> interrupted if the process restarts mid-job (see
+    ``JobRunner.mark_interrupted_on_startup``).
+    """
+
+    __tablename__ = "ops_jobs"
+    __table_args__ = (Index("ix_ops_jobs_tenant_created", "tenant_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, ForeignKey("tenants.id"))
+    command: Mapped[str] = mapped_column(String(40))
+    options: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    progress_done: Mapped[int] = mapped_column(Integer, default=0)
+    progress_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
