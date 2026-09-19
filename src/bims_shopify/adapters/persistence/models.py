@@ -155,6 +155,34 @@ class PortalUserModel(Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class PaymentIntentModel(Base):
+    """A hosted-checkout payment link created for a Shopify order.
+
+    Persisted so (a) the Pagopar callback — which never echoes the
+    merchant's own order id, only its internal ``hash_pedido`` — can
+    resolve which Shopify order to mark paid, and (b) the merchant portal
+    can list recent payment links (``GET /api/portal/{slug}/payments``) so
+    staff can copy one into an order confirmation email.
+    """
+
+    __tablename__ = "payment_intents"
+    __table_args__ = (UniqueConstraint("tenant_id", "provider", "order_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, ForeignKey("tenants.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(40))
+    order_id: Mapped[str] = mapped_column(String(255))
+    amount: Mapped[float] = mapped_column(Float, default=0.0)
+    currency: Mapped[str] = mapped_column(String(10), default="PYG")
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    checkout_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    provider_reference: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc, onupdate=_now_utc
+    )
+
+
 class ProcessedEventModel(Base):
     __tablename__ = "processed_events"
     __table_args__ = (UniqueConstraint("tenant_id", "source", "external_id"),)

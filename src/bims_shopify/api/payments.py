@@ -9,6 +9,10 @@ from bims_shopify.adapters.payments.bancard_via_bims_provider import (
     BancardViaBIMSProvider,
 )
 from bims_shopify.adapters.payments.pagopar_provider import PagoparProvider
+from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
+from bims_shopify.adapters.persistence.payment_intent_repository import (
+    SqlAlchemyPaymentIntentRepository,
+)
 from bims_shopify.adapters.persistence.sync_state_repository import (
     SqlAlchemySyncStateRepository,
 )
@@ -18,8 +22,11 @@ from bims_shopify.adapters.persistence.tenant_repository import (
 from bims_shopify.adapters.shopify.client import ShopifyClient
 from bims_shopify.application.payments import CreatePaymentLink, HandlePaymentCallback
 from bims_shopify.domain.tenant import PaymentProvider, Tenant
+from bims_shopify.logging import get_logger
 
 from .deps import get_db_session, get_tenant_repository
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
@@ -38,15 +45,27 @@ async def create_checkout(
     tenant_slug: str,
     request: Request,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    session: AsyncSession = Depends(get_db_session),
 ):
     tenant = await repo.get_by_slug(tenant_slug)
     if tenant is None:
         raise HTTPException(status_code=404, detail="Unknown tenant")
     body = await request.json()
+    order_id = str(body.get("order_id"))
     provider_impl = _build_provider(provider, tenant)
-    use_case = CreatePaymentLink(provider_impl)
+    intents = SqlAlchemyPaymentIntentRepository(session)
+    audit = SqlAlchemyAuditLogger(session)
+    use_case = CreatePaymentLink(provider_impl, intents)
     intent = await use_case.run(
-        tenant, str(body.get("order_id")), float(body.get("amount", 0)), body.get("currency", "PYG")
+        tenant, order_id, float(body.get("amount", 0)), body.get("currency", "PYG")
+    )
+    await audit.log(
+        actor="portal",
+        action="payment.link_created",
+        entity="order",
+        tenant_id=tenant.id,
+        entity_id=order_id,
+        payload={"provider": provider, "status": intent.status},
     )
     return {"checkout_url": intent.checkout_url, "provider_reference": intent.provider_reference}
 
@@ -87,8 +106,37 @@ async def _handle_payment_callback(
     provider_impl = _build_provider(provider, tenant)
     storefront = ShopifyClient(tenant)
     processed_events = SqlAlchemySyncStateRepository(session)
-    use_case = HandlePaymentCallback(provider_impl, storefront, processed_events)
-    intent = await use_case.run(tenant, payload)
+    intents = SqlAlchemyPaymentIntentRepository(session)
+    audit = SqlAlchemyAuditLogger(session)
+    use_case = HandlePaymentCallback(provider_impl, storefront, processed_events, intents)
+
+    await audit.log(
+        actor=provider,
+        action="payment.callback_received",
+        entity="order",
+        tenant_id=tenant.id,
+    )
+    try:
+        intent = await use_case.run(tenant, payload)
+    except Exception as exc:
+        logger.warning("payment_callback_verification_failed", provider=provider, tenant=tenant_slug)
+        await audit.log(
+            actor=provider,
+            action="payment.verification_failed",
+            entity="order",
+            tenant_id=tenant.id,
+            payload={"error": type(exc).__name__},
+        )
+        raise
+
+    await audit.log(
+        actor=provider,
+        action="payment.confirmed" if intent.status == "paid" else "payment.verification_failed",
+        entity="order",
+        tenant_id=tenant.id,
+        entity_id=intent.order_id or None,
+        payload={"status": intent.status},
+    )
     return {"status": intent.status}
 
 

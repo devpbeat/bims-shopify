@@ -1,12 +1,18 @@
 """Shopify webhook receiver: verifies HMAC, returns fast, processes in background."""
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from bims_shopify.adapters.bims.client import BIMSClient
 from bims_shopify.adapters.bims.erp_adapter import BIMSERPAdapter
+from bims_shopify.adapters.payments.pagopar_provider import PagoparProvider
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
+from bims_shopify.adapters.persistence.payment_intent_repository import (
+    SqlAlchemyPaymentIntentRepository,
+)
 from bims_shopify.adapters.persistence.sync_state_repository import (
     SqlAlchemySyncStateRepository,
     hash_payload,
@@ -15,9 +21,11 @@ from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
 from bims_shopify.adapters.shopify.webhook_auth import verify_shopify_hmac
+from bims_shopify.application.payments import CreatePaymentLink
 from bims_shopify.application.process_shopify_order import ProcessShopifyOrder
 from bims_shopify.config import Settings
 from bims_shopify.domain.sale import SaleLineItem, SaleOrder, SalePayment
+from bims_shopify.domain.tenant import PaymentProvider, Tenant
 from bims_shopify.logging import get_logger
 
 from .deps import get_settings, get_tenant_repository
@@ -179,6 +187,82 @@ async def receive_shopify_webhook(
     return {"status": "accepted"}
 
 
+def _order_gateway_matches(payload: dict, gateway_name: str) -> bool:
+    """Check whether the order's payment gateway matches the configured manual method.
+
+    Shopify's order payload lists ``payment_gateway_names`` (list[str]);
+    matched case-insensitively so the merchant can name the Shopify Manual
+    Payment Method "Pagopar", "pagopar", etc. without a config change.
+    """
+    names = payload.get("payment_gateway_names") or []
+    gateway_name = gateway_name.strip().lower()
+    return any(str(name).strip().lower() == gateway_name for name in names)
+
+
+async def _maybe_create_pagopar_payment_link(
+    tenant: Tenant,
+    order_id: str,
+    payload: dict,
+    sync_state_repo: SqlAlchemySyncStateRepository,
+    audit: SqlAlchemyAuditLogger,
+    session,
+) -> None:
+    """On `orders/create`, create a Pagopar hosted-checkout link for tenants using
+    the "manual payment" model: a Shopify Manual Payment Method named to match
+    `provider_config["gateway_name"]` (default "Pagopar") triggers a link so
+    staff can paste it into the order confirmation email.
+    """
+    if tenant.payment_provider != PaymentProvider.PAGOPAR:
+        return
+
+    config = tenant.provider_config or {}
+    gateway_name = config.get("gateway_name", "Pagopar")
+    if not _order_gateway_matches(payload, gateway_name):
+        return
+
+    source = "payment_link:pagopar"
+    claimed = await sync_state_repo.try_claim_event(
+        tenant.id, source, order_id, hash_payload(json.dumps(payload, sort_keys=True, default=str).encode())
+    )
+    if not claimed:
+        return
+
+    amount = round(float(payload.get("total_price", 0) or 0))
+    currency = payload.get("currency", "PYG")
+
+    try:
+        intents = SqlAlchemyPaymentIntentRepository(session)
+        use_case = CreatePaymentLink(PagoparProvider(), intents)
+        intent = await use_case.run(tenant, order_id, amount, currency)
+    except Exception as exc:
+        logger.warning(
+            "pagopar_link_creation_failed",
+            tenant=tenant.slug,
+            order_id=order_id,
+            error=str(exc),
+        )
+        await sync_state_repo.delete_event(tenant.id, source, order_id)
+        await audit.log(
+            actor="shopify",
+            action="payment.verification_failed",
+            entity="order",
+            tenant_id=tenant.id,
+            entity_id=order_id,
+            payload={"reason": "link_creation_failed"},
+        )
+        return
+
+    await sync_state_repo.mark_event_status(tenant.id, source, order_id, "processed")
+    await audit.log(
+        actor="shopify",
+        action="payment.link_created",
+        entity="order",
+        tenant_id=tenant.id,
+        entity_id=order_id,
+        payload={"provider": "pagopar", "status": intent.status, "amount": amount, "currency": currency},
+    )
+
+
 async def _process_order_webhook(
     session_factory: async_sessionmaker,
     settings: Settings,
@@ -224,6 +308,18 @@ async def _process_order_webhook(
             entity_id=order_id,
             payload={"topic": topic},
         )
+
+        if topic == "orders/create":
+            # orders/create additionally drives the Pagopar hosted-checkout
+            # "manual payment" flow: a pending order placed against a
+            # Shopify Manual Payment Method is matched by gateway name and
+            # gets a payment link. This runs alongside (not instead of) the
+            # existing generic order-received handling below, keyed by its
+            # own idempotency source so it never interferes with the
+            # `shopify_webhook`-sourced claim used for the BIMS Sale push.
+            await _maybe_create_pagopar_payment_link(
+                tenant, order_id, payload, sync_state_repo, audit, session
+            )
 
         # Atomically claim this (tenant, source, external_id) via the DB
         # unique constraint. This closes the race where two concurrent

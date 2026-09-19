@@ -223,6 +223,25 @@ class ResolutionResultOut(BaseModel):
     error: str | None = None
 
 
+@router.get("/payments")
+async def list_payments(
+    tenant: Tenant = Depends(get_portal_tenant),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Recent hosted-checkout payment links for this tenant.
+
+    Lets merchant staff copy a Pagopar link into an order confirmation
+    email (sending it automatically is a later iteration).
+    """
+    from bims_shopify.adapters.persistence.payment_intent_repository import (
+        SqlAlchemyPaymentIntentRepository,
+    )
+
+    repo = SqlAlchemyPaymentIntentRepository(session)
+    payments = await repo.list_recent(tenant.id)
+    return {"payments": payments}
+
+
 @router.get("/rekey-report")
 async def get_rekey_report(
     tenant: Tenant = Depends(get_portal_tenant),
