@@ -48,6 +48,9 @@ class Tenant:
     field_mappings: dict[str, Any] = field(default_factory=dict)
     active: bool = True
     push_orders_to_bims: bool = True
+    auto_import_products: bool = False
+    auto_import_publish: bool = False
+    auto_import_interval_minutes: int = 360
 
     @property
     def bims_auth_header(self) -> str:

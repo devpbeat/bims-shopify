@@ -7,6 +7,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from alembic.config import Config
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 
@@ -29,6 +31,7 @@ from bims_shopify.api import (
 )
 from bims_shopify.config import get_settings
 from bims_shopify.logging import configure_logging, get_logger
+from bims_shopify.ops.auto_import import AutoImportCoordinator
 from bims_shopify.ops.job_runner import JobRunner
 from bims_shopify.scheduler import TenantSyncScheduler
 
@@ -117,7 +120,8 @@ def create_app() -> FastAPI:
         interrupted_count = await JobRunner.mark_interrupted_on_startup(session_factory)
         if interrupted_count:
             logger.warning("ops_jobs_marked_interrupted", count=interrupted_count)
-        app.state.job_runner = JobRunner(session_factory, settings)
+        job_runner = JobRunner(session_factory, settings)
+        app.state.job_runner = job_runner
 
         async with session_factory() as session:
             repo = SqlAlchemyTenantRepository(session, SecretBox(settings.fernet_key))
@@ -126,10 +130,33 @@ def create_app() -> FastAPI:
             )
         app.state.scheduler = scheduler
         scheduler.start()
+
+        # Separate ticking loop from the inventory-sync scheduler above: this
+        # one only enqueues catalog imports for tenants opted into
+        # auto-import (see ops/auto_import.py), never touches inventory sync.
+        async with session_factory() as session:
+            auto_import_repo = SqlAlchemyTenantRepository(session, SecretBox(settings.fernet_key))
+            auto_import_coordinator = AutoImportCoordinator(
+                auto_import_repo,
+                job_runner,
+                session_factory,
+                settings.auto_import_tick_minutes,
+            )
+        app.state.auto_import_coordinator = auto_import_coordinator
+        auto_import_scheduler = AsyncIOScheduler()
+        auto_import_scheduler.add_job(
+            auto_import_coordinator.run_once,
+            trigger=IntervalTrigger(minutes=settings.auto_import_tick_minutes),
+            id="auto-import-coordinator",
+            replace_existing=True,
+        )
+        auto_import_scheduler.start()
+
         try:
             yield
         finally:
             scheduler.shutdown()
+            auto_import_scheduler.shutdown(wait=False)
             await engine.dispose()
 
     app = FastAPI(title="bims-shopify", lifespan=lifespan)

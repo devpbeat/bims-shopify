@@ -61,6 +61,9 @@ class TenantModel(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     push_orders_to_bims: Mapped[bool] = mapped_column(Boolean, default=True)
     portal_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    auto_import_products: Mapped[bool] = mapped_column(Boolean, default=False)
+    auto_import_publish: Mapped[bool] = mapped_column(Boolean, default=False)
+    auto_import_interval_minutes: Mapped[int] = mapped_column(Integer, default=360)
 
 
 class SyncStateModel(Base):

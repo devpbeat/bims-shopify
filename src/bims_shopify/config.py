@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     admin_token: str = "change-me"
     fernet_key: str = ""
     sync_interval_minutes: int = 30
+    auto_import_tick_minutes: int = 15
     log_level: str = "INFO"
     environment: str = "development"
 

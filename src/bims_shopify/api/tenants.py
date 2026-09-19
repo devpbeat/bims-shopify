@@ -52,6 +52,9 @@ class TenantCreate(BaseModel):
     field_mappings: dict = {}
     active: bool = True
     push_orders_to_bims: bool = True
+    auto_import_products: bool = False
+    auto_import_publish: bool = False
+    auto_import_interval_minutes: int = 360
 
     @field_validator("bims_timezone")
     @classmethod
@@ -90,6 +93,9 @@ class TenantPatch(BaseModel):
     field_mappings: dict | None = None
     active: bool | None = None
     push_orders_to_bims: bool | None = None
+    auto_import_products: bool | None = None
+    auto_import_publish: bool | None = None
+    auto_import_interval_minutes: int | None = None
 
     @field_validator("bims_api_key", "shopify_access_token", "shopify_webhook_secret")
     @classmethod
@@ -124,6 +130,9 @@ class TenantOut(BaseModel):
     payment_provider: PaymentProvider | None
     active: bool
     push_orders_to_bims: bool
+    auto_import_products: bool
+    auto_import_publish: bool
+    auto_import_interval_minutes: int
 
     @classmethod
     def from_domain(cls, tenant: Tenant) -> TenantOut:
@@ -141,6 +150,9 @@ class TenantOut(BaseModel):
             payment_provider=tenant.payment_provider,
             active=tenant.active,
             push_orders_to_bims=tenant.push_orders_to_bims,
+            auto_import_products=tenant.auto_import_products,
+            auto_import_publish=tenant.auto_import_publish,
+            auto_import_interval_minutes=tenant.auto_import_interval_minutes,
         )
 
 

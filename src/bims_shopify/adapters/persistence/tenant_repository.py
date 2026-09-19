@@ -40,6 +40,9 @@ class SqlAlchemyTenantRepository:
             field_mappings=model.field_mappings or {},
             active=model.active,
             push_orders_to_bims=model.push_orders_to_bims,
+            auto_import_products=model.auto_import_products,
+            auto_import_publish=model.auto_import_publish,
+            auto_import_interval_minutes=model.auto_import_interval_minutes,
         )
 
     def _apply_domain(self, model: TenantModel, tenant: Tenant) -> None:
@@ -65,6 +68,9 @@ class SqlAlchemyTenantRepository:
         model.field_mappings = tenant.field_mappings
         model.active = tenant.active
         model.push_orders_to_bims = tenant.push_orders_to_bims
+        model.auto_import_products = tenant.auto_import_products
+        model.auto_import_publish = tenant.auto_import_publish
+        model.auto_import_interval_minutes = tenant.auto_import_interval_minutes
 
     async def get_by_slug(self, slug: str) -> Tenant | None:
         result = await self._session.execute(select(TenantModel).where(TenantModel.slug == slug))
