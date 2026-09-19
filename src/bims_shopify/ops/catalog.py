@@ -5,6 +5,7 @@ Usage::
     python -m bims_shopify.ops.catalog <tenant_slug> wipe --yes-i-mean-it
     python -m bims_shopify.ops.catalog <tenant_slug> import [--apply] [--publish] \\
         [--only-with-stock] [--limit N]
+    python -m bims_shopify.ops.catalog <tenant_slug> status
 
 ``wipe`` deletes every product in the tenant's Shopify store. ``import``
 rebuilds the catalog from the tenant's BIMS company (``tenant.bims_company_id``):
@@ -15,6 +16,13 @@ option; rows without a size suffix become single-variant products.
 ``import`` defaults to a dry run (prints a plan, writes nothing); pass
 ``--apply`` to actually create products in Shopify. New products are created
 as DRAFT unless ``--publish`` is passed.
+
+``status`` pulls both sides (BIMS-eligible rows, Shopify's live catalog) and
+prints a reconciliation report: counts on each side, SKUs present in one but
+not the other (with a 20-item sample), and the last import/wipe/sync
+activity. It persists the counts (not the SKU samples) to ``audit_logs`` as
+a ``catalog.reconciliation`` entry, which the admin API's
+``GET /sync/{slug}/reconciliation`` endpoint serves back without re-pulling.
 """
 from __future__ import annotations
 
@@ -31,6 +39,10 @@ from bims_shopify.adapters.bims.client import BIMSClient
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.adapters.persistence.database import create_engine_and_sessionmaker
+from bims_shopify.adapters.persistence.models import AuditLogModel
+from bims_shopify.adapters.persistence.sync_state_repository import (
+    SqlAlchemySyncStateRepository,
+)
 from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
 from bims_shopify.adapters.shopify.client import ShopifyClient, ShopifyGraphQLError
 from bims_shopify.config import get_settings
@@ -42,6 +54,7 @@ MAX_VARIANTS_PER_PRODUCT = 100
 WIPE_PROGRESS_EVERY = 50
 IMPORT_PROGRESS_EVERY = 25
 SAMPLE_GROUP_COUNT = 5
+RECONCILIATION_SAMPLE_SIZE = 20
 
 #: A trailing parenthetical of 1-6 chars, e.g. " (XL)", " (32)", " (M)".
 _SIZE_SUFFIX_RE = re.compile(r"\s*\(([^)]{1,6})\)\s*$")
@@ -279,6 +292,28 @@ def group_skus(group: ProductGroup) -> set[str]:
     return {v.sku for v in group.variants}
 
 
+def reconciliation_diff(bims_skus: set[str], shopify_skus: set[str]) -> dict[str, Any]:
+    """Compare BIMS-eligible SKUs against Shopify SKUs, both directions.
+
+    ``sample`` lists are capped at ``RECONCILIATION_SAMPLE_SIZE`` and sorted
+    for stable output; ``count`` always reflects the full set size.
+    """
+    missing_in_shopify = sorted(bims_skus - shopify_skus)
+    missing_in_bims = sorted(shopify_skus - bims_skus)
+    matched = bims_skus & shopify_skus
+    return {
+        "skus_in_bims_not_in_shopify": {
+            "count": len(missing_in_shopify),
+            "sample": missing_in_shopify[:RECONCILIATION_SAMPLE_SIZE],
+        },
+        "skus_in_shopify_not_in_bims": {
+            "count": len(missing_in_bims),
+            "sample": missing_in_bims[:RECONCILIATION_SAMPLE_SIZE],
+        },
+        "matched_skus": len(matched),
+    }
+
+
 def build_product_set_input(group: ProductGroup, *, status: str) -> dict[str, Any]:
     """Build the ``ProductSetInput`` payload for one product group."""
     product_input: dict[str, Any] = {"title": group.title, "status": status}
@@ -476,10 +511,105 @@ async def _run_import(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any
         await shopify_client.aclose()
 
 
+def _audit_entry_summary(entry: AuditLogModel | None) -> dict[str, Any] | None:
+    if entry is None:
+        return None
+    return {"created_at": entry.created_at.isoformat(), "payload": entry.payload}
+
+
+async def _fetch_last_activity(tenant_id: int) -> dict[str, Any]:
+    settings = get_settings()
+    engine, session_factory = create_engine_and_sessionmaker(settings)
+    try:
+        async with session_factory() as session:
+            audit = SqlAlchemyAuditLogger(session)
+            last_import = await audit.get_latest(action="catalog.import", tenant_id=tenant_id)
+            last_wipe = await audit.get_latest(action="catalog.wipe", tenant_id=tenant_id)
+            sync_state_repo = SqlAlchemySyncStateRepository(session)
+            sync_status = await sync_state_repo.get_status(tenant_id)
+        return {
+            "last_import": _audit_entry_summary(last_import),
+            "last_wipe": _audit_entry_summary(last_wipe),
+            "last_sync": {
+                "last_run_at": sync_status["last_run_at"],
+                "last_run_summary": sync_status["last_run_summary"],
+            },
+        }
+    finally:
+        await engine.dispose()
+
+
+async def _run_status(tenant: Tenant, args: argparse.Namespace) -> dict[str, Any]:
+    bims_client = BIMSClient(tenant)
+    shopify_client = ShopifyClient(tenant)
+    try:
+        raw_rows = await fetch_bims_catalog_rows(bims_client, tenant.bims_company_id)
+        rows, duplicates = filter_and_dedupe_rows(raw_rows)
+        grouping = group_rows(rows)
+        bims_skus = {v.sku for g in grouping.groups for v in g.variants}
+
+        shopify_products = 0
+        async for _product in shopify_client.iter_all_products():
+            shopify_products += 1
+
+        shopify_variants = 0
+        shopify_variants_with_sku = 0
+        shopify_skus: set[str] = set()
+        async for variant in shopify_client.iter_all_variants():
+            shopify_variants += 1
+            sku = (variant.get("sku") or "").strip()
+            if sku:
+                shopify_variants_with_sku += 1
+                shopify_skus.add(sku)
+
+        reconciliation = reconciliation_diff(bims_skus, shopify_skus)
+
+        report: dict[str, Any] = {
+            "bims": {
+                "eligible_products": len(grouping.groups),
+                "eligible_variants": len(rows),
+                "duplicate_code2": len(duplicates),
+            },
+            "shopify": {
+                "products": shopify_products,
+                "variants": shopify_variants,
+                "variants_with_sku": shopify_variants_with_sku,
+            },
+            "reconciliation": reconciliation,
+            "last_activity": await _fetch_last_activity(tenant.id),
+        }
+
+        # Persist counts only (not the SKU samples) so audit_logs stays small.
+        await _audit(
+            tenant.id,
+            "catalog.reconciliation",
+            {
+                "bims": report["bims"],
+                "shopify": report["shopify"],
+                "reconciliation": {
+                    "skus_in_bims_not_in_shopify": reconciliation["skus_in_bims_not_in_shopify"][
+                        "count"
+                    ],
+                    "skus_in_shopify_not_in_bims": reconciliation["skus_in_shopify_not_in_bims"][
+                        "count"
+                    ],
+                    "matched_skus": reconciliation["matched_skus"],
+                },
+            },
+        )
+
+        return report
+    finally:
+        await bims_client.aclose()
+        await shopify_client.aclose()
+
+
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     tenant = await _load_tenant_from_db(args.tenant_slug)
     if args.command == "wipe":
         return await _run_wipe(tenant, args)
+    if args.command == "status":
+        return await _run_status(tenant, args)
     return await _run_import(tenant, args)
 
 
@@ -520,6 +650,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Only process the first N product groups (for smoke testing).",
+    )
+
+    subparsers.add_parser(
+        "status",
+        help="Reconciliation report: BIMS-eligible catalog vs. what's actually in Shopify.",
     )
 
     return parser

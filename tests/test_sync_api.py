@@ -151,3 +151,51 @@ async def test_run_sync_status_endpoint_reports_last_run(app_and_tenant, mock_bi
     body = status_response.json()
     assert body["last_run_summary"]["status"] == "ok"
     assert body["last_run_at"] is not None
+
+async def test_get_reconciliation_404s_when_none_persisted(app_and_tenant):
+    transport = ASGITransport(app=app_and_tenant)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/sync/acme/reconciliation", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        )
+    assert response.status_code == 404
+
+async def test_get_reconciliation_returns_latest_persisted_entry(app_and_tenant):
+    from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
+    from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
+
+    async with app_and_tenant.state.session_factory() as session:
+        repo = SqlAlchemyTenantRepository(session, SecretBox(app_and_tenant.state.settings.fernet_key))
+        tenant = await repo.get_by_slug("acme")
+        audit = SqlAlchemyAuditLogger(session)
+        await audit.log(
+            actor="system",
+            action="catalog.reconciliation",
+            entity="catalog",
+            tenant_id=tenant.id,
+            payload={"bims": {"eligible_products": 1}, "reconciliation": {"matched_skus": 0}},
+        )
+        # A second, newer entry must win over the first.
+        await audit.log(
+            actor="system",
+            action="catalog.reconciliation",
+            entity="catalog",
+            tenant_id=tenant.id,
+            payload={"bims": {"eligible_products": 2}, "reconciliation": {"matched_skus": 1}},
+        )
+
+    transport = ASGITransport(app=app_and_tenant)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/sync/acme/reconciliation", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["payload"]["bims"]["eligible_products"] == 2
+    assert body["created_at"] is not None
+
+async def test_get_reconciliation_requires_admin_auth(app_and_tenant):
+    transport = ASGITransport(app=app_and_tenant)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/sync/acme/reconciliation")
+    assert response.status_code == 401

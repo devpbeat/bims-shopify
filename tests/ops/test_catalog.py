@@ -1,11 +1,24 @@
-"""Tests for the catalog ops script (wipe + import from BIMS)."""
+"""Tests for the catalog ops script (wipe + import + status from BIMS)."""
 from __future__ import annotations
+
+import asyncio
+import json
+import os
+from pathlib import Path
 
 import httpx
 import respx
+from cryptography.fernet import Fernet
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from bims_shopify.adapters.bims.client import BIMSClient
+from bims_shopify.adapters.persistence.crypto import SecretBox
+from bims_shopify.adapters.persistence.models import AuditLogModel
+from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
 from bims_shopify.adapters.shopify.client import ShopifyClient
+from bims_shopify.config import Settings
+from bims_shopify.ops import catalog as catalog_ops
 from bims_shopify.ops.catalog import (
     BimsRow,
     apply_import,
@@ -13,6 +26,7 @@ from bims_shopify.ops.catalog import (
     fetch_existing_skus,
     filter_and_dedupe_rows,
     group_rows,
+    reconciliation_diff,
     split_size_suffix,
     wipe_catalog,
 )
@@ -268,3 +282,157 @@ async def test_fetch_stock_by_sku_clamps_negative(tenant):
     bims_client = BIMSClient(tenant)
     stock = await fetch_stock_by_sku(bims_client, ["SKU-1"], [1])
     assert stock == {"SKU-1": 0.0}
+
+
+# -- reconciliation -------------------------------------------------------
+
+
+def test_reconciliation_diff_finds_skus_missing_from_shopify():
+    result = reconciliation_diff({"A", "B", "C"}, {"B"})
+    assert result["skus_in_bims_not_in_shopify"] == {"count": 2, "sample": ["A", "C"]}
+    assert result["matched_skus"] == 1
+
+
+def test_reconciliation_diff_finds_skus_missing_from_bims():
+    result = reconciliation_diff({"A"}, {"A", "B", "C"})
+    assert result["skus_in_shopify_not_in_bims"] == {"count": 2, "sample": ["B", "C"]}
+    assert result["matched_skus"] == 1
+
+
+def test_reconciliation_diff_all_matched_when_sets_equal():
+    result = reconciliation_diff({"A", "B"}, {"A", "B"})
+    assert result["skus_in_bims_not_in_shopify"] == {"count": 0, "sample": []}
+    assert result["skus_in_shopify_not_in_bims"] == {"count": 0, "sample": []}
+    assert result["matched_skus"] == 2
+
+
+def test_reconciliation_diff_caps_sample_at_20():
+    bims_only = {f"SKU-{i}" for i in range(25)}
+    result = reconciliation_diff(bims_only, set())
+    assert result["skus_in_bims_not_in_shopify"]["count"] == 25
+    assert len(result["skus_in_bims_not_in_shopify"]["sample"]) == 20
+
+
+# -- status subcommand: end-to-end --------------------------------------------
+
+
+async def _make_status_db(monkeypatch, tmp_path) -> Settings:
+    db_path = tmp_path / "status.db"
+    settings = Settings(
+        admin_token="test-admin-token",
+        fernet_key=Fernet.generate_key().decode("utf-8"),
+        database_url=f"sqlite+aiosqlite:///{db_path}",
+    )
+
+    from alembic import command
+    from alembic.config import Config
+
+    repo_root = Path(__file__).resolve().parents[2]
+    cfg = Config(str(repo_root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(repo_root / "alembic"))
+    os.environ["ALEMBIC_DATABASE_URL"] = settings.database_url
+    try:
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+    finally:
+        os.environ.pop("ALEMBIC_DATABASE_URL", None)
+
+    monkeypatch.setattr(catalog_ops, "get_settings", lambda: settings)
+    return settings
+
+
+async def _seed_tenant(settings: Settings, tenant) -> int:
+    engine = create_async_engine(settings.database_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            repo = SqlAlchemyTenantRepository(session, SecretBox(settings.fernet_key))
+            created = await repo.create(tenant.__class__(**{**tenant.__dict__, "id": None}))
+            return created.id
+    finally:
+        await engine.dispose()
+
+
+@respx.mock
+async def test_run_status_prints_full_reconciliation_report(monkeypatch, tmp_path, tenant, capsys):
+    settings = await _make_status_db(monkeypatch, tmp_path)
+    tenant_id = await _seed_tenant(settings, tenant)
+    tenant.id = tenant_id
+
+    respx.get(f"{BIMS_URL}/api/products/index.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "count": "2",
+                "data": [
+                    {"Product": _row("1", "Shirt (S)", "SKU-S")},
+                    {"Product": _row("2", "Mug", "SKU-ORPHAN")},
+                ],
+            },
+        )
+    )
+    respx.post(GRAPHQL_URL).mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "products": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [{"id": "p1", "title": "Shirt"}],
+                        }
+                    }
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "productVariants": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [
+                                {"id": "v1", "sku": "SKU-S", "product": {"id": "p1", "title": "Shirt"}},
+                                {"id": "v2", "sku": "SKU-EXTRA", "product": {"id": "p1", "title": "Shirt"}},
+                            ],
+                        }
+                    }
+                },
+            ),
+        ]
+    )
+
+    # main() itself just wraps `_run` in asyncio.run() + json.dumps(..., indent=2)
+    # (see bims_shopify.ops.catalog.main); calling it directly here would nest
+    # asyncio.run() inside pytest-asyncio's already-running loop, so we drive
+    # the same code path it uses and print exactly as it would.
+    args = catalog_ops._build_arg_parser().parse_args(["acme", "status"])
+    tenant_from_db = await catalog_ops._load_tenant_from_db(args.tenant_slug)
+    report = await catalog_ops._run_status(tenant_from_db, args)
+    print(json.dumps(report, indent=2))
+    out = capsys.readouterr().out
+    report = json.loads(out)
+
+    assert report["bims"] == {"eligible_products": 2, "eligible_variants": 2, "duplicate_code2": 0}
+    assert report["shopify"] == {"products": 1, "variants": 2, "variants_with_sku": 2}
+    assert report["reconciliation"]["matched_skus"] == 1
+    assert report["reconciliation"]["skus_in_bims_not_in_shopify"]["sample"] == ["SKU-ORPHAN"]
+    assert report["reconciliation"]["skus_in_shopify_not_in_bims"]["sample"] == ["SKU-EXTRA"]
+    assert report["last_activity"] == {
+        "last_import": None,
+        "last_wipe": None,
+        "last_sync": {"last_run_at": None, "last_run_summary": {}},
+    }
+
+    # Persisted for the admin endpoint to serve back — counts only, no samples.
+    engine = create_async_engine(settings.database_url, future=True)
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            result = await session.execute(
+                select(AuditLogModel).where(AuditLogModel.action == "catalog.reconciliation")
+            )
+            entries = list(result.scalars().all())
+    finally:
+        await engine.dispose()
+    assert len(entries) == 1
+    assert "sample" not in json.dumps(entries[0].payload)
+    assert entries[0].payload["reconciliation"]["matched_skus"] == 1

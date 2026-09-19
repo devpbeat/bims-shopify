@@ -244,3 +244,26 @@ async def get_sync_status(
 
     sync_state_repo = SqlAlchemySyncStateRepository(session)
     return await sync_state_repo.get_status(tenant.id)
+
+
+@router.get("/{tenant_slug}/reconciliation")
+async def get_reconciliation(
+    tenant_slug: str,
+    repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    session: AsyncSession = _Depends(get_db_session),
+):
+    """Return the latest persisted BIMS-vs-Shopify reconciliation report.
+
+    Serves the last ``catalog.reconciliation`` audit entry written by
+    ``python -m bims_shopify.ops.catalog <slug> status``. Does not re-pull
+    live data: a full BIMS pull takes minutes, too slow for a request.
+    """
+    tenant = await repo.get_by_slug(tenant_slug)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Unknown tenant")
+
+    audit = SqlAlchemyAuditLogger(session)
+    entry = await audit.get_latest(action="catalog.reconciliation", tenant_id=tenant.id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="No reconciliation report yet")
+    return {"created_at": entry.created_at.isoformat(), "payload": entry.payload}
