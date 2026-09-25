@@ -100,20 +100,29 @@ class SyncInventoryToShopify:
         products = await self._erp.list_products(tenant, since=since)
         deltas = diff_inventory(previous_stocks, products)
 
+        # Resolve every SKU -> inventory_item_id in a single bulk catalog
+        # listing, once per run. This replaces per-SKU `find_variant_by_sku`
+        # search-index lookups, which are both slow (N Shopify requests) and
+        # unreliable for DRAFT products: Shopify's search index does not
+        # reliably include drafts, so a freshly rebuilt (all-draft) catalog
+        # would resolve zero variants via search even though the product
+        # listing (which this map is built from) sees them fine.
+        sku_map = await self._storefront.build_sku_inventory_map(tenant)
+
         if dry_run:
-            return await self._build_dry_run_report(tenant, products, deltas)
+            return await self._build_dry_run_report(tenant, products, deltas, sku_map)
 
         resolved: list[InventoryDelta] = []
         for delta in deltas:
-            variant = await self._storefront.find_variant_by_sku(tenant, delta.sku)
-            if variant is None:
+            inventory_item_id = sku_map.get(delta.sku)
+            if inventory_item_id is None:
                 continue
             resolved.append(
                 InventoryDelta(
                     sku=delta.sku,
                     previous_stock=delta.previous_stock,
                     new_stock=delta.new_stock,
-                    variant_inventory_item_id=variant.get("inventoryItem", {}).get("id"),
+                    variant_inventory_item_id=inventory_item_id,
                 )
             )
 
@@ -167,13 +176,18 @@ class SyncInventoryToShopify:
         return None
 
     async def _build_dry_run_report(
-        self, tenant: Tenant, products: list[ProductSnapshot], deltas: list[InventoryDelta]
+        self,
+        tenant: Tenant,
+        products: list[ProductSnapshot],
+        deltas: list[InventoryDelta],
+        sku_map: dict[str, str],
     ) -> DryRunReport:
         """Build a diff-only report. Never calls Shopify write endpoints."""
         report = DryRunReport(
             total_products=len(products),
             with_resolved_stock=sum(1 for p in products if p.stock is not None),
             would_update=len(deltas),
+            skipped_missing_variant=sum(1 for d in deltas if d.sku not in sku_map),
             skipped_unresolved_stock=sum(1 for p in products if p.stock is None),
         )
         for delta in deltas[:3]:

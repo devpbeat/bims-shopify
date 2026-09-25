@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -117,15 +118,42 @@ async def _get_state(app, shop: str) -> str:
     return qs["state"][0]
 
 
+def _graphql_side_effect(request: httpx.Request) -> httpx.Response:
+    """Route by GraphQL operation name so the same mock URL can answer both
+    the onboarding location lookup and the scheduled sync's bulk variant
+    listing (used by build_sku_inventory_map)."""
+    body = json.loads(request.content)
+    query = body.get("query", "")
+    if "ListAllVariants" in query:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "productVariants": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [],
+                    }
+                }
+            },
+        )
+    return httpx.Response(
+        200,
+        json={"data": {"locations": {"nodes": [{"id": "gid://shopify/Location/1", "name": "Main"}]}}},
+    )
+
+
 def _mock_shopify_token_and_location(shop: str) -> None:
     respx.post(f"https://{shop}/admin/oauth/access_token").mock(
         return_value=httpx.Response(200, json={"access_token": "shpat_real_token"})
     )
+    # Registered both with and without a trailing slash: the oauth flow
+    # posts to the bare URL, while ShopifyClient (base_url + empty path via
+    # httpx) produces a trailing-slash URL for the same endpoint.
     respx.post(f"https://{shop}/admin/api/2025-07/graphql.json").mock(
-        return_value=httpx.Response(
-            200,
-            json={"data": {"locations": {"nodes": [{"id": "gid://shopify/Location/1", "name": "Main"}]}}},
-        )
+        side_effect=_graphql_side_effect
+    )
+    respx.post(f"https://{shop}/admin/api/2025-07/graphql.json/").mock(
+        side_effect=_graphql_side_effect
     )
 
 

@@ -52,15 +52,59 @@ class _FakeERP:
         return self._products
 
 
+class _AlwaysResolvingSkuMap(dict):
+    """Stand-in for a bulk sku->inventory_item_id map that resolves any SKU.
+
+    Mirrors the old _FakeStorefront.find_variant_by_sku behavior (which
+    always returned a variant) without needing to know every SKU a test
+    will ask about ahead of time.
+    """
+
+    def get(self, key, default=None):
+        return f"gid://{key}"
+
+    def __contains__(self, key):
+        return True
+
+
 class _FakeStorefront:
     def __init__(self):
         self.write_calls = 0
+
+    async def build_sku_inventory_map(self, tenant):
+        return _AlwaysResolvingSkuMap()
 
     async def find_variant_by_sku(self, tenant, sku):
         return {"inventoryItem": {"id": f"gid://{sku}"}}
 
     async def set_inventory_quantities(self, tenant, deltas):
         self.write_calls += 1
+
+    async def upsert_product(self, tenant, sku, name, price):
+        pass
+
+
+class _FakeStorefrontBulkMap:
+    """Storefront fake whose bulk map may include SKUs that a search-based
+    find_variant_by_sku lookup would miss (e.g. drafts). find_variant_by_sku
+    always returns None here to prove the sync no longer depends on it."""
+
+    def __init__(self, sku_map):
+        self.sku_map = sku_map
+        self.write_calls = 0
+        self.pushed_deltas = []
+        self.search_called = False
+
+    async def build_sku_inventory_map(self, tenant):
+        return self.sku_map
+
+    async def find_variant_by_sku(self, tenant, sku):
+        self.search_called = True
+        return None
+
+    async def set_inventory_quantities(self, tenant, deltas):
+        self.write_calls += 1
+        self.pushed_deltas.extend(deltas)
 
     async def upsert_product(self, tenant, sku, name, price):
         pass
@@ -224,3 +268,86 @@ async def test_since_is_forwarded_to_erp(tenant):
     await use_case.run(tenant, {}, since=when)
 
     assert erp.received_since == when
+
+
+async def test_run_resolves_variants_from_bulk_map_including_drafts(tenant):
+    """Regression test for the production bug: find_variant_by_sku's
+    search-index lookup misses DRAFT products, so a freshly rebuilt
+    (all-draft) catalog matched 0 variants and stock was never pushed. The
+    bulk map (built from a full listing, which does see drafts) must be
+    used instead, and find_variant_by_sku must not be called at all."""
+    from bims_shopify.application.sync_inventory import SyncInventoryToShopify
+
+    current = [ProductSnapshot(sku="DRAFT-SKU", name="A", price=10.0, stock=5.0)]
+    erp = _FakeERP(current)
+    storefront = _FakeStorefrontBulkMap({"DRAFT-SKU": "gid://InventoryItem/1"})
+    use_case = SyncInventoryToShopify(erp, storefront)
+
+    result = await use_case.run(tenant, {}, dry_run=False)
+
+    assert not storefront.search_called
+    assert storefront.write_calls == 1
+    assert storefront.pushed_deltas[0].variant_inventory_item_id == "gid://InventoryItem/1"
+    assert len(result) == 1
+
+
+async def test_run_skips_skus_missing_from_bulk_map(tenant):
+    """A SKU absent from the bulk map (no matching Shopify variant at all)
+    must not be pushed, and must not appear among the pushed deltas."""
+    from bims_shopify.application.sync_inventory import SyncInventoryToShopify
+
+    current = [
+        ProductSnapshot(sku="KNOWN", name="A", price=10.0, stock=5.0),
+        ProductSnapshot(sku="MISSING", name="B", price=20.0, stock=2.0),
+    ]
+    erp = _FakeERP(current)
+    storefront = _FakeStorefrontBulkMap({"KNOWN": "gid://InventoryItem/1"})
+    use_case = SyncInventoryToShopify(erp, storefront)
+
+    await use_case.run(tenant, {}, dry_run=False)
+
+    pushed_skus = {d.sku for d in storefront.pushed_deltas}
+    assert pushed_skus == {"KNOWN"}
+
+
+async def test_dry_run_report_counts_skipped_missing_variant_via_bulk_map(tenant):
+    """Dry-run's skipped_missing_variant must reflect the bulk map, not a
+    per-SKU search, so operators see an accurate count for draft-heavy
+    catalogs before committing to a real push."""
+    from bims_shopify.application.sync_inventory import SyncInventoryToShopify
+
+    current = [
+        ProductSnapshot(sku="KNOWN", name="A", price=10.0, stock=5.0),
+        ProductSnapshot(sku="MISSING", name="B", price=20.0, stock=2.0),
+    ]
+    erp = _FakeERP(current)
+    storefront = _FakeStorefrontBulkMap({"KNOWN": "gid://InventoryItem/1"})
+    use_case = SyncInventoryToShopify(erp, storefront)
+
+    report = await use_case.run(tenant, {}, dry_run=True)
+
+    assert report.would_update == 2
+    assert report.skipped_missing_variant == 1
+    assert storefront.write_calls == 0
+
+
+async def test_force_still_pushes_via_bulk_map(tenant):
+    """force=True must still resolve variants from the bulk map (not
+    find_variant_by_sku) and push all matched deltas."""
+    from bims_shopify.application.sync_inventory import SyncInventoryToShopify
+
+    current = [
+        ProductSnapshot(sku=f"SKU{i}", name="A", price=10.0, stock=float(i + 1))
+        for i in range(5)
+    ]
+    sku_map = {f"SKU{i}": f"gid://InventoryItem/{i}" for i in range(5)}
+    erp = _FakeERP(current)
+    storefront = _FakeStorefrontBulkMap(sku_map)
+    use_case = SyncInventoryToShopify(erp, storefront)
+
+    result = await use_case.run(tenant, {}, dry_run=False, force=True)
+
+    assert not storefront.search_called
+    assert len(result) == 5
+    assert storefront.write_calls == 1
+    assert len(storefront.pushed_deltas) == 5

@@ -219,6 +219,19 @@ async def test_sync_dry_run_and_completed_write_audit(app_ctx):
         mock.post("https://bims.example.com/api/products_stocks/stock_fenicio.json").mock(
             return_value=httpx.Response(200, json={"status": "OK", "data": {"stockPorSku": []}})
         )
+        mock.post("https://acme.myshopify.com/admin/api/2025-07/graphql.json/").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "productVariants": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [],
+                        }
+                    }
+                },
+            )
+        )
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             dry = await client.post(
                 "/sync/acme/run", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}

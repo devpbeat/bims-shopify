@@ -12,6 +12,15 @@ class StorefrontPort(Protocol):
         """Look up a product variant (and its inventory item id) by SKU."""
         ...
 
+    async def build_sku_inventory_map(self, tenant: Tenant) -> dict[str, str]:
+        """Return {sku: inventory_item_id} for every variant in the shop.
+
+        Built from a full catalog listing (not the search index), so it
+        includes DRAFT products, unlike ``find_variant_by_sku``'s
+        query-based lookup.
+        """
+        ...
+
     async def set_inventory_quantities(
         self, tenant: Tenant, deltas: list[InventoryDelta]
     ) -> None:

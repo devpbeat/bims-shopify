@@ -106,6 +106,20 @@ async def app_and_tenant():
     os.unlink(db_file.name)
 
 
+def _empty_list_all_variants_response():
+    return httpx.Response(
+        200,
+        json={
+            "data": {
+                "productVariants": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [],
+                }
+            }
+        },
+    )
+
+
 @pytest.fixture
 def mock_bims_and_shopify_empty():
     with respx.mock(assert_all_called=False) as mock:
@@ -114,6 +128,9 @@ def mock_bims_and_shopify_empty():
         )
         mock.post("https://bims.example.com/api/products_stocks/stock_fenicio.json").mock(
             return_value=httpx.Response(200, json={"status": "OK", "data": {"stockPorSku": []}})
+        )
+        mock.post("https://acme.myshopify.com/admin/api/2025-07/graphql.json/").mock(
+            return_value=_empty_list_all_variants_response()
         )
         yield mock
 
@@ -162,17 +179,18 @@ def mock_bims_one_product_and_shopify_variant():
     and accepts the inventory push. Used to prove force re-pushes even when
     the stored product_hashes watermark already equals the current BIMS
     stock (the store-wipe-and-rebuild scenario)."""
-    find_variant_response = {
+    list_all_variants_response = {
         "data": {
             "productVariants": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
                 "nodes": [
                     {
                         "id": "gid://shopify/ProductVariant/1",
                         "sku": "SKU1",
-                        "inventoryItem": {"id": "gid://shopify/InventoryItem/1"},
                         "product": {"id": "gid://shopify/Product/1", "title": "A"},
+                        "inventoryItem": {"id": "gid://shopify/InventoryItem/1", "tracked": True},
                     }
-                ]
+                ],
             }
         }
     }
@@ -214,7 +232,8 @@ def mock_bims_one_product_and_shopify_variant():
         )
         mock.post(_graphql_url()).mock(
             side_effect=[
-                httpx.Response(200, json=find_variant_response),
+                httpx.Response(200, json=list_all_variants_response),
+                httpx.Response(200, json=list_all_variants_response),
                 httpx.Response(200, json=set_quantities_response),
             ]
         )

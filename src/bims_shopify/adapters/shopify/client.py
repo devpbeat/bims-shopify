@@ -350,6 +350,25 @@ class ShopifyClient:
         data = await self._graphql(_GET_ORDER, {"id": order_id})
         return data.get("order")
 
+    async def build_sku_inventory_map(self, tenant: Tenant) -> dict[str, str]:
+        """Return {sku: inventory_item_id} for every variant in the shop.
+
+        Built via ``iter_all_variants`` (a full catalog listing), which —
+        unlike the search-index-backed ``find_variant_by_sku`` query —
+        reliably includes DRAFT products. Used by inventory sync to resolve
+        every delta's variant in a single pass instead of one Shopify
+        search request per SKU.
+        """
+        sku_map: dict[str, str] = {}
+        async for node in self.iter_all_variants():
+            sku = (node.get("sku") or "").strip()
+            if not sku:
+                continue
+            inventory_item_id = (node.get("inventoryItem") or {}).get("id")
+            if inventory_item_id:
+                sku_map[sku] = inventory_item_id
+        return sku_map
+
     async def iter_all_variants(self) -> AsyncIterator[dict[str, Any]]:
         """Page through every product variant in the shop.
 
