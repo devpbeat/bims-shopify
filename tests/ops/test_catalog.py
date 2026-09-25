@@ -789,3 +789,306 @@ async def test_run_fix_tracking_isolates_per_product_failures(tenant):
 
     assert summary["fixed"] == 1
     assert summary["failed"] == [{"product_id": "p1", "error": "ShopifyGraphQLError: boom"}]
+
+
+# -- cleanup_no_stock (draft/delete zero-stock products) ----------------------
+
+
+def test_compute_cleanup_plan_all_zero_stock_is_target():
+    from bims_shopify.ops.catalog import compute_cleanup_plan
+
+    products = [{"id": "p1", "title": "Dead Shirt", "status": "ACTIVE", "skus": ["SKU-A", "SKU-B"]}]
+    stock = {"SKU-A": 0.0, "SKU-B": 0.0}
+    plan = compute_cleanup_plan(products, stock, mode="draft")
+    assert [t["product_id"] for t in plan.targets] == ["p1"]
+    assert plan.unknown == []
+    assert plan.already_done == 0
+
+
+def test_compute_cleanup_plan_any_positive_stock_is_kept():
+    from bims_shopify.ops.catalog import compute_cleanup_plan
+
+    products = [{"id": "p1", "title": "Live Shirt", "status": "ACTIVE", "skus": ["SKU-A", "SKU-B"]}]
+    stock = {"SKU-A": 0.0, "SKU-B": 3.0}
+    plan = compute_cleanup_plan(products, stock, mode="draft")
+    assert plan.targets == []
+    assert plan.unknown == []
+    assert plan.already_done == 0
+
+
+def test_compute_cleanup_plan_unknown_sku_is_kept_and_reported():
+    from bims_shopify.ops.catalog import compute_cleanup_plan
+
+    products = [{"id": "p1", "title": "Mystery", "status": "ACTIVE", "skus": ["SKU-A", "SKU-GONE"]}]
+    stock = {"SKU-A": 0.0}  # SKU-GONE has no BIMS record at all
+    plan = compute_cleanup_plan(products, stock, mode="draft")
+    assert plan.targets == []
+    assert [u["product_id"] for u in plan.unknown] == ["p1"]
+
+
+def test_compute_cleanup_plan_no_skus_is_unknown():
+    from bims_shopify.ops.catalog import compute_cleanup_plan
+
+    products = [{"id": "p1", "title": "No Variants", "status": "ACTIVE", "skus": []}]
+    plan = compute_cleanup_plan(products, {}, mode="draft")
+    assert plan.targets == []
+    assert [u["product_id"] for u in plan.unknown] == ["p1"]
+
+
+def test_compute_cleanup_plan_draft_mode_already_done_is_skipped():
+    from bims_shopify.ops.catalog import compute_cleanup_plan
+
+    products = [{"id": "p1", "title": "Already Drafted", "status": "DRAFT", "skus": ["SKU-A"]}]
+    plan = compute_cleanup_plan(products, {"SKU-A": 0.0}, mode="draft")
+    assert plan.targets == []
+    assert plan.already_done == 1
+
+
+def test_compute_cleanup_plan_delete_mode_has_no_already_done():
+    from bims_shopify.ops.catalog import compute_cleanup_plan
+
+    products = [{"id": "p1", "title": "Zero Stock", "status": "DRAFT", "skus": ["SKU-A"]}]
+    plan = compute_cleanup_plan(products, {"SKU-A": 0.0}, mode="delete")
+    assert [t["product_id"] for t in plan.targets] == ["p1"]
+    assert plan.already_done == 0
+
+
+def test_build_cleanup_report_shape_and_sample_caps():
+    from bims_shopify.ops.catalog import CleanupPlan, build_cleanup_report
+
+    plan = CleanupPlan(
+        total_products=30,
+        targets=[{"product_id": f"p{i}", "title": "X", "skus": []} for i in range(25)],
+        unknown=[{"product_id": f"u{i}", "title": "Y", "skus": []} for i in range(12)],
+        already_done=3,
+    )
+    report = build_cleanup_report(plan)
+    assert report["total_products"] == 30
+    assert report["targets"]["count"] == 25
+    assert len(report["targets"]["sample"]) == 20
+    assert report["unknown"]["count"] == 12
+    assert len(report["unknown"]["sample"]) == 10
+    assert report["already_done"] == 3
+
+
+async def test_apply_cleanup_draft_mode_sets_status_and_isolates_failures():
+    from bims_shopify.adapters.shopify.client import ShopifyGraphQLError
+    from bims_shopify.ops.catalog import apply_cleanup
+
+    calls = []
+
+    class _FakeShopifyClient:
+        async def set_product_status(self, product_id, status):
+            if product_id == "p2":
+                raise ShopifyGraphQLError("boom")
+            calls.append((product_id, status))
+
+    targets = [
+        {"product_id": "p1", "title": "A", "skus": []},
+        {"product_id": "p2", "title": "B", "skus": []},
+    ]
+    result = await apply_cleanup(_FakeShopifyClient(), targets, mode="draft")
+    assert result.processed == 1
+    assert calls == [("p1", "DRAFT")]
+    assert result.failed == [{"product_id": "p2", "error": "ShopifyGraphQLError: boom"}]
+
+
+async def test_apply_cleanup_delete_mode_deletes_products():
+    from bims_shopify.ops.catalog import apply_cleanup
+
+    calls = []
+
+    class _FakeShopifyClient:
+        async def delete_product(self, product_id):
+            calls.append(product_id)
+
+    targets = [{"product_id": "p1", "title": "A", "skus": []}]
+    result = await apply_cleanup(_FakeShopifyClient(), targets, mode="delete")
+    assert result.processed == 1
+    assert calls == ["p1"]
+
+
+def _cleanup_fake_clients(products: list[dict], stock_by_sku: dict[str, float], calls: dict):
+    class _FakeShopifyClient:
+        def __init__(self, tenant):
+            pass
+
+        async def iter_all_products_with_skus(self):
+            for product in products:
+                yield product
+
+        async def set_product_status(self, product_id, status):
+            calls.setdefault("status", []).append((product_id, status))
+
+        async def delete_product(self, product_id):
+            calls.setdefault("deleted", []).append(product_id)
+
+        async def aclose(self):
+            pass
+
+    class _FakeBimsClient:
+        def __init__(self, tenant):
+            pass
+
+        async def stock_fenicio(self, *, skus, warehouse_ids, request_id):
+            return {
+                "data": {
+                    "stockPorSku": [
+                        {"sku": sku, "stock": stock_by_sku[sku]}
+                        for sku in skus
+                        if sku in stock_by_sku
+                    ]
+                }
+            }
+
+        async def aclose(self):
+            pass
+
+    return _FakeShopifyClient, _FakeBimsClient
+
+
+async def test_run_cleanup_no_stock_dry_run_reports_without_mutating(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    products = [
+        {"id": "p1", "title": "Dead", "status": "ACTIVE", "skus": ["SKU-A"]},
+        {"id": "p2", "title": "Live", "status": "ACTIVE", "skus": ["SKU-B"]},
+    ]
+    stock = {"SKU-A": 0.0, "SKU-B": 5.0}
+    calls: dict = {}
+    fake_shopify, fake_bims = _cleanup_fake_clients(products, stock, calls)
+
+    shopify_target = catalog_ops.ShopifyClient
+    bims_target = catalog_ops.BIMSClient
+    catalog_ops.ShopifyClient = fake_shopify  # type: ignore[assignment]
+    catalog_ops.BIMSClient = fake_bims  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(["acme", "cleanup-no-stock"])
+        report = await catalog_ops._run_cleanup_no_stock(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = shopify_target  # type: ignore[assignment]
+        catalog_ops.BIMSClient = bims_target  # type: ignore[assignment]
+
+    assert report["dry_run"] is True
+    assert report["mode"] == "draft"
+    assert report["targets"]["count"] == 1
+    assert report["targets"]["sample"][0]["product_id"] == "p1"
+    assert "apply" not in calls
+    assert calls == {}
+
+
+async def test_run_cleanup_no_stock_apply_draft_mode_sets_status(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.id = None  # skip real-DB audit write
+    products = [{"id": "p1", "title": "Dead", "status": "ACTIVE", "skus": ["SKU-A"]}]
+    stock = {"SKU-A": 0.0}
+    calls: dict = {}
+    fake_shopify, fake_bims = _cleanup_fake_clients(products, stock, calls)
+
+    shopify_target = catalog_ops.ShopifyClient
+    bims_target = catalog_ops.BIMSClient
+    catalog_ops.ShopifyClient = fake_shopify  # type: ignore[assignment]
+    catalog_ops.BIMSClient = fake_bims  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(
+            ["acme", "cleanup-no-stock", "--apply", "--force"]
+        )
+        report = await catalog_ops._run_cleanup_no_stock(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = shopify_target  # type: ignore[assignment]
+        catalog_ops.BIMSClient = bims_target  # type: ignore[assignment]
+
+    assert report["apply"]["processed"] == 1
+    assert calls["status"] == [("p1", "DRAFT")]
+
+
+async def test_run_cleanup_no_stock_apply_delete_mode_deletes(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.id = None
+    products = [{"id": "p1", "title": "Dead", "status": "ACTIVE", "skus": ["SKU-A"]}]
+    stock = {"SKU-A": 0.0}
+    calls: dict = {}
+    fake_shopify, fake_bims = _cleanup_fake_clients(products, stock, calls)
+
+    shopify_target = catalog_ops.ShopifyClient
+    bims_target = catalog_ops.BIMSClient
+    catalog_ops.ShopifyClient = fake_shopify  # type: ignore[assignment]
+    catalog_ops.BIMSClient = fake_bims  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(
+            ["acme", "cleanup-no-stock", "--apply", "--mode", "delete", "--force"]
+        )
+        report = await catalog_ops._run_cleanup_no_stock(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = shopify_target  # type: ignore[assignment]
+        catalog_ops.BIMSClient = bims_target  # type: ignore[assignment]
+
+    assert report["apply"]["processed"] == 1
+    assert calls["deleted"] == ["p1"]
+
+
+async def test_run_cleanup_no_stock_idempotent_second_pass_finds_no_new_targets(tenant):
+    """Draft mode: once a product is DRAFT, the next dry run reports it as already_done."""
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.id = None
+    products_first_pass = [{"id": "p1", "title": "Dead", "status": "ACTIVE", "skus": ["SKU-A"]}]
+    stock = {"SKU-A": 0.0}
+    calls: dict = {}
+    fake_shopify, fake_bims = _cleanup_fake_clients(products_first_pass, stock, calls)
+
+    shopify_target = catalog_ops.ShopifyClient
+    bims_target = catalog_ops.BIMSClient
+    catalog_ops.ShopifyClient = fake_shopify  # type: ignore[assignment]
+    catalog_ops.BIMSClient = fake_bims  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(
+            ["acme", "cleanup-no-stock", "--apply", "--force"]
+        )
+        first = await catalog_ops._run_cleanup_no_stock(tenant, args)
+        assert first["apply"]["processed"] == 1
+
+        # Second pass: same product now reports DRAFT (simulating the applied change).
+        products_second_pass = [{"id": "p1", "title": "Dead", "status": "DRAFT", "skus": ["SKU-A"]}]
+        fake_shopify_2, fake_bims_2 = _cleanup_fake_clients(products_second_pass, stock, {})
+        catalog_ops.ShopifyClient = fake_shopify_2  # type: ignore[assignment]
+        catalog_ops.BIMSClient = fake_bims_2  # type: ignore[assignment]
+        second_args = catalog_ops._build_arg_parser().parse_args(["acme", "cleanup-no-stock"])
+        second = await catalog_ops._run_cleanup_no_stock(tenant, second_args)
+    finally:
+        catalog_ops.ShopifyClient = shopify_target  # type: ignore[assignment]
+        catalog_ops.BIMSClient = bims_target  # type: ignore[assignment]
+
+    assert second["targets"]["count"] == 0
+    assert second["already_done"] == 1
+
+
+async def test_run_cleanup_no_stock_safety_guard_blocks_over_60_percent(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    products = [{"id": "p0", "title": "Live", "status": "ACTIVE", "skus": ["SKU-LIVE"]}]
+    stock = {"SKU-LIVE": 5.0}
+    for i in range(1, 5):
+        products.append({"id": f"p{i}", "title": "Dead", "status": "ACTIVE", "skus": [f"SKU-{i}"]})
+        stock[f"SKU-{i}"] = 0.0
+    calls: dict = {}
+    fake_shopify, fake_bims = _cleanup_fake_clients(products, stock, calls)
+
+    shopify_target = catalog_ops.ShopifyClient
+    bims_target = catalog_ops.BIMSClient
+    catalog_ops.ShopifyClient = fake_shopify  # type: ignore[assignment]
+    catalog_ops.BIMSClient = fake_bims  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(["acme", "cleanup-no-stock", "--apply"])
+        try:
+            await catalog_ops._run_cleanup_no_stock(tenant, args)
+        except SystemExit as exc:
+            assert "Safety guard" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit from the safety guard")
+        assert calls == {}
+    finally:
+        catalog_ops.ShopifyClient = shopify_target  # type: ignore[assignment]
+        catalog_ops.BIMSClient = bims_target  # type: ignore[assignment]

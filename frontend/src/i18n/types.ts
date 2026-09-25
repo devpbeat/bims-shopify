@@ -144,6 +144,9 @@ export interface Messages {
     autoResolve: string
     typeDomainToConfirm: (domain: string) => string
     domainMismatch: string
+    cleanupMode: string
+    cleanupModeDraft: string
+    cleanupModeDelete: string
     commands: {
       status: { title: string; description: string }
       import: { title: string; description: string; confirmApply: string }
@@ -151,6 +154,12 @@ export interface Messages {
       wipe: { title: string; description: string; confirmApply: string }
       rekey: { title: string; description: string; confirmApply: string }
       fixTracking: { title: string; description: string; confirmApply: string }
+      cleanupNoStock: {
+        title: string
+        description: string
+        confirmApplyDraft: string
+        confirmApplyDelete: string
+      }
     }
     jobStatus: {
       queued: string

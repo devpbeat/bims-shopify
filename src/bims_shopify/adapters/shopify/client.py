@@ -109,6 +109,7 @@ query ListAllProductsWithSkus($cursor: String) {
     nodes {
       id
       title
+      status
       variants(first: 100) {
         nodes { sku }
       }
@@ -425,6 +426,7 @@ class ShopifyClient:
                 yield {
                     "id": node["id"],
                     "title": node.get("title"),
+                    "status": node.get("status"),
                     "skus": [s for s in skus if s],
                 }
             page_info = connection["pageInfo"]

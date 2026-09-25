@@ -1,6 +1,15 @@
-export type OpsCommand = 'status' | 'wipe' | 'import' | 'dedupe' | 'rekey' | 'fix_tracking'
+export type OpsCommand =
+  | 'status'
+  | 'wipe'
+  | 'import'
+  | 'dedupe'
+  | 'rekey'
+  | 'fix_tracking'
+  | 'cleanup_no_stock'
 
 export type OpsJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
+
+export type CleanupMode = 'draft' | 'delete'
 
 export interface OpsRunOptions {
   confirm?: boolean
@@ -10,6 +19,7 @@ export interface OpsRunOptions {
   publish?: boolean
   force?: boolean
   auto_resolve?: boolean
+  mode?: CleanupMode
 }
 
 export interface OpsRunResponse {

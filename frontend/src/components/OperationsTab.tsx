@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ApiError } from '../api/client'
 import { getOpsJob, getOpsJobs, runOpsCommand } from '../api/opsClient'
-import type { OpsCommand, OpsJob, OpsJobDetail, OpsRunOptions } from '../api/opsTypes'
+import type { CleanupMode, OpsCommand, OpsJob, OpsJobDetail, OpsRunOptions } from '../api/opsTypes'
 import { useT } from '../i18n'
 
 interface OperationsTabProps {
@@ -110,6 +110,11 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
 
   const [fixTrackingDryRun, setFixTrackingDryRun] = useState(true)
 
+  const [cleanupDryRun, setCleanupDryRun] = useState(true)
+  const [cleanupMode, setCleanupMode] = useState<CleanupMode>('draft')
+  const [cleanupForce, setCleanupForce] = useState(false)
+  const [cleanupAdvancedOpen, setCleanupAdvancedOpen] = useState(false)
+
   const [wipeAdvancedOpen, setWipeAdvancedOpen] = useState(false)
   const [wipeConfirmText, setWipeConfirmText] = useState('')
 
@@ -212,6 +217,7 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
   const wipeJob = latestJobFor('wipe')
   const rekeyJob = latestJobFor('rekey')
   const fixTrackingJob = latestJobFor('fix_tracking')
+  const cleanupJob = latestJobFor('cleanup_no_stock')
 
   return (
     <div className="ops-tab">
@@ -402,6 +408,74 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
           {t.operator.runButton}
         </button>
         {fixTrackingJob && <JobPanel job={fixTrackingJob} />}
+      </div>
+
+      <div className="ops-card">
+        <h3>{t.operator.commands.cleanupNoStock.title}</h3>
+        <p className="muted">{t.operator.commands.cleanupNoStock.description}</p>
+        {runError.cleanup_no_stock && <p className="error-text">{runError.cleanup_no_stock}</p>}
+        <label className="ops-toggle">
+          <input
+            type="checkbox"
+            checked={cleanupDryRun}
+            onChange={(e) => setCleanupDryRun(e.target.checked)}
+          />
+          {t.operator.dryRun}
+        </label>
+        <label className="ops-field">
+          {t.operator.cleanupMode}
+          <select value={cleanupMode} onChange={(e) => setCleanupMode(e.target.value as CleanupMode)}>
+            <option value="draft">{t.operator.cleanupModeDraft}</option>
+            <option value="delete">{t.operator.cleanupModeDelete}</option>
+          </select>
+        </label>
+        {cleanupMode === 'delete' && <p className="error-text">{t.operator.forceWarning}</p>}
+        <button
+          type="button"
+          className="btn-link"
+          onClick={() => setCleanupAdvancedOpen((v) => !v)}
+        >
+          {t.operator.advancedDisclosure}
+        </button>
+        {cleanupAdvancedOpen && (
+          <div className="ops-danger-zone">
+            <label className="ops-toggle">
+              <input
+                type="checkbox"
+                checked={cleanupForce}
+                onChange={(e) => setCleanupForce(e.target.checked)}
+              />
+              {t.operator.force}
+            </label>
+            <p className="error-text">{t.operator.forceWarning}</p>
+          </div>
+        )}
+        <button
+          type="button"
+          className={cleanupMode === 'delete' && !cleanupDryRun ? 'btn btn-danger' : 'btn btn-primary'}
+          onClick={() => {
+            const options: OpsRunOptions = {
+              apply: !cleanupDryRun,
+              mode: cleanupMode,
+              force: cleanupForce,
+            }
+            if (!cleanupDryRun) {
+              setPendingConfirm({
+                title: t.operator.confirmTitle,
+                message:
+                  cleanupMode === 'delete'
+                    ? t.operator.commands.cleanupNoStock.confirmApplyDelete
+                    : t.operator.commands.cleanupNoStock.confirmApplyDraft,
+                onConfirm: () => launch('cleanup_no_stock', options),
+              })
+            } else {
+              launch('cleanup_no_stock', options)
+            }
+          }}
+        >
+          {t.operator.runButton}
+        </button>
+        {cleanupJob && <JobPanel job={cleanupJob} />}
       </div>
 
       <div className="ops-card ops-card-danger">

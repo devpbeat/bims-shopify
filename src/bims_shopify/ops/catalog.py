@@ -76,6 +76,10 @@ RECONCILIATION_SAMPLE_SIZE = 20
 DEDUPE_DUPLICATES_SAMPLE_SIZE = 20
 DEDUPE_PARTIAL_OVERLAP_SAMPLE_SIZE = 10
 DEDUPE_MAX_DELETE_RATIO = 0.6
+CLEANUP_PROGRESS_EVERY = 50
+CLEANUP_TARGET_SAMPLE_SIZE = 20
+CLEANUP_UNKNOWN_SAMPLE_SIZE = 10
+CLEANUP_MAX_TARGET_RATIO = 0.6
 
 #: Progress callback signature shared by the CLI and the background job
 #: runner: (done, total-or-None, human message). May be sync or async.
@@ -699,6 +703,165 @@ async def apply_fix_tracking(
     return result
 
 
+@dataclass
+class CleanupPlan:
+    """Result of scanning the catalog for products with no BIMS stock.
+
+    A product is a ``target`` only when every one of its variant SKUs is
+    confirmed zero-stock in BIMS (aggregated across the tenant's warehouses).
+    A product with at least one variant SKU that BIMS has no record of at all
+    is reported as ``unknown`` and never touched -- we only ever act on
+    confirmed zero-stock, never on "we don't know". A product with zero SKUs
+    is also reported as ``unknown`` (nothing to confirm against BIMS).
+
+    ``already_done`` counts zero-stock products that are already in the
+    target state for ``mode="draft"`` (status already DRAFT), so re-running
+    the same mode finds ~0 new targets on the second pass. ``mode="delete"``
+    has no observable "already done" state (a deleted product no longer
+    appears in the scan), so it is always 0 for that mode.
+    """
+
+    total_products: int = 0
+    targets: list[dict[str, Any]] = field(default_factory=list)
+    unknown: list[dict[str, Any]] = field(default_factory=list)
+    already_done: int = 0
+
+
+def compute_cleanup_plan(
+    products: list[dict[str, Any]], stock_by_sku: dict[str, float], *, mode: str
+) -> CleanupPlan:
+    plan = CleanupPlan(total_products=len(products))
+    for product in products:
+        skus = [s for s in (product.get("skus") or []) if s]
+        product_id = product.get("id")
+        title = product.get("title")
+        status = product.get("status")
+
+        if not skus or any(sku not in stock_by_sku for sku in skus):
+            plan.unknown.append({"product_id": product_id, "title": title, "skus": skus})
+            continue
+
+        zero_stock = all(stock_by_sku.get(sku, 0.0) <= 0 for sku in skus)
+        if not zero_stock:
+            continue
+
+        if mode == "draft" and status == "DRAFT":
+            plan.already_done += 1
+            continue
+
+        plan.targets.append({"product_id": product_id, "title": title, "skus": skus})
+
+    return plan
+
+
+def build_cleanup_report(plan: CleanupPlan) -> dict[str, Any]:
+    return {
+        "total_products": plan.total_products,
+        "targets": {
+            "count": len(plan.targets),
+            "sample": plan.targets[:CLEANUP_TARGET_SAMPLE_SIZE],
+        },
+        "unknown": {
+            "count": len(plan.unknown),
+            "sample": plan.unknown[:CLEANUP_UNKNOWN_SAMPLE_SIZE],
+        },
+        "already_done": plan.already_done,
+    }
+
+
+@dataclass
+class CleanupApplyResult:
+    processed: int = 0
+    failed: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_summary(self) -> dict[str, Any]:
+        return {"processed": self.processed, "failed": self.failed}
+
+
+async def apply_cleanup(
+    shopify_client: ShopifyClient,
+    targets: list[dict[str, Any]],
+    *,
+    mode: str,
+    progress: ProgressFn | None = None,
+) -> CleanupApplyResult:
+    """Draft or delete every target product, isolating per-product failures."""
+    result = CleanupApplyResult()
+    for index, target in enumerate(targets, start=1):
+        product_id = target["product_id"]
+        try:
+            if mode == "delete":
+                await shopify_client.delete_product(product_id)
+            else:
+                await shopify_client.set_product_status(product_id, "DRAFT")
+        except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
+            result.failed.append({"product_id": product_id, "error": f"{type(exc).__name__}: {exc}"})
+        else:
+            result.processed += 1
+        if index % CLEANUP_PROGRESS_EVERY == 0:
+            message = f"{index}/{len(targets)} products processed"
+            print(f"  ... {message}")
+            await _emit_progress(progress, index, len(targets), message)
+    return result
+
+
+async def _run_cleanup_no_stock(
+    tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
+) -> dict[str, Any]:
+    mode = args.mode
+    if mode not in ("draft", "delete"):
+        raise SystemExit(f"cleanup_no_stock: invalid mode '{mode}' (must be 'draft' or 'delete')")
+
+    bims_client = BIMSClient(tenant)
+    shopify_client = ShopifyClient(tenant)
+    try:
+        await _emit_progress(progress, 0, None, "scanning Shopify catalog")
+        products = await fetch_products_with_skus(shopify_client)
+        all_skus = [sku for product in products for sku in (product.get("skus") or []) if sku]
+
+        await _emit_progress(progress, 0, None, "checking BIMS stock")
+        stock_by_sku = await fetch_stock_by_sku(bims_client, all_skus, tenant.stock_warehouse_ids)
+
+        plan = compute_cleanup_plan(products, stock_by_sku, mode=mode)
+        report = build_cleanup_report(plan)
+        report["mode"] = mode
+
+        if not args.apply:
+            report["dry_run"] = True
+            return report
+
+        target_count = len(plan.targets)
+        if plan.total_products > 0 and not args.force:
+            ratio = target_count / plan.total_products
+            if ratio > CLEANUP_MAX_TARGET_RATIO:
+                raise SystemExit(
+                    f"Safety guard: cleanup_no_stock would touch {target_count}/{plan.total_products} "
+                    f"products ({ratio:.0%}), exceeding the "
+                    f"{CLEANUP_MAX_TARGET_RATIO:.0%} threshold. Re-run with --force to override "
+                    "if this is expected."
+                )
+
+        apply_result = await apply_cleanup(shopify_client, plan.targets, mode=mode, progress=progress)
+        report["apply"] = apply_result.to_summary()
+        await _audit(
+            tenant.id,
+            "ops.cleanup_no_stock",
+            {
+                "mode": mode,
+                "total_products": plan.total_products,
+                "targets_found": target_count,
+                "unknown": len(plan.unknown),
+                "already_done": plan.already_done,
+                "processed": apply_result.processed,
+                "failed": len(apply_result.failed),
+            },
+        )
+        return report
+    finally:
+        await bims_client.aclose()
+        await shopify_client.aclose()
+
+
 async def _run_fix_tracking(
     tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
 ) -> dict[str, Any]:
@@ -998,6 +1161,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         return await _run_dedupe(tenant, args)
     if args.command == "fix-tracking":
         return await _run_fix_tracking(tenant, args)
+    if args.command == "cleanup-no-stock":
+        return await _run_cleanup_no_stock(tenant, args)
     return await _run_import(tenant, args)
 
 
@@ -1043,6 +1208,17 @@ async def run_fix_tracking(
 ) -> dict[str, Any]:
     args = argparse.Namespace(apply=bool(options.get("apply", False)))
     return await _run_fix_tracking(tenant, args, progress=progress)
+
+
+async def run_cleanup_no_stock(
+    tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None
+) -> dict[str, Any]:
+    args = argparse.Namespace(
+        apply=bool(options.get("apply", False)),
+        mode=options.get("mode", "draft"),
+        force=bool(options.get("force", False)),
+    )
+    return await _run_cleanup_no_stock(tenant, args, progress=progress)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -1116,6 +1292,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help="Execute the repair (default: dry run, reports counts only).",
+    )
+
+    cleanup_parser = subparsers.add_parser(
+        "cleanup-no-stock",
+        help="Draft or delete Shopify products with no stock in BIMS.",
+    )
+    cleanup_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Execute the cleanup (default: dry run, prints the report only).",
+    )
+    cleanup_parser.add_argument(
+        "--mode",
+        choices=["draft", "delete"],
+        default="draft",
+        help="What to do with zero-stock products: set to DRAFT (default) or delete them.",
+    )
+    cleanup_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Override the safety guard that refuses to touch more than "
+        f"{CLEANUP_MAX_TARGET_RATIO:.0%} of the catalog in one run.",
     )
 
     return parser

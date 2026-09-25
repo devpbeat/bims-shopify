@@ -163,6 +163,9 @@ export const en: Messages = {
     autoResolve: 'Auto-resolve',
     typeDomainToConfirm: (domain) => `Type "${domain}" to confirm this destructive action.`,
     domainMismatch: 'The typed value does not match the shop domain.',
+    cleanupMode: 'Mode',
+    cleanupModeDraft: 'Draft (set to Draft status)',
+    cleanupModeDelete: 'Delete (permanently remove)',
     commands: {
       status: {
         title: 'Status',
@@ -193,6 +196,14 @@ export const en: Messages = {
         description:
           'Enables inventory tracking on existing variants that were created without it, and activates them at the store location so the regular sync can write stock.',
         confirmApply: 'This will enable inventory tracking on affected Shopify variants. Continue?',
+      },
+      cleanupNoStock: {
+        title: 'Cleanup no-stock products',
+        description:
+          'Declutters the store of dead products BIMS won\'t let you delete: finds Shopify products with zero confirmed stock in BIMS and sets them to Draft, or permanently deletes them.',
+        confirmApplyDraft: 'This will set the listed zero-stock products to Draft status. Continue?',
+        confirmApplyDelete:
+          'DESTRUCTIVE: this will PERMANENTLY DELETE the listed zero-stock products from Shopify. This cannot be undone. Continue?',
       },
     },
     jobStatus: {

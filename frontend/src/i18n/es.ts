@@ -168,6 +168,9 @@ export const es: Messages = {
     autoResolve: 'Auto-resolver',
     typeDomainToConfirm: (domain) => `Escribí "${domain}" para confirmar esta acción destructiva.`,
     domainMismatch: 'El valor ingresado no coincide con el dominio de la tienda.',
+    cleanupMode: 'Modo',
+    cleanupModeDraft: 'Borrador (cambiar a estado Draft)',
+    cleanupModeDelete: 'Eliminar (borrado permanente)',
     commands: {
       status: {
         title: 'Estado',
@@ -198,6 +201,14 @@ export const es: Messages = {
         description:
           'Activa el seguimiento de inventario para variantes existentes que se crearon sin seguimiento, y las activa en la ubicación de la tienda para que la sincronización regular pueda escribir stock.',
         confirmApply: 'Esto activará el seguimiento de inventario en las variantes afectadas de Shopify. ¿Continuar?',
+      },
+      cleanupNoStock: {
+        title: 'Limpiar productos sin stock',
+        description:
+          'Ordena la tienda eliminando productos muertos que BIMS no permite borrar: busca productos de Shopify con stock cero confirmado en BIMS y los pasa a Draft, o los elimina permanentemente.',
+        confirmApplyDraft: 'Esto pasará a estado Draft los productos sin stock listados. ¿Continuar?',
+        confirmApplyDelete:
+          'DESTRUCTIVO: esto ELIMINARÁ PERMANENTEMENTE los productos sin stock listados de Shopify. Esta acción no se puede deshacer. ¿Continuar?',
       },
     },
     jobStatus: {

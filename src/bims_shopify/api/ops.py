@@ -24,11 +24,21 @@ from .deps import get_db_session, get_tenant_repository, require_admin
 
 router = APIRouter(prefix="/ops", tags=["ops"], dependencies=[Depends(require_admin)])
 
-_VALID_COMMANDS = {"status", "wipe", "import", "dedupe", "rekey", "fix_tracking"}
+_VALID_COMMANDS = {
+    "status",
+    "wipe",
+    "import",
+    "dedupe",
+    "rekey",
+    "fix_tracking",
+    "cleanup_no_stock",
+}
 
 
 class RunJobRequest(BaseModel):
-    command: Literal["status", "wipe", "import", "dedupe", "rekey", "fix_tracking"]
+    command: Literal[
+        "status", "wipe", "import", "dedupe", "rekey", "fix_tracking", "cleanup_no_stock"
+    ]
     options: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -64,6 +74,16 @@ def _validate_options(command: str, options: dict[str, Any]) -> dict[str, Any]:
 
     if command == "fix_tracking":
         return {"apply": bool(options.get("apply", False))}
+
+    if command == "cleanup_no_stock":
+        mode = options.get("mode", "draft")
+        if mode not in ("draft", "delete"):
+            raise HTTPException(status_code=422, detail="options.mode must be 'draft' or 'delete'")
+        return {
+            "apply": bool(options.get("apply", False)),
+            "mode": mode,
+            "force": bool(options.get("force", False)),
+        }
 
     # status
     return {}

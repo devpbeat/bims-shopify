@@ -41,6 +41,7 @@ _COMMAND_RUNNERS = {
     "dedupe": catalog.run_dedupe,
     "rekey": rekey_skus.run_rekey,
     "fix_tracking": catalog.run_fix_tracking,
+    "cleanup_no_stock": catalog.run_cleanup_no_stock,
 }
 
 
