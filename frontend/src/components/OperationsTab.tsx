@@ -110,6 +110,11 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
 
   const [fixTrackingDryRun, setFixTrackingDryRun] = useState(true)
 
+  const [syncDryRun, setSyncDryRun] = useState(true)
+  const [syncFull, setSyncFull] = useState(false)
+  const [syncForce, setSyncForce] = useState(false)
+  const [syncAdvancedOpen, setSyncAdvancedOpen] = useState(false)
+
   const [cleanupDryRun, setCleanupDryRun] = useState(true)
   const [cleanupMode, setCleanupMode] = useState<CleanupMode>('draft')
   const [cleanupForce, setCleanupForce] = useState(false)
@@ -218,6 +223,7 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
   const rekeyJob = latestJobFor('rekey')
   const fixTrackingJob = latestJobFor('fix_tracking')
   const cleanupJob = latestJobFor('cleanup_no_stock')
+  const syncJob = latestJobFor('sync')
 
   return (
     <div className="ops-tab">
@@ -408,6 +414,51 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
           {t.operator.runButton}
         </button>
         {fixTrackingJob && <JobPanel job={fixTrackingJob} />}
+      </div>
+
+      <div className="ops-card">
+        <h3>{t.operator.commands.sync.title}</h3>
+        <p className="muted">{t.operator.commands.sync.description}</p>
+        {runError.sync && <p className="error-text">{runError.sync}</p>}
+        <label className="ops-toggle">
+          <input type="checkbox" checked={syncDryRun} onChange={(e) => setSyncDryRun(e.target.checked)} />
+          {t.operator.dryRun}
+        </label>
+        <label className="ops-toggle">
+          <input type="checkbox" checked={syncFull} onChange={(e) => setSyncFull(e.target.checked)} />
+          {t.operator.full}
+        </label>
+        <button type="button" className="btn-link" onClick={() => setSyncAdvancedOpen((v) => !v)}>
+          {t.operator.advancedDisclosure}
+        </button>
+        {syncAdvancedOpen && (
+          <div className="ops-danger-zone">
+            <label className="ops-toggle">
+              <input type="checkbox" checked={syncForce} onChange={(e) => setSyncForce(e.target.checked)} />
+              {t.operator.force}
+            </label>
+            <p className="error-text">{t.operator.syncForceWarning}</p>
+          </div>
+        )}
+        <button
+          type="button"
+          className="btn btn-primary"
+          onClick={() => {
+            const options: OpsRunOptions = { dry_run: syncDryRun, full: syncFull, force: syncForce }
+            if (!syncDryRun) {
+              setPendingConfirm({
+                title: t.operator.confirmTitle,
+                message: t.operator.commands.sync.confirmApply,
+                onConfirm: () => launch('sync', options),
+              })
+            } else {
+              launch('sync', options)
+            }
+          }}
+        >
+          {t.operator.runButton}
+        </button>
+        {syncJob && <JobPanel job={syncJob} />}
       </div>
 
       <div className="ops-card">

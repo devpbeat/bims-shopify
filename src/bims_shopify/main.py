@@ -129,6 +129,11 @@ def create_app() -> FastAPI:
                 repo, _make_sync_tenant_fn(session_factory), settings.sync_interval_minutes
             )
         app.state.scheduler = scheduler
+        # Share this scheduler's per-tenant lock with the "sync" ops job
+        # (see JobRunner._run) so a background sync job, the scheduled
+        # tick, and a manual HTTP sync can never run concurrently for the
+        # same tenant.
+        job_runner.set_sync_lock_provider(scheduler.lock_for_tenant)
         scheduler.start()
 
         # Separate ticking loop from the inventory-sync scheduler above: this

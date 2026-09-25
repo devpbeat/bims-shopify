@@ -141,6 +141,8 @@ export interface Messages {
     limit: string
     force: string
     forceWarning: string
+    full: string
+    syncForceWarning: string
     autoResolve: string
     typeDomainToConfirm: (domain: string) => string
     domainMismatch: string
@@ -154,6 +156,7 @@ export interface Messages {
       wipe: { title: string; description: string; confirmApply: string }
       rekey: { title: string; description: string; confirmApply: string }
       fixTracking: { title: string; description: string; confirmApply: string }
+      sync: { title: string; description: string; confirmApply: string }
       cleanupNoStock: {
         title: string
         description: string

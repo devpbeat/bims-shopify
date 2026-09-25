@@ -32,12 +32,20 @@ _VALID_COMMANDS = {
     "rekey",
     "fix_tracking",
     "cleanup_no_stock",
+    "sync",
 }
 
 
 class RunJobRequest(BaseModel):
     command: Literal[
-        "status", "wipe", "import", "dedupe", "rekey", "fix_tracking", "cleanup_no_stock"
+        "status",
+        "wipe",
+        "import",
+        "dedupe",
+        "rekey",
+        "fix_tracking",
+        "cleanup_no_stock",
+        "sync",
     ]
     options: dict[str, Any] = Field(default_factory=dict)
 
@@ -74,6 +82,15 @@ def _validate_options(command: str, options: dict[str, Any]) -> dict[str, Any]:
 
     if command == "fix_tracking":
         return {"apply": bool(options.get("apply", False))}
+
+    if command == "sync":
+        result: dict[str, Any] = {}
+        for key in ("dry_run", "full", "force"):
+            value = options.get(key, False)
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=422, detail=f"options.{key} must be a boolean")
+            result[key] = value
+        return result
 
     if command == "cleanup_no_stock":
         mode = options.get("mode", "draft")

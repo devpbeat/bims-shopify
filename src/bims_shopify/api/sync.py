@@ -22,6 +22,7 @@ from bims_shopify.adapters.shopify.client import ShopifyClient
 from bims_shopify.application.sync_inventory import (
     DryRunReport,
     NeedsConfirmation,
+    ProgressFn,
     SyncInventoryToShopify,
 )
 from bims_shopify.logging import get_logger
@@ -77,8 +78,18 @@ async def run_sync(
 
 
 async def _do_run_sync(
-    tenant, dry_run: bool, session: AsyncSession, full: bool = False, force: bool = False
+    tenant,
+    dry_run: bool,
+    session: AsyncSession,
+    full: bool = False,
+    force: bool = False,
+    progress: ProgressFn | None = None,
 ):
+    """Core sync coroutine shared by the manual HTTP endpoint (kept for the
+    scheduler / back-compat), the APScheduler tick (main.py), and the
+    background ops job (ops/sync_job.py) -- so behavior never diverges
+    between the three entry points. ``progress`` is optional and only used
+    by the background job to report coarse phase progress."""
     sync_state_repo = SqlAlchemySyncStateRepository(session)
     audit = SqlAlchemyAuditLogger(session)
     client = BIMSClient(tenant)
@@ -138,7 +149,7 @@ async def _do_run_sync(
         run_started_at = datetime.now(UTC)
         try:
             result = await use_case.run(
-                tenant, previous_stocks, since=since, dry_run=dry_run, force=force
+                tenant, previous_stocks, since=since, dry_run=dry_run, force=force, progress=progress
             )
         except Exception as exc:
             duration = (datetime.now(UTC) - started_at).total_seconds()

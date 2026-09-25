@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -26,7 +27,7 @@ from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenant
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.config import Settings
 from bims_shopify.logging import get_logger
-from bims_shopify.ops import catalog, rekey_skus
+from bims_shopify.ops import catalog, rekey_skus, sync_job
 
 logger = get_logger(__name__)
 
@@ -42,6 +43,7 @@ _COMMAND_RUNNERS = {
     "rekey": rekey_skus.run_rekey,
     "fix_tracking": catalog.run_fix_tracking,
     "cleanup_no_stock": catalog.run_cleanup_no_stock,
+    "sync": sync_job.run_sync,
 }
 
 
@@ -57,6 +59,16 @@ class JobRunner:
         # Strong references to in-flight tasks so they are not garbage
         # collected mid-run (asyncio only holds a weak ref once created).
         self._background_tasks: set[asyncio.Task[None]] = set()
+        # Optional: shared per-tenant sync lock provider (set by main.py to
+        # `TenantSyncScheduler.lock_for_tenant`). When set, the "sync"
+        # command additionally acquires this lock so a sync job can never
+        # run concurrently with the APScheduler tick or a manual HTTP sync
+        # (`POST /sync/{slug}/run`) for the same tenant -- all three share
+        # the exact same lock object. See `set_sync_lock_provider`.
+        self._tenant_sync_lock_provider: Callable[[int], asyncio.Lock] | None = None
+
+    def set_sync_lock_provider(self, provider: Callable[[int], asyncio.Lock]) -> None:
+        self._tenant_sync_lock_provider = provider
 
     def _lock_for(self, tenant_id: int, command: str) -> asyncio.Lock:
         key = (tenant_id, command)
@@ -87,7 +99,15 @@ class JobRunner:
     async def _run(self, job_id: int, tenant_id: int, command: str, options: dict[str, Any]) -> None:
         lock = self._lock_for(tenant_id, command)
         async with lock:
-            await self._execute(job_id, tenant_id, command, options)
+            if command == "sync" and self._tenant_sync_lock_provider is not None:
+                # Also hold the shared tenant sync lock for the whole run,
+                # so this job serializes with the scheduler tick and manual
+                # HTTP sync -- not just with other "sync" ops jobs.
+                shared_lock = self._tenant_sync_lock_provider(tenant_id)
+                async with shared_lock:
+                    await self._execute(job_id, tenant_id, command, options)
+            else:
+                await self._execute(job_id, tenant_id, command, options)
 
     async def _execute(self, job_id: int, tenant_id: int, command: str, options: dict[str, Any]) -> None:
         async with self._session_factory() as session:

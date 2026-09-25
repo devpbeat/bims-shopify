@@ -1,6 +1,8 @@
 """Use case: compute inventory deltas from BIMS and push them to Shopify."""
 from __future__ import annotations
 
+import inspect
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -8,6 +10,21 @@ from bims_shopify.domain.product import InventoryDelta, ProductSnapshot
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.ports.erp import ERPPort
 from bims_shopify.ports.storefront import StorefrontPort
+
+#: Progress callback signature shared by the CLI/job runner (see
+#: ops/catalog.py): (done, total-or-None, human message). May be sync or
+#: async. Used here so a background sync job can report coarse phase
+#: progress (pulling BIMS, resolving variants, pushing batches) instead of
+#: going silent for the full run duration.
+ProgressFn = Callable[[int, int | None, str], "Awaitable[None] | None"]
+
+
+async def _emit_progress(progress: ProgressFn | None, done: int, total: int | None, message: str) -> None:
+    if progress is None:
+        return
+    outcome = progress(done, total, message)
+    if inspect.isawaitable(outcome):
+        await outcome
 
 # Per-run safety guard defaults (tenant-configurable via field_mappings).
 # If a run would zero out more than this fraction of matched variants, or
@@ -86,6 +103,7 @@ class SyncInventoryToShopify:
         since: datetime | None = None,
         dry_run: bool = False,
         force: bool = False,
+        progress: ProgressFn | None = None,
     ) -> list[InventoryDelta] | DryRunReport | NeedsConfirmation:
         """Run the sync.
 
@@ -98,6 +116,9 @@ class SyncInventoryToShopify:
         true full re-push; ``force`` itself only controls the guard.
         """
         products = await self._erp.list_products(tenant, since=since)
+        await _emit_progress(
+            progress, len(products), None, f"pulled {len(products)} products from BIMS"
+        )
         deltas = diff_inventory(previous_stocks, products)
 
         # Resolve every SKU -> inventory_item_id in a single bulk catalog
@@ -108,6 +129,9 @@ class SyncInventoryToShopify:
         # would resolve zero variants via search even though the product
         # listing (which this map is built from) sees them fine.
         sku_map = await self._storefront.build_sku_inventory_map(tenant)
+        await _emit_progress(
+            progress, len(sku_map), None, f"resolved {len(sku_map)} Shopify variants"
+        )
 
         if dry_run:
             return await self._build_dry_run_report(tenant, products, deltas, sku_map)
@@ -131,10 +155,15 @@ class SyncInventoryToShopify:
             if guard_result is not None:
                 return guard_result
 
+        total_batches = max(1, -(-len(resolved) // INVENTORY_PUSH_BATCH_SIZE)) if resolved else 0
         for i in range(0, len(resolved), INVENTORY_PUSH_BATCH_SIZE):
             batch = resolved[i : i + INVENTORY_PUSH_BATCH_SIZE]
             if batch:
                 await self._storefront.set_inventory_quantities(tenant, batch)
+            batch_num = i // INVENTORY_PUSH_BATCH_SIZE + 1
+            await _emit_progress(
+                progress, batch_num, total_batches, f"pushed batch {batch_num}/{total_batches}"
+            )
         return deltas
 
     def _check_safety_guard(

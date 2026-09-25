@@ -6,6 +6,7 @@ export type OpsCommand =
   | 'rekey'
   | 'fix_tracking'
   | 'cleanup_no_stock'
+  | 'sync'
 
 export type OpsJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
 
@@ -20,6 +21,8 @@ export interface OpsRunOptions {
   force?: boolean
   auto_resolve?: boolean
   mode?: CleanupMode
+  dry_run?: boolean
+  full?: boolean
 }
 
 export interface OpsRunResponse {

@@ -165,6 +165,9 @@ export const es: Messages = {
     limit: 'Límite',
     force: 'Forzar',
     forceWarning: 'Forzar evita el resguardo de seguridad del 60%. Usar con precaución.',
+    full: 'Completa',
+    syncForceWarning:
+      'Forzar ignora tanto la marca de agua desactualizada como el resguardo de seguridad por corrida (ratio de ceros / máximo de cambios), y vuelve a enviar cada SKU con stock resoluble aunque parezca sin cambios. Usar después de vaciar y reconstruir la tienda.',
     autoResolve: 'Auto-resolver',
     typeDomainToConfirm: (domain) => `Escribí "${domain}" para confirmar esta acción destructiva.`,
     domainMismatch: 'El valor ingresado no coincide con el dominio de la tienda.',
@@ -201,6 +204,12 @@ export const es: Messages = {
         description:
           'Activa el seguimiento de inventario para variantes existentes que se crearon sin seguimiento, y las activa en la ubicación de la tienda para que la sincronización regular pueda escribir stock.',
         confirmApply: 'Esto activará el seguimiento de inventario en las variantes afectadas de Shopify. ¿Continuar?',
+      },
+      sync: {
+        title: 'Sincronizar inventario',
+        description:
+          'Trae el stock actual desde BIMS y envía a Shopify las cantidades que cambiaron. Corre en segundo plano, así no lo afectan los timeouts de request en catálogos grandes.',
+        confirmApply: 'Esto escribirá cantidades de inventario en Shopify. ¿Continuar?',
       },
       cleanupNoStock: {
         title: 'Limpiar productos sin stock',

@@ -160,6 +160,9 @@ export const en: Messages = {
     limit: 'Limit',
     force: 'Force',
     forceWarning: 'Force bypasses the 60% safety guard. Use with caution.',
+    full: 'Full',
+    syncForceWarning:
+      'Force bypasses both the stale-watermark check and the per-run safety guard (zero-ratio / max-changed), re-pushing every SKU with resolvable stock even if it looks unchanged. Use after a store wipe+rebuild.',
     autoResolve: 'Auto-resolve',
     typeDomainToConfirm: (domain) => `Type "${domain}" to confirm this destructive action.`,
     domainMismatch: 'The typed value does not match the shop domain.',
@@ -196,6 +199,12 @@ export const en: Messages = {
         description:
           'Enables inventory tracking on existing variants that were created without it, and activates them at the store location so the regular sync can write stock.',
         confirmApply: 'This will enable inventory tracking on affected Shopify variants. Continue?',
+      },
+      sync: {
+        title: 'Sync inventory',
+        description:
+          'Pulls current stock from BIMS and pushes changed quantities to Shopify. Runs in the background so it is not affected by request timeouts on large catalogs.',
+        confirmApply: 'This will write inventory quantities to Shopify. Continue?',
       },
       cleanupNoStock: {
         title: 'Cleanup no-stock products',
