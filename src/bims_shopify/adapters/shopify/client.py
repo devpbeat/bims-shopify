@@ -297,6 +297,9 @@ class ShopifyClient:
                 "input": {
                     "reason": "correction",
                     "name": "available",
+                    # Shopify 2025-07 requires either a per-item compareQuantity
+                    # or this flag; we push BIMS as source of truth, so ignore.
+                    "ignoreCompareQuantity": True,
                     "quantities": quantities,
                 }
             },

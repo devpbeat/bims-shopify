@@ -80,6 +80,8 @@ async def test_item_not_stocked_at_location_activates_then_retries_once(shopify_
     activate_request = route.calls[1].request
     assert b"InventoryActivate" in activate_request.content
     assert b"gid://shopify/InventoryItem/123" in activate_request.content
+    # 2025-07 requires ignoreCompareQuantity when no per-item compareQuantity is sent.
+    assert b"ignoreCompareQuantity" in route.calls[0].request.content
 
 
 @respx.mock
