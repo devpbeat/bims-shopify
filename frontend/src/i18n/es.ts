@@ -193,6 +193,12 @@ export const es: Messages = {
         description: 'Reconcilia diferencias de SKU, duplicados y variantes sin resolver.',
         confirmApply: 'Esto aplicará las resoluciones de recodificación en Shopify. ¿Continuar?',
       },
+      fixTracking: {
+        title: 'Reparar seguimiento de inventario',
+        description:
+          'Activa el seguimiento de inventario para variantes existentes que se crearon sin seguimiento, y las activa en la ubicación de la tienda para que la sincronización regular pueda escribir stock.',
+        confirmApply: 'Esto activará el seguimiento de inventario en las variantes afectadas de Shopify. ¿Continuar?',
+      },
     },
     jobStatus: {
       queued: 'En cola',

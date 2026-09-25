@@ -40,6 +40,7 @@ _COMMAND_RUNNERS = {
     "import": catalog.run_import,
     "dedupe": catalog.run_dedupe,
     "rekey": rekey_skus.run_rekey,
+    "fix_tracking": catalog.run_fix_tracking,
 }
 
 

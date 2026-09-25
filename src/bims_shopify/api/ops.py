@@ -24,11 +24,11 @@ from .deps import get_db_session, get_tenant_repository, require_admin
 
 router = APIRouter(prefix="/ops", tags=["ops"], dependencies=[Depends(require_admin)])
 
-_VALID_COMMANDS = {"status", "wipe", "import", "dedupe", "rekey"}
+_VALID_COMMANDS = {"status", "wipe", "import", "dedupe", "rekey", "fix_tracking"}
 
 
 class RunJobRequest(BaseModel):
-    command: Literal["status", "wipe", "import", "dedupe", "rekey"]
+    command: Literal["status", "wipe", "import", "dedupe", "rekey", "fix_tracking"]
     options: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -61,6 +61,9 @@ def _validate_options(command: str, options: dict[str, Any]) -> dict[str, Any]:
             "apply": bool(options.get("apply", False)),
             "auto_resolve": bool(options.get("auto_resolve", False)),
         }
+
+    if command == "fix_tracking":
+        return {"apply": bool(options.get("apply", False))}
 
     # status
     return {}

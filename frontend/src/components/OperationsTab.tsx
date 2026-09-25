@@ -108,6 +108,8 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
   const [rekeyDryRun, setRekeyDryRun] = useState(true)
   const [rekeyAutoResolve, setRekeyAutoResolve] = useState(false)
 
+  const [fixTrackingDryRun, setFixTrackingDryRun] = useState(true)
+
   const [wipeAdvancedOpen, setWipeAdvancedOpen] = useState(false)
   const [wipeConfirmText, setWipeConfirmText] = useState('')
 
@@ -209,6 +211,7 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
   const dedupeJob = latestJobFor('dedupe')
   const wipeJob = latestJobFor('wipe')
   const rekeyJob = latestJobFor('rekey')
+  const fixTrackingJob = latestJobFor('fix_tracking')
 
   return (
     <div className="ops-tab">
@@ -366,6 +369,39 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
           {t.operator.runButton}
         </button>
         {rekeyJob && <JobPanel job={rekeyJob} />}
+      </div>
+
+      <div className="ops-card">
+        <h3>{t.operator.commands.fixTracking.title}</h3>
+        <p className="muted">{t.operator.commands.fixTracking.description}</p>
+        {runError.fix_tracking && <p className="error-text">{runError.fix_tracking}</p>}
+        <label className="ops-toggle">
+          <input
+            type="checkbox"
+            checked={fixTrackingDryRun}
+            onChange={(e) => setFixTrackingDryRun(e.target.checked)}
+          />
+          {t.operator.dryRun}
+        </label>
+        <button
+          type="button"
+          className="btn btn-primary"
+          onClick={() => {
+            const options: OpsRunOptions = { apply: !fixTrackingDryRun }
+            if (!fixTrackingDryRun) {
+              setPendingConfirm({
+                title: t.operator.confirmTitle,
+                message: t.operator.commands.fixTracking.confirmApply,
+                onConfirm: () => launch('fix_tracking', options),
+              })
+            } else {
+              launch('fix_tracking', options)
+            }
+          }}
+        >
+          {t.operator.runButton}
+        </button>
+        {fixTrackingJob && <JobPanel job={fixTrackingJob} />}
       </div>
 
       <div className="ops-card ops-card-danger">

@@ -32,6 +32,15 @@ _INVENTORY_SET_QUANTITIES = """
 mutation InventorySetQuantities($input: InventorySetQuantitiesInput!) {
   inventorySetQuantities(input: $input) {
     inventoryAdjustmentGroup { createdAt }
+    userErrors { field message code }
+  }
+}
+"""
+
+_INVENTORY_ACTIVATE = """
+mutation InventoryActivate($inventoryItemId: ID!, $locationId: ID!) {
+  inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId) {
+    inventoryLevel { id }
     userErrors { field message }
   }
 }
@@ -54,6 +63,7 @@ query ListAllVariants($cursor: String) {
       id
       sku
       product { id title }
+      inventoryItem { id tracked }
     }
   }
 }
@@ -263,6 +273,23 @@ class ShopifyClient:
             )
         if not quantities:
             return
+        await self._set_inventory_quantities_self_healing(quantities)
+
+    async def _set_inventory_quantities_self_healing(
+        self, quantities: list[dict[str, Any]], *, retried: bool = False
+    ) -> None:
+        """Set inventory quantities, self-healing items that aren't activated yet.
+
+        Legacy/pre-fix variants (created before tracking + activation was
+        wired into import) come back with a per-quantity ``userErrors`` entry
+        of code ``ITEM_NOT_STOCKED_AT_LOCATION`` (see
+        https://shopify.dev/docs/api/admin-graphql/2025-07/mutations/inventorySetQuantities
+        and https://shopify.dev/docs/api/admin-graphql/2025-07/enums/InventorySetQuantitiesUserErrorCode).
+        On that error we activate the offending item(s) via ``inventoryActivate``
+        (https://shopify.dev/docs/api/admin-graphql/2025-07/mutations/inventoryActivate)
+        and retry the whole batch exactly once, so the regular sync gradually
+        heals legacy variants instead of silently dropping their stock.
+        """
         data = await self._graphql(
             _INVENTORY_SET_QUANTITIES,
             {
@@ -273,7 +300,39 @@ class ShopifyClient:
                 }
             },
         )
-        self._check_user_errors(data.get("inventorySetQuantities"))
+        result = data.get("inventorySetQuantities")
+        user_errors = (result or {}).get("userErrors") or []
+        not_stocked = [e for e in user_errors if e.get("code") == "ITEM_NOT_STOCKED_AT_LOCATION"]
+        if not_stocked and not retried:
+            for error in not_stocked:
+                index = self._extract_quantity_index(error.get("field"))
+                if index is None or index >= len(quantities):
+                    continue
+                quantity = quantities[index]
+                await self.activate_inventory_item(
+                    quantity["inventoryItemId"], quantity["locationId"]
+                )
+            await self._set_inventory_quantities_self_healing(quantities, retried=True)
+            return
+        self._check_user_errors(result)
+
+    @staticmethod
+    def _extract_quantity_index(field: Any) -> int | None:
+        """Pull the list index out of a userErrors ``field`` path, e.g. ``["input", "quantities", "0", "inventoryItemId"]``."""
+        for part in field or []:
+            if isinstance(part, int):
+                return part
+            if isinstance(part, str) and part.isdigit():
+                return int(part)
+        return None
+
+    async def activate_inventory_item(self, inventory_item_id: str, location_id: str) -> None:
+        """Activate an inventory item at a location via ``inventoryActivate``."""
+        data = await self._graphql(
+            _INVENTORY_ACTIVATE,
+            {"inventoryItemId": inventory_item_id, "locationId": location_id},
+        )
+        self._check_user_errors(data.get("inventoryActivate"))
 
     async def upsert_product(self, tenant: Tenant, sku: str, name: str, price: float) -> None:
         # Product creation/update requires the productSet mutation; kept minimal

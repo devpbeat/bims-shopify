@@ -165,27 +165,57 @@ def test_group_rows_multi_size_without_duplicates_is_unaffected():
 def test_build_product_set_input_with_size_option():
     rows = [BimsRow("1", "Shirt (S)", "SKU-S", 1000), BimsRow("2", "Shirt (M)", "SKU-M", 1000)]
     group = group_rows(rows).groups[0]
-    payload = build_product_set_input(group, status="DRAFT")
+    payload = build_product_set_input(group, status="DRAFT", location_id="gid://shopify/Location/1")
     assert payload["title"] == "Shirt"
     assert payload["status"] == "DRAFT"
     assert payload["productOptions"] == [{"name": "Size", "values": [{"name": "S"}, {"name": "M"}]}]
+    expected_inventory_quantities = [
+        {"locationId": "gid://shopify/Location/1", "name": "available", "quantity": 0}
+    ]
     assert payload["variants"] == [
-        {"sku": "SKU-S", "price": "1000", "optionValues": [{"optionName": "Size", "name": "S"}]},
-        {"sku": "SKU-M", "price": "1000", "optionValues": [{"optionName": "Size", "name": "M"}]},
+        {
+            "sku": "SKU-S",
+            "price": "1000",
+            "optionValues": [{"optionName": "Size", "name": "S"}],
+            "inventoryItem": {"tracked": True},
+            "inventoryPolicy": "DENY",
+            "inventoryQuantities": expected_inventory_quantities,
+        },
+        {
+            "sku": "SKU-M",
+            "price": "1000",
+            "optionValues": [{"optionName": "Size", "name": "M"}],
+            "inventoryItem": {"tracked": True},
+            "inventoryPolicy": "DENY",
+            "inventoryQuantities": expected_inventory_quantities,
+        },
     ]
 
 
 def test_build_product_set_input_single_variant_no_options():
     group = group_rows([BimsRow("1", "Mug", "SKU-MUG", 5000)]).groups[0]
-    payload = build_product_set_input(group, status="ACTIVE")
+    payload = build_product_set_input(group, status="ACTIVE", location_id="gid://shopify/Location/1")
     assert payload["productOptions"] == [{"name": "Title", "values": [{"name": "Default Title"}]}]
     assert payload["variants"] == [
         {
             "sku": "SKU-MUG",
             "price": "5000",
             "optionValues": [{"optionName": "Title", "name": "Default Title"}],
+            "inventoryItem": {"tracked": True},
+            "inventoryPolicy": "DENY",
+            "inventoryQuantities": [
+                {"locationId": "gid://shopify/Location/1", "name": "available", "quantity": 0}
+            ],
         }
     ]
+
+
+def test_build_product_set_input_without_location_skips_activation_but_tracks():
+    group = group_rows([BimsRow("1", "Mug", "SKU-MUG", 5000)]).groups[0]
+    payload = build_product_set_input(group, status="ACTIVE", location_id="")
+    variant = payload["variants"][0]
+    assert variant["inventoryItem"] == {"tracked": True}
+    assert "inventoryQuantities" not in variant
 
 
 # -- idempotent skip / apply isolation ----------------------------------------
@@ -611,3 +641,151 @@ async def test_run_dedupe_safety_guard_blocks_over_60_percent(tenant):
             raise AssertionError("expected SystemExit from the safety guard")
     finally:
         catalog_ops.ShopifyClient = monkeypatch_target  # type: ignore[assignment]
+
+
+# -- fix_tracking (repair legacy untracked variants) --------------------------
+
+
+def _fix_tracking_fake_client(variants: list[dict], calls: dict):
+    class _FakeShopifyClient:
+        def __init__(self, tenant):
+            pass
+
+        async def iter_all_variants(self):
+            for variant in variants:
+                yield variant
+
+        async def bulk_update_variants(self, product_id, bulk_variants):
+            calls.setdefault("bulk_update", []).append((product_id, bulk_variants))
+
+        async def activate_inventory_item(self, inventory_item_id, location_id):
+            calls.setdefault("activate", []).append((inventory_item_id, location_id))
+
+        async def aclose(self):
+            pass
+
+    return _FakeShopifyClient
+
+
+def _variant(sku, product_id, tracked, inventory_item_id="inv-1", variant_id=None):
+    return {
+        "id": variant_id or f"gid://shopify/ProductVariant/{sku}",
+        "sku": sku,
+        "product": {"id": product_id, "title": "Widget"},
+        "inventoryItem": {"id": inventory_item_id, "tracked": tracked},
+    }
+
+
+async def test_run_fix_tracking_dry_run_reports_without_mutating(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    variants = [
+        _variant("SKU-A", "p1", tracked=False),
+        _variant("SKU-B", "p1", tracked=False),
+        _variant("SKU-C", "p2", tracked=True),
+    ]
+    calls: dict = {}
+    monkeypatch_target = catalog_ops.ShopifyClient
+    catalog_ops.ShopifyClient = _fix_tracking_fake_client(variants, calls)  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(["acme", "fix-tracking"])
+        report = await catalog_ops._run_fix_tracking(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = monkeypatch_target  # type: ignore[assignment]
+
+    assert report["dry_run"] is True
+    assert report["checked"] == 3
+    assert report["already_ok"] == 1
+    assert report["fixed"] == 2
+    assert report["products_to_fix"] == 1
+    assert "bulk_update" not in calls
+    assert "activate" not in calls
+
+
+async def test_run_fix_tracking_apply_fixes_untracked_variants_and_is_idempotent(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.id = None  # skip the real-DB audit write; audit logging is exercised elsewhere
+    variants = [
+        _variant("SKU-A", "p1", tracked=False, inventory_item_id="inv-a"),
+        _variant("SKU-B", "p1", tracked=False, inventory_item_id="inv-b"),
+        _variant("SKU-C", "p2", tracked=True, inventory_item_id="inv-c"),
+    ]
+    calls: dict = {}
+    monkeypatch_target = catalog_ops.ShopifyClient
+    catalog_ops.ShopifyClient = _fix_tracking_fake_client(variants, calls)  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(["acme", "fix-tracking", "--apply"])
+        summary = await catalog_ops._run_fix_tracking(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = monkeypatch_target  # type: ignore[assignment]
+
+    assert summary == {"checked": 3, "already_ok": 1, "fixed": 2, "failed": []}
+    assert len(calls["bulk_update"]) == 1
+    product_id, bulk_variants = calls["bulk_update"][0]
+    assert product_id == "p1"
+    assert bulk_variants == [
+        {"id": "gid://shopify/ProductVariant/SKU-A", "inventoryItem": {"tracked": True}},
+        {"id": "gid://shopify/ProductVariant/SKU-B", "inventoryItem": {"tracked": True}},
+    ]
+    assert set(calls["activate"]) == {
+        ("inv-a", tenant.shopify_location_id),
+        ("inv-b", tenant.shopify_location_id),
+    }
+
+    # Second run: everything now reports tracked=True -> 0 fixed (idempotent).
+    variants_after = [
+        _variant("SKU-A", "p1", tracked=True, inventory_item_id="inv-a"),
+        _variant("SKU-B", "p1", tracked=True, inventory_item_id="inv-b"),
+        _variant("SKU-C", "p2", tracked=True, inventory_item_id="inv-c"),
+    ]
+    calls_2: dict = {}
+    catalog_ops.ShopifyClient = _fix_tracking_fake_client(variants_after, calls_2)  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(["acme", "fix-tracking", "--apply"])
+        summary_2 = await catalog_ops._run_fix_tracking(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = monkeypatch_target  # type: ignore[assignment]
+
+    assert summary_2 == {"checked": 3, "already_ok": 3, "fixed": 0, "failed": []}
+    assert "bulk_update" not in calls_2
+
+
+async def test_run_fix_tracking_isolates_per_product_failures(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+    from bims_shopify.adapters.shopify.client import ShopifyGraphQLError
+
+    tenant.id = None  # skip the real-DB audit write; audit logging is exercised elsewhere
+    variants = [
+        _variant("SKU-A", "p1", tracked=False, inventory_item_id="inv-a"),
+        _variant("SKU-B", "p2", tracked=False, inventory_item_id="inv-b"),
+    ]
+
+    class _FailingFakeClient:
+        def __init__(self, tenant):
+            pass
+
+        async def iter_all_variants(self):
+            for variant in variants:
+                yield variant
+
+        async def bulk_update_variants(self, product_id, bulk_variants):
+            if product_id == "p1":
+                raise ShopifyGraphQLError("boom")
+
+        async def activate_inventory_item(self, inventory_item_id, location_id):
+            pass
+
+        async def aclose(self):
+            pass
+
+    monkeypatch_target = catalog_ops.ShopifyClient
+    catalog_ops.ShopifyClient = _FailingFakeClient  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(["acme", "fix-tracking", "--apply"])
+        summary = await catalog_ops._run_fix_tracking(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = monkeypatch_target  # type: ignore[assignment]
+
+    assert summary["fixed"] == 1
+    assert summary["failed"] == [{"product_id": "p1", "error": "ShopifyGraphQLError: boom"}]

@@ -188,6 +188,12 @@ export const en: Messages = {
         description: 'Reconciles SKU mismatches, duplicates, and unresolved variants.',
         confirmApply: 'This will apply rekey resolutions to Shopify. Continue?',
       },
+      fixTracking: {
+        title: 'Fix inventory tracking',
+        description:
+          'Enables inventory tracking on existing variants that were created without it, and activates them at the store location so the regular sync can write stock.',
+        confirmApply: 'This will enable inventory tracking on affected Shopify variants. Continue?',
+      },
     },
     jobStatus: {
       queued: 'Queued',

@@ -1,4 +1,4 @@
-export type OpsCommand = 'status' | 'wipe' | 'import' | 'dedupe' | 'rekey'
+export type OpsCommand = 'status' | 'wipe' | 'import' | 'dedupe' | 'rekey' | 'fix_tracking'
 
 export type OpsJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
 

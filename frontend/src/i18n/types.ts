@@ -150,6 +150,7 @@ export interface Messages {
       dedupe: { title: string; description: string; confirmApply: string }
       wipe: { title: string; description: string; confirmApply: string }
       rekey: { title: string; description: string; confirmApply: string }
+      fixTracking: { title: string; description: string; confirmApply: string }
     }
     jobStatus: {
       queued: string

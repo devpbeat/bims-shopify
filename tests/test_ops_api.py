@@ -254,6 +254,41 @@ async def test_import_dry_run_vs_apply_options_pass_through(app_and_tenant, monk
     assert seen_options == [{"apply": True, "publish": False, "only_with_stock": True, "limit": 5}]
 
 
+async def test_fix_tracking_options_pass_through_and_defaults_to_dry_run(app_and_tenant, monkeypatch):
+    app, _tenant, session_factory = app_and_tenant
+    seen_options: list[dict] = []
+
+    async def _capture_runner(tenant, options, progress):
+        seen_options.append(options)
+        return {"checked": 0, "already_ok": 0, "fixed": 0, "failed": []}
+
+    monkeypatch.setitem(
+        __import__("bims_shopify.ops.job_runner", fromlist=["_COMMAND_RUNNERS"])._COMMAND_RUNNERS,
+        "fix_tracking",
+        _capture_runner,
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/ops/acme/run",
+            json={"command": "fix_tracking", "options": {}},
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        assert response.status_code == 200
+        await _wait_for_status(session_factory, response.json()["job_id"], {"succeeded", "failed"})
+
+        apply_response = await client.post(
+            "/ops/acme/run",
+            json={"command": "fix_tracking", "options": {"apply": True}},
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        assert apply_response.status_code == 200
+        await _wait_for_status(session_factory, apply_response.json()["job_id"], {"succeeded", "failed"})
+
+    assert seen_options == [{"apply": False}, {"apply": True}]
+
+
 async def test_startup_marks_running_jobs_interrupted(app_and_tenant):
     _app, tenant, session_factory = app_and_tenant
 

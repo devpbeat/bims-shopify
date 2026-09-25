@@ -41,6 +41,7 @@ import argparse
 import asyncio
 import inspect
 import json
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -61,12 +62,15 @@ from bims_shopify.adapters.shopify.client import ShopifyClient, ShopifyGraphQLEr
 from bims_shopify.config import get_settings
 from bims_shopify.domain.tenant import Tenant
 
+logger = logging.getLogger(__name__)
+
 BIMS_PAGE_LIMIT = 250
 STOCK_BATCH_SIZE = 200
 MAX_VARIANTS_PER_PRODUCT = 100
 WIPE_PROGRESS_EVERY = 50
 IMPORT_PROGRESS_EVERY = 25
 DEDUPE_PROGRESS_EVERY = 50
+FIX_TRACKING_PROGRESS_EVERY = 50
 SAMPLE_GROUP_COUNT = 5
 RECONCILIATION_SAMPLE_SIZE = 20
 DEDUPE_DUPLICATES_SAMPLE_SIZE = 20
@@ -347,9 +351,46 @@ def reconciliation_diff(bims_skus: set[str], shopify_skus: set[str]) -> dict[str
     }
 
 
-def build_product_set_input(group: ProductGroup, *, status: str) -> dict[str, Any]:
-    """Build the ``ProductSetInput`` payload for one product group."""
+def _variant_inventory_fields(location_id: str) -> dict[str, Any]:
+    """Fields every new variant needs to be tracked and land in inventory sync.
+
+    Sets ``inventoryItem.tracked=true`` and ``inventoryPolicy=DENY`` (stop
+    selling at 0). When a tenant location id is available, also activates the
+    item at that location via ``inventoryQuantities`` (required before
+    ``inventorySetQuantities`` can write stock during the regular sync).
+    """
+    fields: dict[str, Any] = {
+        "inventoryItem": {"tracked": True},
+        "inventoryPolicy": "DENY",
+    }
+    if location_id and location_id != "0":
+        fields["inventoryQuantities"] = [
+            {"locationId": location_id, "name": "available", "quantity": 0}
+        ]
+    else:
+        logger.warning(
+            "catalog.import: tenant has no shopify_location_id; skipping inventory "
+            "activation (tracking still enabled, but variant will not be activated "
+            "at any location until location is configured)"
+        )
+    return fields
+
+
+def build_product_set_input(
+    group: ProductGroup, *, status: str, location_id: str = ""
+) -> dict[str, Any]:
+    """Build the ``ProductSetInput`` payload for one product group.
+
+    ``location_id`` should be the tenant's ``shopify_location_id``. It is used
+    to enable inventory tracking and activate each variant at that location,
+    so the regular inventory sync (``inventorySetQuantities``) can later write
+    stock levels. See PRODUCT_SET_INPUT and INVENTORY_ITEM_INPUT docs (2025-07):
+    https://shopify.dev/docs/api/admin-graphql/2025-07/input-objects/ProductSetInput
+    https://shopify.dev/docs/api/admin-graphql/2025-07/input-objects/ProductVariantSetInput
+    https://shopify.dev/docs/api/admin-graphql/2025-07/input-objects/InventoryItemInput
+    """
     product_input: dict[str, Any] = {"title": group.title, "status": status}
+    inventory_fields = _variant_inventory_fields(location_id)
     if group.has_size_option:
         sizes = [v.size or "Default" for v in group.variants]
         product_input["productOptions"] = [
@@ -360,6 +401,7 @@ def build_product_set_input(group: ProductGroup, *, status: str) -> dict[str, An
                 "sku": v.sku,
                 "price": str(v.price),
                 "optionValues": [{"optionName": "Size", "name": v.size or "Default"}],
+                **inventory_fields,
             }
             for v in group.variants
         ]
@@ -373,6 +415,7 @@ def build_product_set_input(group: ProductGroup, *, status: str) -> dict[str, An
                 "sku": variant.sku,
                 "price": str(variant.price),
                 "optionValues": [{"optionName": "Title", "name": "Default Title"}],
+                **inventory_fields,
             }
         ]
     return product_input
@@ -399,6 +442,7 @@ async def apply_import(
     *,
     existing_skus: set[str],
     status: str,
+    location_id: str = "",
     progress: ProgressFn | None = None,
 ) -> ImportResult:
     """Create each product group via productSet, isolating failures per product."""
@@ -408,7 +452,7 @@ async def apply_import(
         if skus and (skus & existing_skus):
             result.skipped_existing.append(group.title)
         else:
-            product_input = build_product_set_input(group, status=status)
+            product_input = build_product_set_input(group, status=status, location_id=location_id)
             try:
                 product = await shopify_client.product_set(product_input)
             except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
@@ -558,6 +602,139 @@ async def apply_dedupe(
     return result
 
 
+@dataclass
+class FixTrackingResult:
+    """Result of repairing legacy variants created with tracking disabled.
+
+    ``checked`` counts every variant scanned; ``already_ok`` those that
+    already had ``inventoryItem.tracked=true``; ``fixed`` those repaired
+    (tracking enabled + activated at the tenant location); ``failed`` lists
+    per-product failures so one bad product doesn't abort the whole run.
+    """
+
+    checked: int = 0
+    already_ok: int = 0
+    fixed: int = 0
+    failed: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_summary(self) -> dict[str, Any]:
+        return {
+            "checked": self.checked,
+            "already_ok": self.already_ok,
+            "fixed": self.fixed,
+            "failed": self.failed,
+        }
+
+
+async def apply_fix_tracking(
+    shopify_client: ShopifyClient,
+    tenant: Tenant,
+    *,
+    progress: ProgressFn | None = None,
+) -> FixTrackingResult:
+    """Enable tracking + activate at the tenant location for untracked variants.
+
+    Scans every variant in the shop via ``iter_all_variants`` (paginated).
+    For each with ``inventoryItem.tracked=false``, groups by product and
+    repairs it via ``productVariantsBulkUpdate`` (setting
+    ``inventoryItem.tracked=true`` for every untracked variant of that
+    product in one call), then activates each repaired variant's inventory
+    item at the tenant location via ``inventoryActivate`` so the regular
+    sync can write stock to it. Idempotent: a variant already tracked is
+    left untouched and counted under ``already_ok``, so a second run fixes 0.
+
+    Docs (2025-07):
+    https://shopify.dev/docs/api/admin-graphql/2025-07/mutations/productVariantsBulkUpdate
+    https://shopify.dev/docs/api/admin-graphql/2025-07/mutations/inventoryActivate
+    """
+    result = FixTrackingResult()
+    by_product: dict[str, list[dict[str, Any]]] = {}
+
+    async for variant in shopify_client.iter_all_variants():
+        result.checked += 1
+        tracked = ((variant.get("inventoryItem") or {}).get("tracked"))
+        if tracked:
+            result.already_ok += 1
+        else:
+            product_id = (variant.get("product") or {}).get("id")
+            if product_id:
+                by_product.setdefault(product_id, []).append(variant)
+        if result.checked % FIX_TRACKING_PROGRESS_EVERY == 0:
+            message = f"{result.checked} variants checked"
+            print(f"  ... {message}")
+            await _emit_progress(progress, result.checked, None, message)
+
+    has_location = bool(tenant.shopify_location_id) and tenant.shopify_location_id != "0"
+    if not has_location:
+        logger.warning(
+            "ops.fix_tracking: tenant %s has no shopify_location_id; enabling tracking "
+            "but skipping activation",
+            tenant.slug,
+        )
+
+    products = list(by_product.items())
+    for index, (product_id, variants) in enumerate(products, start=1):
+        try:
+            bulk_variants = [
+                {"id": v["id"], "inventoryItem": {"tracked": True}} for v in variants
+            ]
+            await shopify_client.bulk_update_variants(product_id, bulk_variants)
+            if has_location:
+                for variant in variants:
+                    inventory_item_id = (variant.get("inventoryItem") or {}).get("id")
+                    if inventory_item_id:
+                        await shopify_client.activate_inventory_item(
+                            inventory_item_id, tenant.shopify_location_id
+                        )
+        except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
+            result.failed.append({"product_id": product_id, "error": f"{type(exc).__name__}: {exc}"})
+        else:
+            result.fixed += len(variants)
+
+        if index % FIX_TRACKING_PROGRESS_EVERY == 0:
+            message = f"{index}/{len(products)} products repaired"
+            print(f"  ... {message}")
+            await _emit_progress(progress, index, len(products), message)
+
+    return result
+
+
+async def _run_fix_tracking(
+    tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
+) -> dict[str, Any]:
+    shopify_client = ShopifyClient(tenant)
+    try:
+        await _emit_progress(progress, 0, None, "scanning variants for tracking status")
+        if not args.apply:
+            # Dry run still has to scan the whole catalog to produce real
+            # counts, it just doesn't call any mutation.
+            result = FixTrackingResult()
+            by_product: dict[str, int] = {}
+            async for variant in shopify_client.iter_all_variants():
+                result.checked += 1
+                if ((variant.get("inventoryItem") or {}).get("tracked")):
+                    result.already_ok += 1
+                else:
+                    product_id = (variant.get("product") or {}).get("id")
+                    by_product[product_id] = by_product.get(product_id, 0) + 1
+                if result.checked % FIX_TRACKING_PROGRESS_EVERY == 0:
+                    await _emit_progress(
+                        progress, result.checked, None, f"{result.checked} variants checked"
+                    )
+            result.fixed = sum(by_product.values())
+            summary = result.to_summary()
+            summary["dry_run"] = True
+            summary["products_to_fix"] = len(by_product)
+            return summary
+
+        result = await apply_fix_tracking(shopify_client, tenant, progress=progress)
+        summary = result.to_summary()
+        await _audit(tenant.id, "ops.fix_tracking", summary)
+        return summary
+    finally:
+        await shopify_client.aclose()
+
+
 async def _load_tenant_from_db(tenant_slug: str) -> Tenant:
     settings = get_settings()
     engine, session_factory = create_engine_and_sessionmaker(settings)
@@ -653,7 +830,12 @@ async def _run_import(
         existing_skus = await fetch_existing_skus(shopify_client)
         status = "ACTIVE" if args.publish else "DRAFT"
         result = await apply_import(
-            shopify_client, groups, existing_skus=existing_skus, status=status, progress=progress
+            shopify_client,
+            groups,
+            existing_skus=existing_skus,
+            status=status,
+            location_id=tenant.shopify_location_id,
+            progress=progress,
         )
         summary["apply"] = result.to_summary()
         await _audit(tenant.id, "catalog.import", summary)
@@ -814,6 +996,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         return await _run_status(tenant, args)
     if args.command == "dedupe":
         return await _run_dedupe(tenant, args)
+    if args.command == "fix-tracking":
+        return await _run_fix_tracking(tenant, args)
     return await _run_import(tenant, args)
 
 
@@ -852,6 +1036,13 @@ async def run_dedupe(tenant: Tenant, options: dict[str, Any], progress: Progress
         force=bool(options.get("force", False)),
     )
     return await _run_dedupe(tenant, args, progress=progress)
+
+
+async def run_fix_tracking(
+    tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None
+) -> dict[str, Any]:
+    args = argparse.Namespace(apply=bool(options.get("apply", False)))
+    return await _run_fix_tracking(tenant, args, progress=progress)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -912,6 +1103,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Override the safety guard that refuses to delete more than "
         f"{DEDUPE_MAX_DELETE_RATIO:.0%} of the catalog in one run.",
+    )
+
+    fix_tracking_parser = subparsers.add_parser(
+        "fix-tracking",
+        help=(
+            "Repair legacy variants created with inventory tracking disabled: enable "
+            "tracking and activate them at the tenant location."
+        ),
+    )
+    fix_tracking_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Execute the repair (default: dry run, reports counts only).",
     )
 
     return parser
