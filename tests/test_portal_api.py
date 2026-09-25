@@ -431,6 +431,48 @@ async def test_idempotent_repost_returns_already_resolved_without_reapplying(app
     assert second.json()["results"][0]["status"] == "already_resolved"
 
 
+async def test_admin_token_authorizes_rekey_report(app_and_tenants):
+    app, _acme, _other = app_and_tenants
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/api/portal/acme/rekey-report", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        )
+    assert response.status_code == 200
+
+
+async def test_admin_token_authorizes_sync_status(app_and_tenants):
+    app, _acme, _other = app_and_tenants
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/api/portal/acme/sync-status", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        )
+    assert response.status_code == 200
+
+
+async def test_admin_token_on_unknown_slug_returns_404(app_and_tenants):
+    app, _acme, _other = app_and_tenants
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/api/portal/no-such-tenant/sync-status",
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+    assert response.status_code == 404
+
+
+async def test_random_token_still_rejected(app_and_tenants):
+    app, _acme, _other = app_and_tenants
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/api/portal/acme/sync-status",
+            headers={"Authorization": "Bearer totally-random-token"},
+        )
+    assert response.status_code == 401
+
+
 async def test_portal_sync_status_returns_status_summary(app_and_tenants):
     app, _acme, _other = app_and_tenants
     token = await _mint_portal_token(app, "acme")

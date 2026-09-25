@@ -84,24 +84,37 @@ async def get_portal_tenant(
     B's slug — there is no cross-tenant lookup path, only same-tenant
     comparisons.
 
-    Two credential shapes are accepted on the same ``Authorization: Bearer``
+    Three credential shapes are accepted on the same ``Authorization: Bearer``
     header, checked in order:
 
-    1. The legacy shared portal access token, hashed and compared against
+    1. The static platform admin token (``settings.admin_token``), compared
+       with ``hmac.compare_digest``. This is a superuser credential: it
+       authorizes the request for *any* tenant slug, the same way it already
+       authorizes every ``/ops/*`` endpoint via ``require_admin``. This exists
+       because the operator SPA logs the operator in with the single admin
+       token and then calls these same portal data endpoints — without this
+       path every portal page load 401s for operators.
+    2. The legacy shared portal access token, hashed and compared against
        ``tenants.portal_token_hash`` with ``hmac.compare_digest``.
-    2. A per-user session JWT minted by ``POST /api/portal/{slug}/login``,
+    3. A per-user session JWT minted by ``POST /api/portal/{slug}/login``,
        verified for signature, expiry, and that its ``tenant_id`` claim
        matches *this* tenant (a valid session for store A can't be replayed
        against store B's slug even though JWTs aren't tenant-scoped by URL).
     """
-    tenant = await repo.get_by_slug(slug)
-    if tenant is None:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
     presented = authorization.removeprefix("Bearer ").strip()
     if not presented:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if hmac.compare_digest(presented, settings.admin_token):
+        tenant = await repo.get_by_slug(slug)
+        if tenant is None:
+            raise HTTPException(status_code=404, detail="Not found")
+        return tenant
+
+    tenant = await repo.get_by_slug(slug)
+    if tenant is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     stored_hash = await repo.get_portal_token_hash(tenant.id)
