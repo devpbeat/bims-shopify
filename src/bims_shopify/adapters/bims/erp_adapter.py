@@ -53,9 +53,6 @@ class BIMSERPAdapter:
                 continue
             if _is_truthy(product.get("exclude_ecommerce", False)):
                 continue
-            company_id = product.get("company_id")
-            if company_id is not None and str(company_id) != str(tenant.bims_company_id):
-                continue
             sku = _extract_sku(product, tenant.field_mappings)
             if not sku:
                 continue

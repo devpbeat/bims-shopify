@@ -66,7 +66,18 @@ async def test_pagination_exhausts_all_pages(bims_client, tenant):
 
 
 @respx.mock
-async def test_filters_disabled_and_excluded_and_wrong_company(bims_client, tenant):
+async def test_filters_disabled_and_excluded_but_keeps_other_companies(bims_client, tenant):
+    """company_id must NOT be used to drop rows.
+
+    ``products/index.json`` only ever returns the API key's default/current
+    company (here, company 1) regardless of any requested company_id --
+    the BIMS API key, not a query param, determines company scoping. The
+    catalog import (``filter_and_dedupe_rows`` in ``ops/catalog.py``) never
+    filtered by company_id, relying on ``code2`` as the cross-company join
+    key with stock fetched independently via stock_fenicio. The sync must
+    match that behavior instead of silently dropping every row whose
+    company_id happens to differ from ``tenant.bims_company_id``.
+    """
     data = [
         _product(id=1, code2="OK-1", enabled=True, exclude_ecommerce=False, company_id="6"),
         _product(id=2, code2="DISABLED", enabled=False),
@@ -82,15 +93,26 @@ async def test_filters_disabled_and_excluded_and_wrong_company(bims_client, tena
     )
     respx.post(f"{tenant.bims_base_url}/api/products_stocks/stock_fenicio.json").mock(
         return_value=httpx.Response(
-            200, json={"status": "OK", "data": {"stockPorSku": [{"sku": "OK-1", "stock": 5}]}}
+            200,
+            json={
+                "status": "OK",
+                "data": {
+                    "stockPorSku": [
+                        {"sku": "OK-1", "stock": 5},
+                        {"sku": "OTHER-CO", "stock": 3},
+                    ]
+                },
+            },
         )
     )
 
     adapter = BIMSERPAdapter(bims_client)
     snapshots = await adapter.list_products(tenant)
 
-    assert [s.sku for s in snapshots] == ["OK-1"]
-    assert snapshots[0].stock == 5
+    assert {s.sku for s in snapshots} == {"OK-1", "OTHER-CO"}
+    by_sku = {s.sku: s for s in snapshots}
+    assert by_sku["OK-1"].stock == 5
+    assert by_sku["OTHER-CO"].stock == 3
 
 
 @respx.mock
