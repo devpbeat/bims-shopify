@@ -11,7 +11,8 @@ scheduler-triggered import has ever finished for it, or the last one
 finished more than `auto_import_interval_minutes` ago -- and, if so and no
 import job is currently queued/running for that tenant, enqueue one via
 `JobRunner` with `command="import"`, `apply=True`, and
-`publish=tenant.auto_import_publish`.
+`publish=tenant.auto_import_publish` and
+`only_with_stock=tenant.auto_import_only_with_stock`.
 
 Import-only, on purpose: this coordinator never enqueues `wipe` or `dedupe`.
 Those stay manual/admin-triggered because they can delete or merge data.
@@ -92,7 +93,12 @@ class AutoImportCoordinator:
             await self._job_runner.start_job(
                 tenant.id,
                 "import",
-                {"apply": True, "publish": tenant.auto_import_publish, "_trigger": AUTO_IMPORT_TRIGGER},
+                {
+                    "apply": True,
+                    "publish": tenant.auto_import_publish,
+                    "only_with_stock": tenant.auto_import_only_with_stock,
+                    "_trigger": AUTO_IMPORT_TRIGGER,
+                },
             )
             logger.info("auto_import_enqueued", tenant_id=tenant.id, tenant_slug=tenant.slug)
         except JobConflictError:

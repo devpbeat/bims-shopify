@@ -146,7 +146,12 @@ async def test_enqueues_when_due_and_no_prior_import(env):
     tenant_id, command, options = env["job_runner"].started[0]
     assert tenant_id == tenant.id
     assert command == "import"
-    assert options == {"apply": True, "publish": False, "_trigger": "scheduler"}
+    assert options == {
+        "apply": True,
+        "publish": False,
+        "only_with_stock": True,
+        "_trigger": "scheduler",
+    }
 
 
 async def test_skips_when_not_due(env):
@@ -268,6 +273,28 @@ async def test_publish_flag_is_forwarded(env):
 
     _, _, options = env["job_runner"].started[0]
     assert options["publish"] is True
+
+
+async def test_only_with_stock_flag_defaults_to_true(env):
+    await env["make_tenant"](slug="acme")
+    coordinator = AutoImportCoordinator(env["repo"], env["job_runner"], env["session_factory"])
+
+    await coordinator.run_once()
+    await asyncio.sleep(0.05)
+
+    _, _, options = env["job_runner"].started[0]
+    assert options["only_with_stock"] is True
+
+
+async def test_only_with_stock_flag_is_forwarded_when_false(env):
+    await env["make_tenant"](slug="acme", auto_import_only_with_stock=False)
+    coordinator = AutoImportCoordinator(env["repo"], env["job_runner"], env["session_factory"])
+
+    await coordinator.run_once()
+    await asyncio.sleep(0.05)
+
+    _, _, options = env["job_runner"].started[0]
+    assert options["only_with_stock"] is False
 
 
 async def test_per_tenant_interval_is_respected_independently(env):

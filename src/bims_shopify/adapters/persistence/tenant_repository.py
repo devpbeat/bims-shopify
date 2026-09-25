@@ -43,6 +43,7 @@ class SqlAlchemyTenantRepository:
             auto_import_products=model.auto_import_products,
             auto_import_publish=model.auto_import_publish,
             auto_import_interval_minutes=model.auto_import_interval_minutes,
+            auto_import_only_with_stock=model.auto_import_only_with_stock,
         )
 
     def _apply_domain(self, model: TenantModel, tenant: Tenant) -> None:
@@ -71,6 +72,7 @@ class SqlAlchemyTenantRepository:
         model.auto_import_products = tenant.auto_import_products
         model.auto_import_publish = tenant.auto_import_publish
         model.auto_import_interval_minutes = tenant.auto_import_interval_minutes
+        model.auto_import_only_with_stock = tenant.auto_import_only_with_stock
 
     async def get_by_slug(self, slug: str) -> Tenant | None:
         result = await self._session.execute(select(TenantModel).where(TenantModel.slug == slug))

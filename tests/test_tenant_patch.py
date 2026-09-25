@@ -160,6 +160,28 @@ async def test_patch_requires_auth(app_ctx):
     assert response.status_code == 401
 
 
+async def test_patch_auto_import_only_with_stock_round_trips(app_ctx):
+    app, _settings, _acme = app_ctx
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Default is True even without ever being set explicitly.
+        get_response = await client.get(
+            "/tenants/acme", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        )
+        assert get_response.json()["auto_import_only_with_stock"] is True
+
+        patch_response = await client.patch(
+            "/tenants/acme",
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+            json={"auto_import_only_with_stock": False},
+        )
+    assert patch_response.status_code == 200
+    assert patch_response.json()["auto_import_only_with_stock"] is False
+
+    model = await _get_model(app, "acme")
+    assert model.auto_import_only_with_stock is False
+
+
 async def test_patch_rejects_empty_secret(app_ctx):
     app, _settings, _acme = app_ctx
     transport = ASGITransport(app=app)

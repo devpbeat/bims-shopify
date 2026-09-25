@@ -51,6 +51,7 @@ class Tenant:
     auto_import_products: bool = False
     auto_import_publish: bool = False
     auto_import_interval_minutes: int = 360
+    auto_import_only_with_stock: bool = True
 
     @property
     def bims_auth_header(self) -> str:
