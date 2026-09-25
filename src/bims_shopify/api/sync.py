@@ -57,6 +57,7 @@ async def run_sync(
     request: Request,
     dry_run: bool = True,
     full: bool = False,
+    force: bool = False,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     session: AsyncSession = _Depends(get_db_session),
 ):
@@ -72,10 +73,12 @@ async def run_sync(
         )
 
     async with lock:
-        return await _do_run_sync(tenant, dry_run, session, full=full)
+        return await _do_run_sync(tenant, dry_run, session, full=full, force=force)
 
 
-async def _do_run_sync(tenant, dry_run: bool, session: AsyncSession, full: bool = False):
+async def _do_run_sync(
+    tenant, dry_run: bool, session: AsyncSession, full: bool = False, force: bool = False
+):
     sync_state_repo = SqlAlchemySyncStateRepository(session)
     audit = SqlAlchemyAuditLogger(session)
     client = BIMSClient(tenant)
@@ -88,7 +91,14 @@ async def _do_run_sync(tenant, dry_run: bool, session: AsyncSession, full: bool 
         last_run = await sync_state_repo.get_last_run(tenant.id)
         # full=True forces a complete catalog pull (e.g. initial stock push
         # after a catalog import), ignoring the incremental watermark.
-        since = None if full else ((last_run - INCREMENTAL_OVERLAP) if last_run else None)
+        # force=True is a stronger operator override: it implies full=True
+        # (ignore the incremental watermark) AND also ignores the stored
+        # product_hashes watermark below, so every BIMS product with
+        # resolvable stock is treated as a delta and re-pushed to Shopify —
+        # even if the hashes already match current BIMS stock (e.g. after a
+        # store wipe+rebuild where Shopify's real inventory no longer
+        # matches what BIMS last saw).
+        since = None if (full or force) else ((last_run - INCREMENTAL_OVERLAP) if last_run else None)
 
         if since is not None:
             try:
@@ -114,11 +124,22 @@ async def _do_run_sync(tenant, dry_run: bool, session: AsyncSession, full: bool 
                 )
 
         previous = await sync_state_repo.get_product_hashes(tenant.id)
-        previous_stocks = {sku: float(value) for sku, value in previous.items() if value}
+        # force=True ignores the stored watermark entirely: every product
+        # with resolvable stock is diffed against an empty baseline, so it
+        # is treated as changed and re-pushed. The real hashes are still
+        # persisted below at the end of a successful (non-dry-run) run, so
+        # subsequent incremental runs go back to normal behavior.
+        previous_stocks = (
+            {}
+            if force
+            else {sku: float(value) for sku, value in previous.items() if value}
+        )
 
         run_started_at = datetime.now(UTC)
         try:
-            result = await use_case.run(tenant, previous_stocks, since=since, dry_run=dry_run)
+            result = await use_case.run(
+                tenant, previous_stocks, since=since, dry_run=dry_run, force=force
+            )
         except Exception as exc:
             duration = (datetime.now(UTC) - started_at).total_seconds()
             logger.error(

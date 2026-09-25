@@ -85,7 +85,18 @@ class SyncInventoryToShopify:
         previous_stocks: dict[str, float],
         since: datetime | None = None,
         dry_run: bool = False,
+        force: bool = False,
     ) -> list[InventoryDelta] | DryRunReport | NeedsConfirmation:
+        """Run the sync.
+
+        ``force=True`` is an explicit operator override: it bypasses the
+        per-run safety guard (``_check_safety_guard``) so an intentional
+        full re-push (e.g. after a store wipe+rebuild where BIMS's stored
+        watermark no longer reflects Shopify reality) is never blocked by
+        the zero-ratio / max-changed abort. Callers are expected to also
+        pass ``previous_stocks={}`` and ``since=None`` when they want a
+        true full re-push; ``force`` itself only controls the guard.
+        """
         products = await self._erp.list_products(tenant, since=since)
         deltas = diff_inventory(previous_stocks, products)
 
@@ -106,9 +117,10 @@ class SyncInventoryToShopify:
                 )
             )
 
-        guard_result = self._check_safety_guard(tenant, resolved)
-        if guard_result is not None:
-            return guard_result
+        if not force:
+            guard_result = self._check_safety_guard(tenant, resolved)
+            if guard_result is not None:
+                return guard_result
 
         for i in range(0, len(resolved), INVENTORY_PUSH_BATCH_SIZE):
             batch = resolved[i : i + INVENTORY_PUSH_BATCH_SIZE]
