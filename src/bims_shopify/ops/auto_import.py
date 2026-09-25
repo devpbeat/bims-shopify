@@ -19,7 +19,7 @@ Those stay manual/admin-triggered because they can delete or merge data.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -41,6 +41,11 @@ AUTO_IMPORT_TRIGGER = "scheduler"
 #: for the last scheduler-triggered one. Small and bounded -- we don't need
 #: full history, just the most recent match.
 _RECENT_IMPORT_JOBS_LOOKBACK = 20
+
+#: Re-pull products modified within this window before the last successful
+#: scheduled import, to tolerate clock skew / near-miss writes on the BIMS
+#: side. Mirrors INCREMENTAL_OVERLAP in api/sync.py.
+INCREMENTAL_OVERLAP = timedelta(minutes=15)
 
 
 class AutoImportCoordinator:
@@ -85,9 +90,20 @@ class AutoImportCoordinator:
             logger.info("auto_import_skipped_job_in_flight", tenant_id=tenant.id, tenant_slug=tenant.slug)
             return
 
-        if not await self._is_due(tenant):
+        last_finished_at = await self._last_scheduler_import_finished_at(tenant.id)
+        if not self._is_due(tenant, last_finished_at):
             logger.info("auto_import_skipped_not_due", tenant_id=tenant.id, tenant_slug=tenant.slug)
             return
+
+        # First-ever scheduled import for this tenant runs full (no prior
+        # watermark to trust); every subsequent one is incremental, pulling
+        # only products BIMS reports as created/modified since the last
+        # successful scheduled import (minus a small overlap for clock skew).
+        since_iso = (
+            (last_finished_at - INCREMENTAL_OVERLAP).isoformat()
+            if last_finished_at is not None
+            else None
+        )
 
         try:
             await self._job_runner.start_job(
@@ -97,10 +113,16 @@ class AutoImportCoordinator:
                     "apply": True,
                     "publish": tenant.auto_import_publish,
                     "only_with_stock": tenant.auto_import_only_with_stock,
+                    "since_iso": since_iso,
                     "_trigger": AUTO_IMPORT_TRIGGER,
                 },
             )
-            logger.info("auto_import_enqueued", tenant_id=tenant.id, tenant_slug=tenant.slug)
+            logger.info(
+                "auto_import_enqueued",
+                tenant_id=tenant.id,
+                tenant_slug=tenant.slug,
+                incremental=since_iso is not None,
+            )
         except JobConflictError:
             # A job started between our _has_pending_import check and here.
             logger.info("auto_import_skipped_conflict", tenant_id=tenant.id, tenant_slug=tenant.slug)
@@ -118,8 +140,7 @@ class AutoImportCoordinator:
             )
             return result.scalar_one_or_none() is not None
 
-    async def _is_due(self, tenant: Tenant) -> bool:
-        last_finished_at = await self._last_scheduler_import_finished_at(tenant.id)  # type: ignore[arg-type]
+    def _is_due(self, tenant: Tenant, last_finished_at: datetime | None) -> bool:
         if last_finished_at is None:
             return True
         elapsed_minutes = (datetime.now(UTC) - last_finished_at).total_seconds() / 60

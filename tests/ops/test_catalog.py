@@ -4,9 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
 from cryptography.fernet import Fernet
 from sqlalchemy import select
@@ -1092,3 +1094,129 @@ async def test_run_cleanup_no_stock_safety_guard_blocks_over_60_percent(tenant):
     finally:
         catalog_ops.ShopifyClient = shopify_target  # type: ignore[assignment]
         catalog_ops.BIMSClient = bims_target  # type: ignore[assignment]
+
+
+# -- incremental import via BIMS last_update ----------------------------------
+
+
+@respx.mock
+async def test_fetch_bims_catalog_rows_full_pull_when_since_none(tenant):
+    from bims_shopify.ops.catalog import fetch_bims_catalog_rows
+
+    route = respx.get(f"{BIMS_URL}/api/products/index.json").mock(
+        return_value=httpx.Response(200, json={"status": "ok", "data": []})
+    )
+    bims_client = BIMSClient(tenant)
+    rows = await fetch_bims_catalog_rows(bims_client, tenant.bims_company_id, since=None)
+
+    assert rows == []
+    assert "last_update" not in route.calls[0].request.url.params
+
+
+@respx.mock
+async def test_fetch_bims_catalog_rows_incremental_passes_last_update_in_bims_local_format(tenant):
+    from bims_shopify.adapters.bims.timezones import to_bims_local
+    from bims_shopify.ops.catalog import fetch_bims_catalog_rows
+
+    route = respx.get(f"{BIMS_URL}/api/products/index.json").mock(
+        return_value=httpx.Response(200, json={"status": "ok", "data": []})
+    )
+    since = datetime(2026, 9, 20, 12, 0, 0, tzinfo=UTC)
+    bims_client = BIMSClient(tenant)
+    await fetch_bims_catalog_rows(
+        bims_client, tenant.bims_company_id, since=since, tenant_timezone=tenant.bims_timezone
+    )
+
+    sent = route.calls[0].request.url.params
+    assert sent["last_update"] == to_bims_local(since, tenant.bims_timezone)
+
+
+async def test_parse_since_returns_none_for_missing():
+    assert catalog_ops._parse_since(None) is None
+    assert catalog_ops._parse_since("") is None
+
+
+async def test_parse_since_rejects_naive_datetime():
+    with pytest.raises(ValueError, match="aware"):
+        catalog_ops._parse_since("2026-09-20T12:00:00")
+
+
+async def test_parse_since_accepts_aware_iso():
+    since = catalog_ops._parse_since("2026-09-20T12:00:00+00:00")
+    assert since is not None
+    assert since.tzinfo is not None
+
+
+@respx.mock
+async def test_run_import_incremental_dry_run_passes_last_update_and_flags_incremental(tenant):
+    from bims_shopify.adapters.bims.timezones import to_bims_local
+
+    since = datetime(2026, 9, 24, 8, 0, 0, tzinfo=UTC)
+    index_route = respx.get(f"{BIMS_URL}/api/products/index.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={"status": "ok", "data": [{"Product": _row("1", "Mug", "SKU-MUG")}]},
+        )
+    )
+
+    summary = await catalog_ops.run_import(
+        tenant, {"apply": False, "since_iso": since.isoformat()}
+    )
+
+    assert summary["incremental"] is True
+    assert summary["dry_run"] is True
+    assert summary["products"] == 1
+    sent = index_route.calls[0].request.url.params
+    assert sent["last_update"] == to_bims_local(since, tenant.bims_timezone)
+
+
+@respx.mock
+async def test_run_import_manual_default_stays_full_no_last_update(tenant):
+    index_route = respx.get(f"{BIMS_URL}/api/products/index.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={"status": "ok", "data": [{"Product": _row("1", "Mug", "SKU-MUG")}]},
+        )
+    )
+
+    # Manual import options never include since_iso unless a caller
+    # explicitly passes it -- must stay a full pull.
+    summary = await catalog_ops.run_import(tenant, {"apply": False})
+
+    assert summary["incremental"] is False
+    assert "last_update" not in index_route.calls[0].request.url.params
+
+
+@respx.mock
+async def test_run_import_incremental_still_respects_only_with_stock(tenant):
+    since = datetime(2026, 9, 24, 8, 0, 0, tzinfo=UTC)
+    respx.get(f"{BIMS_URL}/api/products/index.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "data": [
+                    {"Product": _row("1", "InStock", "SKU-IN")},
+                    {"Product": _row("2", "OutOfStock", "SKU-OUT")},
+                ],
+            },
+        )
+    )
+    respx.post(f"{BIMS_URL}/api/products_stocks/stock_fenicio.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "data": {"stockPorSku": [{"sku": "SKU-IN", "stock": 5}, {"sku": "SKU-OUT", "stock": 0}]},
+            },
+        )
+    )
+
+    summary = await catalog_ops.run_import(
+        tenant,
+        {"apply": False, "since_iso": since.isoformat(), "only_with_stock": True},
+    )
+
+    assert summary["incremental"] is True
+    assert summary["products"] == 1
+    assert summary["sample"][0]["skus"] == ["SKU-IN"]

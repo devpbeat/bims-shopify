@@ -21,7 +21,7 @@ from bims_shopify.adapters.persistence.tenant_repository import (
 )
 from bims_shopify.config import Settings
 from bims_shopify.domain.tenant import Tenant
-from bims_shopify.ops.auto_import import AutoImportCoordinator
+from bims_shopify.ops.auto_import import INCREMENTAL_OVERLAP, AutoImportCoordinator
 from bims_shopify.ops.job_runner import JobRunner
 
 
@@ -150,6 +150,7 @@ async def test_enqueues_when_due_and_no_prior_import(env):
         "apply": True,
         "publish": False,
         "only_with_stock": True,
+        "since_iso": None,
         "_trigger": "scheduler",
     }
 
@@ -295,6 +296,64 @@ async def test_only_with_stock_flag_is_forwarded_when_false(env):
 
     _, _, options = env["job_runner"].started[0]
     assert options["only_with_stock"] is False
+
+
+async def test_first_ever_auto_import_has_no_since_iso_full_pull(env):
+    """No prior scheduler-triggered import for this tenant -- the first
+    scheduled import must run full (since_iso=None), there's no watermark
+    to trust yet."""
+    await env["make_tenant"](slug="acme")
+    coordinator = AutoImportCoordinator(env["repo"], env["job_runner"], env["session_factory"])
+
+    await coordinator.run_once()
+    await asyncio.sleep(0.05)
+
+    _, _, options = env["job_runner"].started[0]
+    assert options["since_iso"] is None
+
+
+async def test_subsequent_auto_import_computes_since_iso_with_overlap(env):
+    """Once a prior scheduler-triggered import finished, the next one must
+    be incremental: since_iso = last_finished_at - INCREMENTAL_OVERLAP."""
+    tenant = await env["make_tenant"](slug="acme", auto_import_interval_minutes=60)
+    last_finished_at = datetime.now(UTC) - timedelta(minutes=61)
+    await _insert_finished_import_job(
+        env["session_factory"],
+        tenant.id,
+        trigger="scheduler",
+        created_at=last_finished_at,
+    )
+    coordinator = AutoImportCoordinator(env["repo"], env["job_runner"], env["session_factory"])
+
+    await coordinator.run_once()
+    await asyncio.sleep(0.05)
+
+    _, _, options = env["job_runner"].started[0]
+    assert options["since_iso"] is not None
+    expected = last_finished_at - INCREMENTAL_OVERLAP
+    actual = datetime.fromisoformat(options["since_iso"])
+    assert abs((actual - expected).total_seconds()) < 1
+
+
+async def test_manual_trigger_marker_does_not_affect_since_iso_computation(env):
+    """A manually-triggered import doesn't count toward the scheduler
+    watermark at all (see test_manual_import_does_not_count_as_due_marker),
+    so the next scheduled import after one is still the "first" one from the
+    scheduler's point of view: full pull, since_iso=None."""
+    await env["make_tenant"](slug="acme", auto_import_interval_minutes=360)
+    await _insert_finished_import_job(
+        env["session_factory"],
+        (await env["repo"].get_by_slug("acme")).id,
+        trigger="manual",
+        created_at=datetime.now(UTC) - timedelta(minutes=1),
+    )
+    coordinator = AutoImportCoordinator(env["repo"], env["job_runner"], env["session_factory"])
+
+    await coordinator.run_once()
+    await asyncio.sleep(0.05)
+
+    _, _, options = env["job_runner"].started[0]
+    assert options["since_iso"] is None
 
 
 async def test_per_tenant_interval_is_respected_independently(env):

@@ -45,11 +45,13 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import httpx
 
 from bims_shopify.adapters.bims.client import BIMSClient
+from bims_shopify.adapters.bims.timezones import to_bims_local
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.adapters.persistence.database import create_engine_and_sessionmaker
@@ -281,19 +283,49 @@ def group_rows(rows: list[BimsRow]) -> GroupingReport:
     return report
 
 
-async def fetch_bims_catalog_rows(bims_client: BIMSClient, company_id: int) -> list[dict[str, Any]]:
-    """Page through BIMS ``/api/products/index.json`` (mode=simple) for a company."""
+def _parse_since(since_iso: str | None) -> datetime | None:
+    """Parse the ``since_iso`` import option into an aware UTC datetime.
+
+    ``None``/empty means a full pull. Raises ``ValueError`` if given a naive
+    ISO string -- the incremental watermark must always be unambiguous.
+    """
+    if not since_iso:
+        return None
+    parsed = datetime.fromisoformat(since_iso)
+    if parsed.tzinfo is None:
+        raise ValueError("since_iso must be an aware ISO datetime (with UTC offset)")
+    return parsed
+
+
+async def fetch_bims_catalog_rows(
+    bims_client: BIMSClient,
+    company_id: int,
+    *,
+    since: datetime | None = None,
+    tenant_timezone: str = "America/Asuncion",
+) -> list[dict[str, Any]]:
+    """Page through BIMS ``/api/products/index.json`` (mode=simple) for a company.
+
+    ``since``, when given (an aware UTC datetime), narrows the pull to
+    products BIMS reports as created/modified after that point via the
+    ``last_update`` filter (converted to BIMS local time). ``None`` means a
+    full pull of the company's catalog -- the historical, always-correct
+    default used by manual imports and the very first scheduled auto-import.
+    """
+    params: dict[str, Any] = {
+        "mode": "simple",
+        "company_id": company_id,
+        "limit": BIMS_PAGE_LIMIT,
+    }
+    if since is not None:
+        params["last_update"] = to_bims_local(since, tenant_timezone)
+
     rows: list[dict[str, Any]] = []
     offset = 0
     while True:
         body = await bims_client.get(
             "/api/products/index.json",
-            params={
-                "mode": "simple",
-                "company_id": company_id,
-                "limit": BIMS_PAGE_LIMIT,
-                "offset": offset,
-            },
+            params={**params, "offset": offset},
         )
         page = body.get("data") or []
         for item in page:
@@ -947,11 +979,23 @@ async def _run_wipe(
 async def _run_import(
     tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
 ) -> dict[str, Any]:
+    since = _parse_since(getattr(args, "since_iso", None))
+
     bims_client = BIMSClient(tenant)
     shopify_client = ShopifyClient(tenant)
     try:
-        await _emit_progress(progress, 0, None, "pulling BIMS catalog")
-        raw_rows = await fetch_bims_catalog_rows(bims_client, tenant.bims_company_id)
+        await _emit_progress(
+            progress,
+            0,
+            None,
+            "pulling BIMS catalog (incremental)" if since is not None else "pulling BIMS catalog",
+        )
+        raw_rows = await fetch_bims_catalog_rows(
+            bims_client,
+            tenant.bims_company_id,
+            since=since,
+            tenant_timezone=tenant.bims_timezone,
+        )
         rows, duplicates = filter_and_dedupe_rows(raw_rows)
         grouping = group_rows(rows)
         groups = grouping.groups
@@ -975,6 +1019,7 @@ async def _run_import(
                 "count": len(grouping.shadowed_size_duplicates),
                 "items": grouping.shadowed_size_duplicates,
             },
+            "incremental": since is not None,
         }
 
         if not args.apply:
@@ -1186,11 +1231,16 @@ async def run_wipe(tenant: Tenant, options: dict[str, Any], progress: ProgressFn
 
 
 async def run_import(tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None) -> dict[str, Any]:
+    # `since_iso` is opt-in and defaults to None (full pull): manual imports
+    # via the ops UI/CLI stay full unless a caller explicitly passes it. The
+    # auto-import scheduler is the one caller that sets it, to run
+    # incrementally after the first scheduled import.
     args = argparse.Namespace(
         apply=bool(options.get("apply", False)),
         publish=bool(options.get("publish", False)),
         only_with_stock=bool(options.get("only_with_stock", False)),
         limit=options.get("limit"),
+        since_iso=options.get("since_iso"),
     )
     return await _run_import(tenant, args, progress=progress)
 
@@ -1258,6 +1308,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Only process the first N product groups (for smoke testing).",
+    )
+    import_parser.add_argument(
+        "--since-iso",
+        dest="since_iso",
+        default=None,
+        help=(
+            "Aware ISO-8601 UTC datetime; only pull BIMS products created/modified "
+            "since then (incremental). Default: full pull (all manual imports)."
+        ),
     )
 
     subparsers.add_parser(
