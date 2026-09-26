@@ -272,6 +272,14 @@ class ShopifyClient:
                     "quantity": int(delta.new_stock),
                 }
             )
+        # BIMS can carry several rows with the same code2 (duplicate SKUs),
+        # which resolve to the same Shopify inventory item. Shopify rejects a
+        # batch with a repeated (inventoryItemId, locationId) pair, so keep one
+        # quantity per inventory item (values match — stock is by code2).
+        deduped: dict[tuple[str, str], dict[str, Any]] = {}
+        for q in quantities:
+            deduped[(q["inventoryItemId"], q["locationId"])] = q
+        quantities = list(deduped.values())
         if not quantities:
             return
         await self._set_inventory_quantities_self_healing(quantities)

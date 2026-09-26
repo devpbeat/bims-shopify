@@ -125,3 +125,21 @@ async def test_persistent_not_stocked_error_raises_after_single_retry(shopify_cl
         await shopify_client.set_inventory_quantities(tenant, deltas)
 
     assert route.call_count == 3
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_duplicate_inventory_item_ids_are_deduped(shopify_client, tenant):
+    """Duplicate code2 in BIMS resolve to the same Shopify inventory item;
+    the batch must not send a repeated (inventoryItemId, locationId) pair."""
+    success = {"data": {"inventorySetQuantities": {"inventoryAdjustmentGroup": {"id": "gid://x/1"}, "userErrors": []}}}
+    route = respx.post(_graphql_url(tenant)).mock(return_value=httpx.Response(200, json=success))
+    deltas = [
+        InventoryDelta(sku="A", previous_stock=0, new_stock=5, variant_inventory_item_id="gid://shopify/InventoryItem/1"),
+        InventoryDelta(sku="A2", previous_stock=0, new_stock=5, variant_inventory_item_id="gid://shopify/InventoryItem/1"),
+    ]
+    await shopify_client.set_inventory_quantities(tenant, deltas)
+    import json as _json
+    body = _json.loads(route.calls[0].request.content)
+    qs = body["variables"]["input"]["quantities"]
+    assert len(qs) == 1
