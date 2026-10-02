@@ -4,7 +4,6 @@ import { LanguageToggle } from './LanguageToggle'
 
 interface PortalHeaderProps {
   slug: string
-  reportDate: string | null
   syncStatus: SyncStatus | null
   onLogout: () => void
   isOperator: boolean
@@ -13,7 +12,6 @@ interface PortalHeaderProps {
 
 export function PortalHeader({
   slug,
-  reportDate,
   syncStatus,
   onLogout,
   isOperator,
@@ -32,13 +30,8 @@ export function PortalHeader({
     <header className="portal-header">
       <div>
         <h1>{slug}</h1>
-        <p className="muted">{t.header.subtitle}</p>
       </div>
       <div className="portal-header-meta">
-        <div>
-          <span className="label">{t.common.reportDate}</span>
-          <span>{formatDate(reportDate)}</span>
-        </div>
         <div>
           <span className="label">{t.common.lastSync}</span>
           <span>{formatDate(syncStatus?.last_run_at as string | undefined)}</span>

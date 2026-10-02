@@ -137,11 +137,37 @@ async def test_dashboard_returns_expected_shape_with_admin_token(app_and_tenant)
             entity="catalog",
             tenant_id=acme.id,
             payload={
-                "shopify_products": 100,
-                "shopify_variants": 150,
-                "matched_skus": 90,
-                "bims_not_in_shopify": 5,
+                "bims": {
+                    "eligible_products": 120,
+                    "eligible_variants": 300,
+                    "duplicate_code2": 2,
+                    "with_stock": 80,
+                },
+                "shopify": {
+                    "products": 100,
+                    "variants": 150,
+                    "variants_with_sku": 150,
+                },
+                "reconciliation": {
+                    "skus_in_bims_not_in_shopify": {"count": 5},
+                    "skus_in_shopify_not_in_bims": {"count": 1},
+                    "matched_skus": 90,
+                },
             },
+        )
+        await audit.log(
+            actor="system",
+            action="sync.completed",
+            entity="sync_run",
+            tenant_id=acme.id,
+            payload={"matched": 0, "updated": 0},
+        )
+        await audit.log(
+            actor="system",
+            action="sync.completed",
+            entity="sync_run",
+            tenant_id=acme.id,
+            payload={"matched": 7, "updated": 7},
         )
 
     transport = ASGITransport(app=app)
@@ -161,8 +187,13 @@ async def test_dashboard_returns_expected_shape_with_admin_token(app_and_tenant)
         "interval_minutes": 120,
         "only_with_stock": True,
     }
+    assert body["catalog"]["bims_eligible_products"] == 120
+    assert body["catalog"]["bims_with_stock"] == 80
     assert body["catalog"]["shopify_products"] == 100
+    assert body["catalog"]["shopify_variants"] == 150
+    assert body["catalog"]["matched_skus"] == 90
     assert body["catalog"]["bims_not_in_shopify"] == 5
+    assert body["last_push"]["updated"] == 7
 
 
 async def test_dashboard_requires_portal_auth(app_and_tenant):
@@ -185,6 +216,7 @@ async def test_dashboard_works_with_portal_token(app_and_tenant):
     body = response.json()
     assert body["catalog"]["shopify_products"] is None
     assert "hint" in body["catalog"]
+    assert body["last_push"] is None
 
 
 async def test_rekey_report_obsolete_when_wipe_happened_after_report(app_and_tenant):

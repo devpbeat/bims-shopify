@@ -98,3 +98,22 @@ class SqlAlchemyAuditLogger:
         stmt = stmt.order_by(AuditLogModel.created_at.desc(), AuditLogModel.id.desc()).limit(1)
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def list_recent_by_action(
+        self, *, action: str, tenant_id: int | None = None, limit: int = DEFAULT_AUDIT_LIMIT
+    ) -> list[AuditLogModel]:
+        """List the most recent entries for ``action``, newest-first.
+
+        Used to scan a short recent window for an entry matching a payload
+        condition (e.g. "the last sync that actually changed stock") without
+        a dedicated indexed column for that condition.
+        """
+        clamped_limit = max(1, min(limit, MAX_AUDIT_LIMIT))
+        stmt = select(AuditLogModel).where(AuditLogModel.action == action)
+        if tenant_id is not None:
+            stmt = stmt.where(AuditLogModel.tenant_id == tenant_id)
+        stmt = stmt.order_by(AuditLogModel.created_at.desc(), AuditLogModel.id.desc()).limit(
+            clamped_limit
+        )
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())

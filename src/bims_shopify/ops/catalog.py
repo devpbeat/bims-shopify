@@ -1137,6 +1137,15 @@ async def _run_status(
         rows, duplicates = filter_and_dedupe_rows(raw_rows)
         grouping = group_rows(rows)
         bims_skus = {v.sku for g in grouping.groups for v in g.variants}
+
+        all_skus = list(bims_skus)
+        stock_by_sku = await fetch_stock_by_sku(bims_client, all_skus, tenant.stock_warehouse_ids)
+        bims_with_stock = sum(
+            1
+            for g in grouping.groups
+            if any(stock_by_sku.get(v.sku, 0.0) > 0 for v in g.variants)
+        )
+
         await _emit_progress(progress, 1, 2, "bims pull done, pulling Shopify catalog")
 
         shopify_products = 0
@@ -1161,6 +1170,7 @@ async def _run_status(
                 "eligible_products": len(grouping.groups),
                 "eligible_variants": len(rows),
                 "duplicate_code2": len(duplicates),
+                "with_stock": bims_with_stock,
             },
             "shopify": {
                 "products": shopify_products,

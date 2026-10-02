@@ -463,6 +463,20 @@ async def test_run_status_prints_full_reconciliation_report(monkeypatch, tmp_pat
             ),
         ]
     )
+    respx.post(f"{BIMS_URL}/api/products_stocks/stock_fenicio.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "data": {
+                    "stockPorSku": [
+                        {"sku": "SKU-S", "stock": 4},
+                        {"sku": "SKU-ORPHAN", "stock": 0},
+                    ]
+                },
+            },
+        )
+    )
 
     # main() itself just wraps `_run` in asyncio.run() + json.dumps(..., indent=2)
     # (see bims_shopify.ops.catalog.main); calling it directly here would nest
@@ -475,7 +489,12 @@ async def test_run_status_prints_full_reconciliation_report(monkeypatch, tmp_pat
     out = capsys.readouterr().out
     report = json.loads(out)
 
-    assert report["bims"] == {"eligible_products": 2, "eligible_variants": 2, "duplicate_code2": 0}
+    assert report["bims"] == {
+        "eligible_products": 2,
+        "eligible_variants": 2,
+        "duplicate_code2": 0,
+        "with_stock": 1,
+    }
     assert report["shopify"] == {"products": 1, "variants": 2, "variants_with_sku": 2}
     assert report["reconciliation"]["matched_skus"] == 1
     assert report["reconciliation"]["skus_in_bims_not_in_shopify"]["sample"] == ["SKU-ORPHAN"]

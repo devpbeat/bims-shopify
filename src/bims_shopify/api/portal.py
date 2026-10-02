@@ -474,15 +474,25 @@ async def get_portal_dashboard(
     catalog_entry = await audit_repo.get_latest(action="catalog.reconciliation", tenant_id=tenant.id)
     if catalog_entry is not None:
         payload = catalog_entry.payload or {}
+        bims = payload.get("bims") or {}
+        shopify = payload.get("shopify") or {}
+        reconciliation = payload.get("reconciliation") or {}
+        bims_not_in_shopify = reconciliation.get("skus_in_bims_not_in_shopify")
         catalog = {
-            "shopify_products": payload.get("shopify_products"),
-            "shopify_variants": payload.get("shopify_variants"),
-            "matched_skus": payload.get("matched_skus"),
-            "bims_not_in_shopify": payload.get("bims_not_in_shopify"),
+            "bims_eligible_products": bims.get("eligible_products"),
+            "bims_with_stock": bims.get("with_stock"),
+            "shopify_products": shopify.get("products"),
+            "shopify_variants": shopify.get("variants"),
+            "matched_skus": reconciliation.get("matched_skus"),
+            "bims_not_in_shopify": (
+                bims_not_in_shopify.get("count") if isinstance(bims_not_in_shopify, dict) else None
+            ),
             "checked_at": ensure_aware_utc(catalog_entry.created_at).isoformat(),
         }
     else:
         catalog = {
+            "bims_eligible_products": None,
+            "bims_with_stock": None,
             "shopify_products": None,
             "shopify_variants": None,
             "matched_skus": None,
@@ -491,9 +501,24 @@ async def get_portal_dashboard(
             "hint": "No reconciliation report yet. Run Status to generate one.",
         }
 
+    last_push_entries = await audit_repo.list_recent_by_action(
+        action="sync.completed", tenant_id=tenant.id, limit=50
+    )
+    last_push = None
+    for entry in last_push_entries:
+        payload = entry.payload or {}
+        updated = payload.get("updated") or 0
+        if updated > 0:
+            last_push = {
+                "updated": updated,
+                "ran_at": ensure_aware_utc(entry.created_at).isoformat(),
+            }
+            break
+
     return {
         "slug": tenant.slug,
         "last_sync": last_sync,
+        "last_push": last_push,
         "last_error": status.get("last_error"),
         "last_error_at": status.get("last_error_at"),
         "auto_import": {

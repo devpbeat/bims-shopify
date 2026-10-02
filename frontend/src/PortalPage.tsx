@@ -252,7 +252,6 @@ export function PortalPage() {
     <div className="portal-page">
       <PortalHeader
         slug={slug}
-        reportDate={conflictsVisible ? (report?.created_at ?? null) : null}
         syncStatus={syncStatus}
         onLogout={handleLogout}
         isOperator={!!adminToken}

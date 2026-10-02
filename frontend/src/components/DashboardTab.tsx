@@ -116,6 +116,11 @@ export function DashboardTab({
               {d.matched}: {dashboard.last_sync.matched} · {d.updated}: {dashboard.last_sync.updated}
             </p>
           )}
+          <p className="muted">
+            {dashboard?.last_push
+              ? d.lastPush(dashboard.last_push.updated, new Date(dashboard.last_push.ran_at).toLocaleString(localeTag))
+              : d.lastPushNone}
+          </p>
         </div>
 
         <div className="dash-card dash-card--pending">
@@ -150,24 +155,39 @@ export function DashboardTab({
       <div className="dash-card">
         <p className="label">{d.catalogTitle}</p>
         {catalog && catalog.shopify_products != null ? (
-          <div className="dash-stat-row">
-            <div className="dash-stat-tile dash-stat-tile--ok">
-              <span className="dash-stat-count">{catalog.shopify_products}</span>
-              <span className="dash-stat-label">{d.catalogProducts}</span>
+          <>
+            <div className="dash-stat-row">
+              <div className="dash-stat-tile dash-stat-tile--ok">
+                <span className="dash-stat-count">{catalog.bims_eligible_products}</span>
+                <span className="dash-stat-label">{d.catalogEligibleProducts}</span>
+              </div>
+              <div className="dash-stat-tile dash-stat-tile--ok">
+                <span className="dash-stat-count">{catalog.bims_with_stock}</span>
+                <span className="dash-stat-label">{d.catalogWithStock}</span>
+              </div>
+              <div className="dash-stat-tile dash-stat-tile--ok">
+                <span className="dash-stat-count">{catalog.shopify_products}</span>
+                <span className="dash-stat-label">{d.catalogProducts}</span>
+              </div>
+              <div className="dash-stat-tile dash-stat-tile--ok">
+                <span className="dash-stat-count">{catalog.shopify_variants}</span>
+                <span className="dash-stat-label">{d.catalogVariants}</span>
+              </div>
+              <div className="dash-stat-tile dash-stat-tile--ok">
+                <span className="dash-stat-count">{catalog.matched_skus}</span>
+                <span className="dash-stat-label">{d.catalogMatched}</span>
+              </div>
+              <div className="dash-stat-tile dash-stat-tile--warn">
+                <span className="dash-stat-count">{catalog.bims_not_in_shopify}</span>
+                <span className="dash-stat-label">{d.catalogNotInShopify}</span>
+              </div>
             </div>
-            <div className="dash-stat-tile dash-stat-tile--ok">
-              <span className="dash-stat-count">{catalog.shopify_variants}</span>
-              <span className="dash-stat-label">{d.catalogVariants}</span>
-            </div>
-            <div className="dash-stat-tile dash-stat-tile--ok">
-              <span className="dash-stat-count">{catalog.matched_skus}</span>
-              <span className="dash-stat-label">{d.catalogMatched}</span>
-            </div>
-            <div className="dash-stat-tile dash-stat-tile--warn">
-              <span className="dash-stat-count">{catalog.bims_not_in_shopify}</span>
-              <span className="dash-stat-label">{d.catalogNotInShopify}</span>
-            </div>
-          </div>
+            {catalog.checked_at && (
+              <p className="muted">
+                {d.catalogCheckedAt(formatRelative(catalog.checked_at, locale) ?? new Date(catalog.checked_at).toLocaleString(localeTag))}
+              </p>
+            )}
+          </>
         ) : (
           <p className="muted">{catalog?.hint ?? d.catalogNoData}</p>
         )}

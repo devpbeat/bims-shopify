@@ -17,7 +17,6 @@ export interface Messages {
     backToLogin: string
     continueLabel: string
     logout: string
-    reportDate: string
     lastSync: string
     never: string
     loadingReport: string
@@ -61,9 +60,6 @@ export interface Messages {
     accessKeyPrompt: (slug: string) => string
     accessKeyPlaceholder: string
   }
-  header: {
-    subtitle: string
-  }
   tabs: {
     dashboard: string
     duplicates: string
@@ -98,12 +94,17 @@ export interface Messages {
     autoImportOnlyWithStock: string
     autoImportAllProducts: string
     catalogTitle: string
+    catalogEligibleProducts: string
+    catalogWithStock: string
     catalogProducts: string
     catalogVariants: string
     catalogMatched: string
     catalogNotInShopify: string
     catalogNoData: string
+    catalogCheckedAt: (relative: string) => string
     noConflicts: string
+    lastPush: (n: number, date: string) => string
+    lastPushNone: string
   }
   banner: {
     text: string

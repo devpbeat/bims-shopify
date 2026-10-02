@@ -85,6 +85,8 @@ export interface DashboardAutoImport {
 }
 
 export interface DashboardCatalog {
+  bims_eligible_products: number | null
+  bims_with_stock: number | null
   shopify_products: number | null
   shopify_variants: number | null
   matched_skus: number | null
@@ -93,9 +95,15 @@ export interface DashboardCatalog {
   hint?: string
 }
 
+export interface DashboardLastPush {
+  updated: number
+  ran_at: string
+}
+
 export interface DashboardData {
   slug: string
   last_sync: DashboardLastSync
+  last_push: DashboardLastPush | null
   last_error: string | null
   last_error_at: string | null
   auto_import: DashboardAutoImport
