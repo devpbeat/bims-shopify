@@ -236,6 +236,7 @@ async def _do_run_sync(
         # last_sync only advances after the full run (including the push)
         # succeeded end-to-end.
         await sync_state_repo.set_last_run(tenant.id, run_started_at)
+        await sync_state_repo.clear_last_error(tenant.id)
         summary = {
             "status": "ok",
             "matched": len(deltas),

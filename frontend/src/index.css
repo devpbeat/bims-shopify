@@ -341,6 +341,22 @@ code {
   padding: 10px 14px;
 }
 
+.dash-error-banner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  background: rgba(220, 38, 38, 0.08);
+  border: 1px solid rgba(220, 38, 38, 0.24);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin-bottom: 16px;
+}
+
+.dash-error-banner strong {
+  color: var(--color-danger);
+}
+
 .token-card-top {
   display: flex;
   align-items: center;

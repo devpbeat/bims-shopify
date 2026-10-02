@@ -41,7 +41,7 @@ export function PortalHeader({
         </div>
         <div>
           <span className="label">{t.common.lastSync}</span>
-          <span>{formatDate(syncStatus?.last_run as string | undefined)}</span>
+          <span>{formatDate(syncStatus?.last_run_at as string | undefined)}</span>
         </div>
         <LanguageToggle />
         <button type="button" className="btn-link" onClick={onOperatorClick}>

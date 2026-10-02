@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
-import { ApiError, getRekeyReport, getSyncStatus, postRekeyResolutions } from './api/client'
-import type { PendingQueue, RekeyReport, Resolution, SyncStatus } from './api/types'
+import { ApiError, getDashboard, getRekeyReport, getSyncStatus, postRekeyResolutions } from './api/client'
+import type { DashboardData, PendingQueue, RekeyReport, Resolution, SyncStatus } from './api/types'
 import { ActivityTab } from './components/ActivityTab'
 import { ApplyFooter } from './components/ApplyFooter'
 import { AutoReconcileBanner } from './components/AutoReconcileBanner'
@@ -30,7 +30,9 @@ export function PortalPage() {
   const { slug = '' } = useParams<{ slug: string }>()
   const [token, setToken] = useState<string | null>(() => tokenFromUrl() ?? loadToken(slug))
   const [report, setReport] = useState<RekeyReport | null>(null)
+  const [reportMissing, setReportMissing] = useState(false)
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
+  const [dashboard, setDashboard] = useState<DashboardData | null>(null)
   const [resolutions, setResolutions] = useState<Resolution[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -88,12 +90,27 @@ export function PortalPage() {
     setLoading(true)
     setError(null)
 
-    Promise.all([getRekeyReport(slug, token), getSyncStatus(slug, token)])
-      .then(([reportData, syncData]) => {
+    Promise.all([
+      getRekeyReport(slug, token).catch((err: unknown) => {
+        if (err instanceof ApiError && err.status === 404) return null
+        throw err
+      }),
+      getSyncStatus(slug, token),
+      getDashboard(slug, token),
+    ])
+      .then(([reportData, syncData, dashboardData]) => {
         if (cancelled) return
-        setReport(reportData)
-        setResolutions(reportData.resolutions)
+        if (reportData === null || reportData.obsolete) {
+          setReport(reportData)
+          setReportMissing(true)
+          setResolutions([])
+        } else {
+          setReport(reportData)
+          setReportMissing(false)
+          setResolutions(reportData.resolutions)
+        }
         setSyncStatus(syncData)
+        setDashboard(dashboardData)
       })
       .catch((err: unknown) => {
         if (cancelled) return
@@ -194,7 +211,7 @@ export function PortalPage() {
     )
   }
 
-  if (loading && !report) {
+  if (loading && !dashboard) {
     return (
       <div className="centered-page">
         <p>{t.common.loadingReport}</p>
@@ -202,7 +219,7 @@ export function PortalPage() {
     )
   }
 
-  if (error && !report) {
+  if (error && !dashboard) {
     return (
       <div className="centered-page">
         <p className="error-text">{error}</p>
@@ -210,7 +227,7 @@ export function PortalPage() {
     )
   }
 
-  if (!report) {
+  if (!dashboard) {
     return (
       <div className="centered-page">
         <p className="empty-state">{t.common.noReport}</p>
@@ -218,10 +235,15 @@ export function PortalPage() {
     )
   }
 
-  const payload = report.payload
-  const duplicates = payload.duplicate_target ?? []
-  const unresolved = payload.unresolved ?? []
-  const mismatches = payload.name_mismatch ?? []
+  // Conflict tabs only make sense against a fresh rekey report: once the
+  // catalog has been wiped+rebuilt, the old report's findings no longer
+  // refer to anything real, so we hide the Duplicates/Unresolved/Name
+  // mismatches tabs entirely rather than show stale counts.
+  const conflictsVisible = !reportMissing && report != null && !report.obsolete
+  const payload = conflictsVisible ? report!.payload : null
+  const duplicates = payload?.duplicate_target ?? []
+  const unresolved = payload?.unresolved ?? []
+  const mismatches = payload?.name_mismatch ?? []
 
   const guideSection =
     tab === 'unresolved' ? t.help.unresolved : tab === 'mismatches' ? t.help.mismatches : t.help.duplicates
@@ -230,7 +252,7 @@ export function PortalPage() {
     <div className="portal-page">
       <PortalHeader
         slug={slug}
-        reportDate={report.created_at}
+        reportDate={conflictsVisible ? (report?.created_at ?? null) : null}
         syncStatus={syncStatus}
         onLogout={handleLogout}
         isOperator={!!adminToken}
@@ -252,15 +274,19 @@ export function PortalPage() {
         <button type="button" className={tab === 'dashboard' ? 'tab active' : 'tab'} onClick={() => setTab('dashboard')}>
           {t.tabs.dashboard}
         </button>
-        <button type="button" className={tab === 'duplicates' ? 'tab active' : 'tab'} onClick={() => setTab('duplicates')}>
-          {t.tabs.duplicates} ({duplicates.length})
-        </button>
-        <button type="button" className={tab === 'unresolved' ? 'tab active' : 'tab'} onClick={() => setTab('unresolved')}>
-          {t.tabs.unresolved} ({unresolved.length})
-        </button>
-        <button type="button" className={tab === 'mismatches' ? 'tab active' : 'tab'} onClick={() => setTab('mismatches')}>
-          {t.tabs.mismatches} ({mismatches.length})
-        </button>
+        {conflictsVisible && (
+          <>
+            <button type="button" className={tab === 'duplicates' ? 'tab active' : 'tab'} onClick={() => setTab('duplicates')}>
+              {t.tabs.duplicates} ({duplicates.length})
+            </button>
+            <button type="button" className={tab === 'unresolved' ? 'tab active' : 'tab'} onClick={() => setTab('unresolved')}>
+              {t.tabs.unresolved} ({unresolved.length})
+            </button>
+            <button type="button" className={tab === 'mismatches' ? 'tab active' : 'tab'} onClick={() => setTab('mismatches')}>
+              {t.tabs.mismatches} ({mismatches.length})
+            </button>
+          </>
+        )}
         <button type="button" className={tab === 'activity' ? 'tab active' : 'tab'} onClick={() => setTab('activity')}>
           {t.tabs.activity}
         </button>
@@ -280,6 +306,8 @@ export function PortalPage() {
           <DashboardTab
             slug={slug}
             syncStatus={syncStatus}
+            dashboard={dashboard}
+            conflictsVisible={conflictsVisible}
             duplicatesCount={duplicates.length}
             unresolvedCount={unresolved.length}
             mismatchesCount={mismatches.length}

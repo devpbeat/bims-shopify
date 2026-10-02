@@ -87,6 +87,23 @@ export interface Messages {
     statMismatches: string
     healthy: string
     needsAttention: string
+    matched: string
+    updated: string
+    lastErrorTitle: string
+    lastErrorAt: string
+    autoImportTitle: string
+    autoImportOn: string
+    autoImportOff: string
+    autoImportInterval: (minutes: number) => string
+    autoImportOnlyWithStock: string
+    autoImportAllProducts: string
+    catalogTitle: string
+    catalogProducts: string
+    catalogVariants: string
+    catalogMatched: string
+    catalogNotInShopify: string
+    catalogNoData: string
+    noConflicts: string
   }
   banner: {
     text: string

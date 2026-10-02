@@ -42,9 +42,10 @@ export interface ReportPayload {
 }
 
 export interface RekeyReport {
-  report_id: string
+  obsolete: boolean
+  report_id?: string
   created_at: string | null
-  payload: ReportPayload
+  payload: ReportPayload | null
   resolutions: Resolution[]
 }
 
@@ -62,8 +63,43 @@ export interface ResolutionResult {
 }
 
 export interface SyncStatus {
-  last_run?: string | null
+  last_run_at?: string | null
+  last_error?: string | null
+  last_error_at?: string | null
+  last_run_summary?: Record<string, unknown>
   [key: string]: unknown
+}
+
+export interface DashboardLastSync {
+  ran_at: string | null
+  status: string | null
+  matched: number | null
+  updated: number | null
+  duration_seconds: number | null
+}
+
+export interface DashboardAutoImport {
+  enabled: boolean
+  interval_minutes: number
+  only_with_stock: boolean
+}
+
+export interface DashboardCatalog {
+  shopify_products: number | null
+  shopify_variants: number | null
+  matched_skus: number | null
+  bims_not_in_shopify: number | null
+  checked_at?: string | null
+  hint?: string
+}
+
+export interface DashboardData {
+  slug: string
+  last_sync: DashboardLastSync
+  last_error: string | null
+  last_error_at: string | null
+  auto_import: DashboardAutoImport
+  catalog: DashboardCatalog
 }
 
 export interface PendingEntry {

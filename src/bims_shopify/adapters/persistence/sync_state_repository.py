@@ -44,6 +44,14 @@ class SqlAlchemySyncStateRepository:
         model.last_error_at = datetime.now(UTC)
         await self._session.commit()
 
+    async def clear_last_error(self, tenant_id: int) -> None:
+        """Clear a stale error after a successful sync so sync-status stops
+        surfacing errors from runs that have since succeeded."""
+        model = await self._get_or_create_state(tenant_id)
+        model.last_error = None
+        model.last_error_at = None
+        await self._session.commit()
+
     async def set_last_run_summary(self, tenant_id: int, summary: dict) -> None:
         model = await self._get_or_create_state(tenant_id)
         model.last_run_summary = summary

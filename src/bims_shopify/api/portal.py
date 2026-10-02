@@ -255,19 +255,49 @@ async def list_payments(
     return {"payments": payments}
 
 
+async def _rekey_report_is_obsolete(
+    audit: SqlAlchemyAuditLogger, tenant_id: int, report_created_at
+) -> bool:
+    """A rekey report is obsolete once the catalog has been wiped and/or
+    re-imported after it was generated: a wipe+rebuild invalidates every
+    conflict the report found, since the SKUs/variants it refers to no
+    longer exist in their old form."""
+    last_wipe = await audit.get_latest(action="catalog.wipe", tenant_id=tenant_id)
+    last_import = await audit.get_latest(action="catalog.import", tenant_id=tenant_id)
+    for entry in (last_wipe, last_import):
+        if entry is None:
+            continue
+        entry_created_at = ensure_aware_utc(entry.created_at)
+        if entry_created_at and report_created_at and entry_created_at > report_created_at:
+            return True
+    return False
+
+
 @router.get("/rekey-report")
 async def get_rekey_report(
     tenant: Tenant = Depends(get_portal_tenant),
     session: AsyncSession = Depends(get_db_session),
 ):
     repo = SqlAlchemyRekeyRepository(session)
+    audit_repo = SqlAlchemyAuditLogger(session)
     report = await repo.get_latest_report(tenant.id)
     if report is None:
         raise HTTPException(status_code=404, detail="No rekey report found for this tenant")
 
+    created_at_check = ensure_aware_utc(report.created_at)
+    if await _rekey_report_is_obsolete(audit_repo, tenant.id, created_at_check):
+        return {
+            "obsolete": True,
+            "report_id": report.id,
+            "created_at": created_at_check.isoformat() if created_at_check else None,
+            "payload": None,
+            "resolutions": [],
+        }
+
     resolutions = await repo.get_resolutions_for_report(report.id)
     created_at = ensure_aware_utc(report.created_at)
     return {
+        "obsolete": False,
         "report_id": report.id,
         "created_at": created_at.isoformat() if created_at else None,
         "payload": report.payload,
@@ -414,6 +444,65 @@ async def get_portal_sync_status(
 ):
     sync_state_repo = SqlAlchemySyncStateRepository(session)
     return await sync_state_repo.get_status(tenant.id)
+
+
+@router.get("/dashboard")
+async def get_portal_dashboard(
+    tenant: Tenant = Depends(get_portal_tenant),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Cheap, no-live-pull summary for the portal's default landing view.
+
+    Replaces the stale rekey-conflict report as the first thing merchant
+    staff see: last sync result, auto-import config, and the latest
+    persisted BIMS-vs-Shopify reconciliation counts (if any has been run).
+    """
+    sync_state_repo = SqlAlchemySyncStateRepository(session)
+    audit_repo = SqlAlchemyAuditLogger(session)
+
+    status = await sync_state_repo.get_status(tenant.id)
+    summary = status.get("last_run_summary") or {}
+
+    last_sync = {
+        "ran_at": summary.get("ran_at") or status.get("last_run_at"),
+        "status": summary.get("status"),
+        "matched": summary.get("matched"),
+        "updated": summary.get("updated"),
+        "duration_seconds": summary.get("duration_seconds"),
+    }
+
+    catalog_entry = await audit_repo.get_latest(action="catalog.reconciliation", tenant_id=tenant.id)
+    if catalog_entry is not None:
+        payload = catalog_entry.payload or {}
+        catalog = {
+            "shopify_products": payload.get("shopify_products"),
+            "shopify_variants": payload.get("shopify_variants"),
+            "matched_skus": payload.get("matched_skus"),
+            "bims_not_in_shopify": payload.get("bims_not_in_shopify"),
+            "checked_at": ensure_aware_utc(catalog_entry.created_at).isoformat(),
+        }
+    else:
+        catalog = {
+            "shopify_products": None,
+            "shopify_variants": None,
+            "matched_skus": None,
+            "bims_not_in_shopify": None,
+            "checked_at": None,
+            "hint": "No reconciliation report yet. Run Status to generate one.",
+        }
+
+    return {
+        "slug": tenant.slug,
+        "last_sync": last_sync,
+        "last_error": status.get("last_error"),
+        "last_error_at": status.get("last_error_at"),
+        "auto_import": {
+            "enabled": tenant.auto_import_products,
+            "interval_minutes": tenant.auto_import_interval_minutes,
+            "only_with_stock": tenant.auto_import_only_with_stock,
+        },
+        "catalog": catalog,
+    }
 
 
 @router.get("/audit")
