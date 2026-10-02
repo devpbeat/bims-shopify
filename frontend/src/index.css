@@ -702,3 +702,146 @@ code {
   background: rgba(220, 38, 38, 0.12);
   color: var(--color-danger);
 }
+
+/* Dashboard */
+
+.dash-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.dash-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+@media (max-width: 560px) {
+  .dash-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+.dash-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dash-card .label {
+  margin: 0;
+}
+
+.dash-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.dash-card-header .label {
+  margin: 0;
+}
+
+.dash-sync-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dash-health-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dash-health-dot--ok {
+  background: var(--color-success);
+}
+
+.dash-health-dot--warn {
+  background: var(--color-warning);
+}
+
+.dash-sync-label {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.dash-pending-none {
+  font-size: 14px;
+  color: var(--color-success);
+  margin: 0;
+}
+
+.dash-pending-count {
+  font-size: 14px;
+  color: var(--color-warning);
+  margin: 0;
+}
+
+.dash-stat-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dash-stat-tile {
+  flex: 1;
+  min-width: 100px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 16px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  cursor: pointer;
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.dash-stat-tile:hover {
+  box-shadow: 0 2px 6px rgba(16, 24, 40, 0.1);
+}
+
+.dash-stat-tile--warn {
+  border-color: rgba(217, 119, 6, 0.4);
+  background: rgba(217, 119, 6, 0.05);
+}
+
+.dash-stat-tile--ok {
+  border-color: rgba(22, 163, 74, 0.3);
+  background: rgba(22, 163, 74, 0.04);
+}
+
+.dash-stat-count {
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.dash-stat-tile--warn .dash-stat-count {
+  color: var(--color-warning);
+}
+
+.dash-stat-tile--ok .dash-stat-count {
+  color: var(--color-success);
+}
+
+.dash-stat-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-muted);
+}
+
+.dash-job-dot {
+  display: none;
+}

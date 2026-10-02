@@ -65,10 +65,28 @@ export interface Messages {
     subtitle: string
   }
   tabs: {
+    dashboard: string
     duplicates: string
     unresolved: string
     mismatches: string
     activity: string
+  }
+  dashboard: {
+    syncStatus: string
+    lastSync: string
+    never: string
+    issuesTitle: string
+    pendingTitle: string
+    pendingNone: string
+    pendingCount: (n: number) => string
+    recentJobsTitle: string
+    noJobs: string
+    viewAll: string
+    statDuplicates: string
+    statUnresolved: string
+    statMismatches: string
+    healthy: string
+    needsAttention: string
   }
   banner: {
     text: string

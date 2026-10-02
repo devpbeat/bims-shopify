@@ -56,10 +56,28 @@ export const es: Messages = {
     subtitle: 'Auditoría de reconciliación de inventario',
   },
   tabs: {
+    dashboard: 'Panel',
     duplicates: 'Duplicados',
     unresolved: 'Sin resolver',
     mismatches: 'Diferencias de nombre',
     activity: 'Actividad',
+  },
+  dashboard: {
+    syncStatus: 'Estado de sincronización',
+    lastSync: 'Última sincronización',
+    never: 'Nunca',
+    issuesTitle: 'Problemas abiertos',
+    pendingTitle: 'Acciones pendientes',
+    pendingNone: 'Sin cambios pendientes',
+    pendingCount: (n) => `${n} cambio${n === 1 ? '' : 's'} en cola — aún no aplicado${n === 1 ? '' : 's'}`,
+    recentJobsTitle: 'Últimos trabajos',
+    noJobs: 'Todavía no se ejecutó ningún trabajo.',
+    viewAll: 'Ver todos en Operaciones',
+    statDuplicates: 'Duplicados',
+    statUnresolved: 'Sin resolver',
+    statMismatches: 'Diferencias de nombre',
+    healthy: 'Sin problemas',
+    needsAttention: 'Requiere atención',
   },
   banner: {
     text:

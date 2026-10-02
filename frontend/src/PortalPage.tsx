@@ -5,6 +5,7 @@ import type { PendingQueue, RekeyReport, Resolution, SyncStatus } from './api/ty
 import { ActivityTab } from './components/ActivityTab'
 import { ApplyFooter } from './components/ApplyFooter'
 import { AutoReconcileBanner } from './components/AutoReconcileBanner'
+import { DashboardTab } from './components/DashboardTab'
 import { DuplicatesTab } from './components/DuplicatesTab'
 import { HelpModal } from './components/HelpModal'
 import { LoginCard } from './components/LoginCard'
@@ -18,7 +19,7 @@ import { useT } from './i18n'
 import { clearAdminToken, loadAdminToken, saveAdminToken } from './adminSession'
 import { clearToken, loadToken, saveToken } from './session'
 
-type Tab = 'duplicates' | 'unresolved' | 'mismatches' | 'activity' | 'operations'
+type Tab = 'dashboard' | 'duplicates' | 'unresolved' | 'mismatches' | 'activity' | 'operations'
 
 function tokenFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get('token')
@@ -33,7 +34,7 @@ export function PortalPage() {
   const [resolutions, setResolutions] = useState<Resolution[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [tab, setTab] = useState<Tab>('duplicates')
+  const [tab, setTab] = useState<Tab>('dashboard')
   const [pending, setPending] = useState<PendingQueue>({})
   const [applying, setApplying] = useState(false)
   const [useAccessKey, setUseAccessKey] = useState(false)
@@ -248,6 +249,9 @@ export function PortalPage() {
       {guideOpen && <HelpModal section={guideSection} onClose={() => setGuideOpen(false)} />}
 
       <nav className="tabs">
+        <button type="button" className={tab === 'dashboard' ? 'tab active' : 'tab'} onClick={() => setTab('dashboard')}>
+          {t.tabs.dashboard}
+        </button>
         <button type="button" className={tab === 'duplicates' ? 'tab active' : 'tab'} onClick={() => setTab('duplicates')}>
           {t.tabs.duplicates} ({duplicates.length})
         </button>
@@ -272,6 +276,21 @@ export function PortalPage() {
       </nav>
 
       <main className="tab-content">
+        {tab === 'dashboard' && (
+          <DashboardTab
+            slug={slug}
+            syncStatus={syncStatus}
+            duplicatesCount={duplicates.length}
+            unresolvedCount={unresolved.length}
+            mismatchesCount={mismatches.length}
+            pendingCount={pendingCount}
+            adminToken={adminToken}
+            onNavigate={(dest) => {
+              if (dest === 'operations' && !adminToken) return
+              setTab(dest)
+            }}
+          />
+        )}
         {tab === 'duplicates' && (
           <DuplicatesTab rows={duplicates} resolutions={resolutions} pending={pending} onPick={handlePickSurvivor} />
         )}
