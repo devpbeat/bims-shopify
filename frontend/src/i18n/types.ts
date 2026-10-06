@@ -199,6 +199,7 @@ export interface Messages {
         confirmApplyDraft: string
         confirmApplyDelete: string
       }
+      publish: { title: string; description: string; confirmApply: string }
     }
     jobStatus: {
       queued: string

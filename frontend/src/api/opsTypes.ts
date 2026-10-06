@@ -6,6 +6,7 @@ export type OpsCommand =
   | 'rekey'
   | 'fix_tracking'
   | 'cleanup_no_stock'
+  | 'publish'
   | 'sync'
 
 export type OpsJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'

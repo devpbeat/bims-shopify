@@ -255,6 +255,12 @@ export const es: Messages = {
         confirmApplyDelete:
           'DESTRUCTIVO: esto ELIMINARÁ PERMANENTEMENTE los productos sin stock listados de Shopify. Esta acción no se puede deshacer. ¿Continuar?',
       },
+      publish: {
+        title: 'Publicar productos en borrador',
+        description:
+          'Publica productos en estado Draft que son seguros para mostrar a los clientes (al menos una imagen Y stock confirmado en BIMS) en la tienda online: los marca como Active y los agrega al canal de ventas Online Store. Usá el límite para publicar un lote pequeño primero y probar el checkout de punta a punta.',
+        confirmApply: 'Esto publicará los productos listados en la tienda online. ¿Continuar?',
+      },
     },
     jobStatus: {
       queued: 'En cola',

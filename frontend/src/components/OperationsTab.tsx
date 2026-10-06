@@ -120,6 +120,9 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
   const [cleanupForce, setCleanupForce] = useState(false)
   const [cleanupAdvancedOpen, setCleanupAdvancedOpen] = useState(false)
 
+  const [publishDryRun, setPublishDryRun] = useState(true)
+  const [publishLimit, setPublishLimit] = useState('')
+
   const [wipeAdvancedOpen, setWipeAdvancedOpen] = useState(false)
   const [wipeConfirmText, setWipeConfirmText] = useState('')
 
@@ -223,6 +226,7 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
   const rekeyJob = latestJobFor('rekey')
   const fixTrackingJob = latestJobFor('fix_tracking')
   const cleanupJob = latestJobFor('cleanup_no_stock')
+  const publishJob = latestJobFor('publish')
   const syncJob = latestJobFor('sync')
 
   return (
@@ -527,6 +531,51 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
           {t.operator.runButton}
         </button>
         {cleanupJob && <JobPanel job={cleanupJob} />}
+      </div>
+
+      <div className="ops-card">
+        <h3>{t.operator.commands.publish.title}</h3>
+        <p className="muted">{t.operator.commands.publish.description}</p>
+        {runError.publish && <p className="error-text">{runError.publish}</p>}
+        <label className="ops-toggle">
+          <input
+            type="checkbox"
+            checked={publishDryRun}
+            onChange={(e) => setPublishDryRun(e.target.checked)}
+          />
+          {t.operator.dryRun}
+        </label>
+        <label className="ops-field">
+          {t.operator.limit}
+          <input
+            type="number"
+            min={0}
+            value={publishLimit}
+            onChange={(e) => setPublishLimit(e.target.value)}
+          />
+        </label>
+        <button
+          type="button"
+          className="btn btn-primary"
+          onClick={() => {
+            const options: OpsRunOptions = {
+              apply: !publishDryRun,
+              ...(publishLimit ? { limit: Number(publishLimit) } : {}),
+            }
+            if (!publishDryRun) {
+              setPendingConfirm({
+                title: t.operator.confirmTitle,
+                message: t.operator.commands.publish.confirmApply,
+                onConfirm: () => launch('publish', options),
+              })
+            } else {
+              launch('publish', options)
+            }
+          }}
+        >
+          {t.operator.runButton}
+        </button>
+        {publishJob && <JobPanel job={publishJob} />}
       </div>
 
       <div className="ops-card ops-card-danger">

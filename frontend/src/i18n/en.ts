@@ -250,6 +250,12 @@ export const en: Messages = {
         confirmApplyDelete:
           'DESTRUCTIVE: this will PERMANENTLY DELETE the listed zero-stock products from Shopify. This cannot be undone. Continue?',
       },
+      publish: {
+        title: 'Publish draft products',
+        description:
+          'Publishes Draft products that are safe to show to customers (at least one image AND confirmed stock in BIMS) to the Online Store: sets them Active and adds them to the Online Store sales channel. Use the limit to publish a small batch first and test checkout end to end.',
+        confirmApply: 'This will publish the listed products to the Online Store. Continue?',
+      },
     },
     jobStatus: {
       queued: 'Queued',
