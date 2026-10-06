@@ -7,7 +7,8 @@ Usage::
         [--only-with-stock] [--limit N]
     python -m bims_shopify.ops.catalog <tenant_slug> status
     python -m bims_shopify.ops.catalog <tenant_slug> dedupe [--apply] [--force]
-    python -m bims_shopify.ops.catalog <tenant_slug> publish [--apply] [--limit N]
+    python -m bims_shopify.ops.catalog <tenant_slug> publish [--apply] [--limit N] \\
+        [--no-require-images]
 
 ``wipe`` deletes every product in the tenant's Shopify store. ``import``
 rebuilds the catalog from the tenant's BIMS company (``tenant.bims_company_id``):
@@ -37,9 +38,10 @@ stock (> 0) in BIMS. Products with no images, confirmed zero stock, or an
 unknown SKU are skipped/reported, never guessed at. Defaults to a dry run;
 pass ``--apply`` to mutate. ``--limit N`` publishes only the first N
 eligible products (e.g. to smoke-test checkout end to end before a full
-rollout). Non-destructive by nature (it only ever makes products more
-visible), so unlike ``cleanup_no_stock``/``dedupe`` it has no safety-guard
-ratio or ``--force`` escape hatch.
+rollout). Pass ``--no-require-images`` to also publish products with no
+images (stock is still required regardless). Non-destructive by nature (it
+only ever makes products more visible), so unlike ``cleanup_no_stock``/
+``dedupe`` it has no safety-guard ratio or ``--force`` escape hatch.
 
 ``status`` pulls both sides (BIMS-eligible rows, Shopify's live catalog) and
 prints a reconciliation report: counts on each side, SKUs present in one but
@@ -932,9 +934,10 @@ class PublishPlan:
     cheap no-op on the status side and completes the missing half).
 
     Precedence (checked in this order, first match wins): no SKUs or an
-    unknown SKU -> ``unknown``; no images -> ``skipped_no_images``; all
-    confirmed-zero stock -> ``skipped_no_stock``; already ACTIVE and on the
-    publication -> counted in ``already_done``; otherwise -> ``target``.
+    unknown SKU -> ``unknown``; no images -> ``skipped_no_images`` (only when
+    ``require_images`` is True); all confirmed-zero stock ->
+    ``skipped_no_stock``; already ACTIVE and on the publication -> counted in
+    ``already_done``; otherwise -> ``target``.
     """
 
     total_products: int = 0
@@ -951,6 +954,7 @@ def compute_publish_plan(
     *,
     publication_id: str,
     limit: int | None = None,
+    require_images: bool = True,
 ) -> PublishPlan:
     plan = PublishPlan(total_products=len(products))
     for product in products:
@@ -966,7 +970,7 @@ def compute_publish_plan(
             plan.unknown.append(entry)
             continue
 
-        if media_count <= 0:
+        if require_images and media_count <= 0:
             plan.skipped_no_images.append(entry)
             continue
 
@@ -1090,10 +1094,16 @@ async def _run_publish(
         await _emit_progress(progress, 0, None, "checking BIMS stock")
         stock_by_sku = await fetch_stock_by_sku(bims_client, all_skus, tenant.stock_warehouse_ids)
 
+        require_images = getattr(args, "require_images", True)
         plan = compute_publish_plan(
-            products, stock_by_sku, publication_id=publication_id, limit=args.limit
+            products,
+            stock_by_sku,
+            publication_id=publication_id,
+            limit=args.limit,
+            require_images=require_images,
         )
         report = build_publish_report(plan)
+        report["require_images"] = require_images
 
         if not args.apply:
             report["dry_run"] = True
@@ -1107,6 +1117,7 @@ async def _run_publish(
             tenant.id,
             "ops.publish",
             {
+                "require_images": require_images,
                 "total_products": plan.total_products,
                 "targets_found": len(plan.targets),
                 "skipped_no_images": len(plan.skipped_no_images),
@@ -1516,6 +1527,7 @@ async def run_publish(tenant: Tenant, options: dict[str, Any], progress: Progres
     args = argparse.Namespace(
         apply=bool(options.get("apply", False)),
         limit=options.get("limit"),
+        require_images=bool(options.get("require_images", True)),
     )
     return await _run_publish(tenant, args, progress=progress)
 
@@ -1642,6 +1654,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Only publish the first N eligible products (e.g. to smoke-test checkout).",
     )
+    publish_parser.add_argument(
+        "--no-require-images",
+        dest="require_images",
+        action="store_false",
+        default=True,
+        help=(
+            "Also publish products with no images (default: require at least one image). "
+            "Stock is still required regardless of this flag."
+        ),
+    )
+
     return parser
 
 

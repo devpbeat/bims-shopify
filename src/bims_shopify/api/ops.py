@@ -108,9 +108,13 @@ def _validate_options(command: str, options: dict[str, Any]) -> dict[str, Any]:
         limit = options.get("limit")
         if limit is not None and (not isinstance(limit, int) or limit < 0):
             raise HTTPException(status_code=422, detail="options.limit must be a non-negative integer")
+        require_images = options.get("require_images", True)
+        if not isinstance(require_images, bool):
+            raise HTTPException(status_code=422, detail="options.require_images must be a boolean")
         return {
             "apply": bool(options.get("apply", False)),
             "limit": limit,
+            "require_images": require_images,
         }
 
     # status

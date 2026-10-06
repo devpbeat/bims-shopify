@@ -199,6 +199,7 @@ export const es: Messages = {
     onlyWithStock: 'Solo con stock',
     publish: 'Publicar',
     limit: 'Límite',
+    requireImages: 'Requerir imágenes',
     force: 'Forzar',
     forceWarning: 'Forzar evita el resguardo de seguridad del 60%. Usar con precaución.',
     full: 'Completa',
@@ -260,6 +261,8 @@ export const es: Messages = {
         description:
           'Publica productos en estado Draft que son seguros para mostrar a los clientes (al menos una imagen Y stock confirmado en BIMS) en la tienda online: los marca como Active y los agrega al canal de ventas Online Store. Usá el límite para publicar un lote pequeño primero y probar el checkout de punta a punta.',
         confirmApply: 'Esto publicará los productos listados en la tienda online. ¿Continuar?',
+        confirmApplyNoImages:
+          'Esto publicará los productos listados en la tienda online, incluyendo productos sin imágenes. ¿Continuar?',
       },
     },
     jobStatus: {

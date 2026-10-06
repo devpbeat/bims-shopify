@@ -1402,6 +1402,42 @@ def test_compute_publish_plan_limit_truncates_targets_only_after_full_scan():
     assert len(plan.skipped_no_images) == 1
 
 
+def test_compute_publish_plan_require_images_false_allows_no_images_product():
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1", media_count=0)]
+    stock = {"SKU-A": 3.0}
+    plan = compute_publish_plan(
+        products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID, require_images=False
+    )
+    assert [t["product_id"] for t in plan.targets] == ["p1"]
+    assert plan.skipped_no_images == []
+
+
+def test_compute_publish_plan_require_images_false_still_gates_stock():
+    """Disabling the image gate must not bypass the stock gate."""
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1", media_count=0)]
+    stock = {"SKU-A": 0.0}
+    plan = compute_publish_plan(
+        products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID, require_images=False
+    )
+    assert plan.targets == []
+    assert [s["product_id"] for s in plan.skipped_no_stock] == ["p1"]
+    assert plan.skipped_no_images == []
+
+
+def test_compute_publish_plan_require_images_default_true_unchanged():
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1", media_count=0)]
+    stock = {"SKU-A": 3.0}
+    plan = compute_publish_plan(products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert plan.targets == []
+    assert [s["product_id"] for s in plan.skipped_no_images] == ["p1"]
+
+
 def test_build_publish_report_shape_and_sample_caps():
     from bims_shopify.ops.catalog import PublishPlan, build_publish_report
 
@@ -1577,6 +1613,44 @@ async def test_run_publish_apply_respects_limit(tenant):
 
     assert report["apply"]["processed"] == 1
     assert len(calls["status"]) == 1
+
+
+async def test_run_publish_no_require_images_flag_allows_imageless_products(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.id = None
+    products = [_publish_product("p1", media_count=0)]
+    stock = {"SKU-A": 3.0}
+    calls: dict = {}
+    fake_shopify, fake_bims = _publish_fake_clients(products, stock, calls)
+
+    shopify_target = catalog_ops.ShopifyClient
+    bims_target = catalog_ops.BIMSClient
+    catalog_ops.ShopifyClient = fake_shopify  # type: ignore[assignment]
+    catalog_ops.BIMSClient = fake_bims  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(
+            ["acme", "publish", "--apply", "--no-require-images"]
+        )
+        report = await catalog_ops._run_publish(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = shopify_target  # type: ignore[assignment]
+        catalog_ops.BIMSClient = bims_target  # type: ignore[assignment]
+
+    assert report["require_images"] is False
+    assert report["skipped_no_images"]["count"] == 0
+    assert report["apply"]["processed"] == 1
+    assert calls["status"] == [("p1", "ACTIVE")]
+
+
+def test_build_arg_parser_publish_require_images_defaults_true():
+    from bims_shopify.ops import catalog as catalog_ops
+
+    args = catalog_ops._build_arg_parser().parse_args(["acme", "publish"])
+    assert args.require_images is True
+
+    args = catalog_ops._build_arg_parser().parse_args(["acme", "publish", "--no-require-images"])
+    assert args.require_images is False
 
 
 async def test_run_publish_missing_online_store_publication_raises():

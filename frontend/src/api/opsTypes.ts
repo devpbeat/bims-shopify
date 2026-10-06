@@ -24,6 +24,7 @@ export interface OpsRunOptions {
   mode?: CleanupMode
   dry_run?: boolean
   full?: boolean
+  require_images?: boolean
 }
 
 export interface OpsRunResponse {

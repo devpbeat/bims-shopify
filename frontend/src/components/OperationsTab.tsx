@@ -122,6 +122,7 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
 
   const [publishDryRun, setPublishDryRun] = useState(true)
   const [publishLimit, setPublishLimit] = useState('')
+  const [publishRequireImages, setPublishRequireImages] = useState(true)
 
   const [wipeAdvancedOpen, setWipeAdvancedOpen] = useState(false)
   const [wipeConfirmText, setWipeConfirmText] = useState('')
@@ -554,18 +555,29 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
             onChange={(e) => setPublishLimit(e.target.value)}
           />
         </label>
+        <label className="ops-toggle">
+          <input
+            type="checkbox"
+            checked={publishRequireImages}
+            onChange={(e) => setPublishRequireImages(e.target.checked)}
+          />
+          {t.operator.requireImages}
+        </label>
         <button
           type="button"
           className="btn btn-primary"
           onClick={() => {
             const options: OpsRunOptions = {
               apply: !publishDryRun,
+              require_images: publishRequireImages,
               ...(publishLimit ? { limit: Number(publishLimit) } : {}),
             }
             if (!publishDryRun) {
               setPendingConfirm({
                 title: t.operator.confirmTitle,
-                message: t.operator.commands.publish.confirmApply,
+                message: publishRequireImages
+                  ? t.operator.commands.publish.confirmApply
+                  : t.operator.commands.publish.confirmApplyNoImages,
                 onConfirm: () => launch('publish', options),
               })
             } else {

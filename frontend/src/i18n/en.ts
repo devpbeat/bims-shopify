@@ -194,6 +194,7 @@ export const en: Messages = {
     onlyWithStock: 'Only with stock',
     publish: 'Publish',
     limit: 'Limit',
+    requireImages: 'Require images',
     force: 'Force',
     forceWarning: 'Force bypasses the 60% safety guard. Use with caution.',
     full: 'Full',
@@ -255,6 +256,8 @@ export const en: Messages = {
         description:
           'Publishes Draft products that are safe to show to customers (at least one image AND confirmed stock in BIMS) to the Online Store: sets them Active and adds them to the Online Store sales channel. Use the limit to publish a small batch first and test checkout end to end.',
         confirmApply: 'This will publish the listed products to the Online Store. Continue?',
+        confirmApplyNoImages:
+          'This will publish the listed products to the Online Store, including products with no images. Continue?',
       },
     },
     jobStatus: {

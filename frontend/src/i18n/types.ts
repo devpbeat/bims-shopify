@@ -175,6 +175,7 @@ export interface Messages {
     onlyWithStock: string
     publish: string
     limit: string
+    requireImages: string
     force: string
     forceWarning: string
     full: string
@@ -199,7 +200,12 @@ export interface Messages {
         confirmApplyDraft: string
         confirmApplyDelete: string
       }
-      publish: { title: string; description: string; confirmApply: string }
+      publish: {
+        title: string
+        description: string
+        confirmApply: string
+        confirmApplyNoImages: string
+      }
     }
     jobStatus: {
       queued: string
