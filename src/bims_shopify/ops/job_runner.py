@@ -43,6 +43,7 @@ _COMMAND_RUNNERS = {
     "rekey": rekey_skus.run_rekey,
     "fix_tracking": catalog.run_fix_tracking,
     "cleanup_no_stock": catalog.run_cleanup_no_stock,
+    "publish": catalog.run_publish,
     "sync": sync_job.run_sync,
 }
 

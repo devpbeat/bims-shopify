@@ -7,6 +7,7 @@ Usage::
         [--only-with-stock] [--limit N]
     python -m bims_shopify.ops.catalog <tenant_slug> status
     python -m bims_shopify.ops.catalog <tenant_slug> dedupe [--apply] [--force]
+    python -m bims_shopify.ops.catalog <tenant_slug> publish [--apply] [--limit N]
 
 ``wipe`` deletes every product in the tenant's Shopify store. ``import``
 rebuilds the catalog from the tenant's BIMS company (``tenant.bims_company_id``):
@@ -27,6 +28,18 @@ products under a shifted set of "surviving" variants.
 deletes them with ``--apply``; without it, it only prints a JSON report. It
 refuses to delete more than 60% of the catalog in one run unless ``--force``
 is passed.
+
+``publish`` takes DRAFT products to fully published state -- both
+``status: ACTIVE`` and present on the Online Store sales-channel
+publication, which are two independent things in Shopify. Only products
+safe to show to customers are touched: at least one image AND confirmed
+stock (> 0) in BIMS. Products with no images, confirmed zero stock, or an
+unknown SKU are skipped/reported, never guessed at. Defaults to a dry run;
+pass ``--apply`` to mutate. ``--limit N`` publishes only the first N
+eligible products (e.g. to smoke-test checkout end to end before a full
+rollout). Non-destructive by nature (it only ever makes products more
+visible), so unlike ``cleanup_no_stock``/``dedupe`` it has no safety-guard
+ratio or ``--force`` escape hatch.
 
 ``status`` pulls both sides (BIMS-eligible rows, Shopify's live catalog) and
 prints a reconciliation report: counts on each side, SKUs present in one but
@@ -82,6 +95,12 @@ CLEANUP_PROGRESS_EVERY = 50
 CLEANUP_TARGET_SAMPLE_SIZE = 20
 CLEANUP_UNKNOWN_SAMPLE_SIZE = 10
 CLEANUP_MAX_TARGET_RATIO = 0.6
+PUBLISH_PROGRESS_EVERY = 50
+PUBLISH_TARGET_SAMPLE_SIZE = 20
+PUBLISH_SKIPPED_NO_IMAGES_SAMPLE_SIZE = 10
+PUBLISH_SKIPPED_NO_STOCK_SAMPLE_SIZE = 10
+PUBLISH_UNKNOWN_SAMPLE_SIZE = 10
+ONLINE_STORE_PUBLICATION_NAME = "Online Store"
 
 #: Progress callback signature shared by the CLI and the background job
 #: runner: (done, total-or-None, human message). May be sync or async.
@@ -894,6 +913,216 @@ async def _run_cleanup_no_stock(
         await shopify_client.aclose()
 
 
+@dataclass
+class PublishPlan:
+    """Result of scanning the catalog for DRAFT products safe to publish.
+
+    A product is a ``target`` only when it is safe to show to customers:
+    it has at least one image AND confirmed stock (> 0 on at least one SKU)
+    in BIMS. As with ``CleanupPlan``, we never act on "we don't know" --
+    a product with no SKUs, or with any SKU BIMS has no record of at all, is
+    reported as ``unknown`` and left untouched.
+
+    Unlike ``cleanup_no_stock``, "published" in Shopify is two independent
+    things: ``status: ACTIVE`` (set via ``productUpdate``) and being on the
+    Online Store sales-channel *publication* (set via
+    ``publishablePublish``). ``already_done`` only counts products that are
+    already BOTH ACTIVE and on that publication -- an ACTIVE product that
+    is not yet on the publication is still a ``target`` (publishing it is a
+    cheap no-op on the status side and completes the missing half).
+
+    Precedence (checked in this order, first match wins): no SKUs or an
+    unknown SKU -> ``unknown``; no images -> ``skipped_no_images``; all
+    confirmed-zero stock -> ``skipped_no_stock``; already ACTIVE and on the
+    publication -> counted in ``already_done``; otherwise -> ``target``.
+    """
+
+    total_products: int = 0
+    targets: list[dict[str, Any]] = field(default_factory=list)
+    skipped_no_images: list[dict[str, Any]] = field(default_factory=list)
+    skipped_no_stock: list[dict[str, Any]] = field(default_factory=list)
+    unknown: list[dict[str, Any]] = field(default_factory=list)
+    already_done: int = 0
+
+
+def compute_publish_plan(
+    products: list[dict[str, Any]],
+    stock_by_sku: dict[str, float],
+    *,
+    publication_id: str,
+    limit: int | None = None,
+) -> PublishPlan:
+    plan = PublishPlan(total_products=len(products))
+    for product in products:
+        skus = [s for s in (product.get("skus") or []) if s]
+        product_id = product.get("id")
+        title = product.get("title")
+        status = product.get("status")
+        media_count = product.get("media_count") or 0
+        published_publication_ids = product.get("published_publication_ids") or []
+        entry = {"product_id": product_id, "title": title, "skus": skus}
+
+        if not skus or any(sku not in stock_by_sku for sku in skus):
+            plan.unknown.append(entry)
+            continue
+
+        if media_count <= 0:
+            plan.skipped_no_images.append(entry)
+            continue
+
+        has_stock = any(stock_by_sku.get(sku, 0.0) > 0 for sku in skus)
+        if not has_stock:
+            plan.skipped_no_stock.append(entry)
+            continue
+
+        if status == "ACTIVE" and publication_id in published_publication_ids:
+            plan.already_done += 1
+            continue
+
+        plan.targets.append(entry)
+
+    # Truncate AFTER the full scan so skipped/unknown counts always reflect
+    # the whole catalog, not just the first `limit` products examined.
+    if limit is not None:
+        plan.targets = plan.targets[:limit]
+
+    return plan
+
+
+def build_publish_report(plan: PublishPlan) -> dict[str, Any]:
+    return {
+        "total_products": plan.total_products,
+        "targets": {
+            "count": len(plan.targets),
+            "sample": plan.targets[:PUBLISH_TARGET_SAMPLE_SIZE],
+        },
+        "skipped_no_images": {
+            "count": len(plan.skipped_no_images),
+            "sample": plan.skipped_no_images[:PUBLISH_SKIPPED_NO_IMAGES_SAMPLE_SIZE],
+        },
+        "skipped_no_stock": {
+            "count": len(plan.skipped_no_stock),
+            "sample": plan.skipped_no_stock[:PUBLISH_SKIPPED_NO_STOCK_SAMPLE_SIZE],
+        },
+        "unknown": {
+            "count": len(plan.unknown),
+            "sample": plan.unknown[:PUBLISH_UNKNOWN_SAMPLE_SIZE],
+        },
+        "already_done": plan.already_done,
+    }
+
+
+@dataclass
+class PublishApplyResult:
+    processed: int = 0
+    failed: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_summary(self) -> dict[str, Any]:
+        return {"processed": self.processed, "failed": self.failed}
+
+
+async def apply_publish(
+    shopify_client: ShopifyClient,
+    targets: list[dict[str, Any]],
+    *,
+    publication_ids: list[str],
+    progress: ProgressFn | None = None,
+) -> PublishApplyResult:
+    """Set each target to ACTIVE and publish it to the given publications.
+
+    Isolates per-product failures the same way ``apply_cleanup`` does: one
+    product failing (e.g. a transient Shopify error) does not abort the
+    rest of the batch.
+    """
+    result = PublishApplyResult()
+    for index, target in enumerate(targets, start=1):
+        product_id = target["product_id"]
+        try:
+            await shopify_client.set_product_status(product_id, "ACTIVE")
+            await shopify_client.publish_product(product_id, publication_ids)
+        except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
+            result.failed.append({"product_id": product_id, "error": f"{type(exc).__name__}: {exc}"})
+        else:
+            result.processed += 1
+        if index % PUBLISH_PROGRESS_EVERY == 0:
+            message = f"{index}/{len(targets)} products processed"
+            print(f"  ... {message}")
+            await _emit_progress(progress, index, len(targets), message)
+    return result
+
+
+async def _resolve_online_store_publication_id(shopify_client: ShopifyClient) -> str:
+    publications = await shopify_client.fetch_publications()
+    for publication in publications:
+        if publication.get("name") == ONLINE_STORE_PUBLICATION_NAME:
+            return publication["id"]
+    raise SystemExit(
+        "publish: could not find the 'Online Store' sales-channel publication on this "
+        "shop. Refusing to publish products without a target publication -- check that "
+        "the Online Store channel is installed."
+    )
+
+
+async def _run_publish(
+    tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
+) -> dict[str, Any]:
+    """Publish DRAFT products that are safe to show to customers.
+
+    Publishing in Shopify is two independent things -- ``status: ACTIVE``
+    and being on the Online Store sales-channel publication -- see
+    ``PublishPlan`` for why both are required and how idempotency works.
+
+    Unlike ``cleanup_no_stock``, this command is non-destructive (it only
+    ever moves products towards being visible, never deletes or hides
+    anything), so it intentionally has no safety-guard ratio/``--force``
+    escape hatch.
+    """
+    bims_client = BIMSClient(tenant)
+    shopify_client = ShopifyClient(tenant)
+    try:
+        await _emit_progress(progress, 0, None, "resolving Online Store publication")
+        publication_id = await _resolve_online_store_publication_id(shopify_client)
+
+        await _emit_progress(progress, 0, None, "scanning Shopify catalog")
+        products = await fetch_products_with_skus(shopify_client)
+        all_skus = [sku for product in products for sku in (product.get("skus") or []) if sku]
+
+        await _emit_progress(progress, 0, None, "checking BIMS stock")
+        stock_by_sku = await fetch_stock_by_sku(bims_client, all_skus, tenant.stock_warehouse_ids)
+
+        plan = compute_publish_plan(
+            products, stock_by_sku, publication_id=publication_id, limit=args.limit
+        )
+        report = build_publish_report(plan)
+
+        if not args.apply:
+            report["dry_run"] = True
+            return report
+
+        apply_result = await apply_publish(
+            shopify_client, plan.targets, publication_ids=[publication_id], progress=progress
+        )
+        report["apply"] = apply_result.to_summary()
+        await _audit(
+            tenant.id,
+            "ops.publish",
+            {
+                "total_products": plan.total_products,
+                "targets_found": len(plan.targets),
+                "skipped_no_images": len(plan.skipped_no_images),
+                "skipped_no_stock": len(plan.skipped_no_stock),
+                "unknown": len(plan.unknown),
+                "already_done": plan.already_done,
+                "processed": apply_result.processed,
+                "failed": len(apply_result.failed),
+            },
+        )
+        return report
+    finally:
+        await bims_client.aclose()
+        await shopify_client.aclose()
+
+
 async def _run_fix_tracking(
     tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
 ) -> dict[str, Any]:
@@ -1218,6 +1447,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         return await _run_fix_tracking(tenant, args)
     if args.command == "cleanup-no-stock":
         return await _run_cleanup_no_stock(tenant, args)
+    if args.command == "publish":
+        return await _run_publish(tenant, args)
     return await _run_import(tenant, args)
 
 
@@ -1279,6 +1510,14 @@ async def run_cleanup_no_stock(
         force=bool(options.get("force", False)),
     )
     return await _run_cleanup_no_stock(tenant, args, progress=progress)
+
+
+async def run_publish(tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None) -> dict[str, Any]:
+    args = argparse.Namespace(
+        apply=bool(options.get("apply", False)),
+        limit=options.get("limit"),
+    )
+    return await _run_publish(tenant, args, progress=progress)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -1385,6 +1624,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         f"{CLEANUP_MAX_TARGET_RATIO:.0%} of the catalog in one run.",
     )
 
+    publish_parser = subparsers.add_parser(
+        "publish",
+        help=(
+            "Publish DRAFT products that are safe to show to customers (have an image "
+            "and confirmed stock) to the Online Store."
+        ),
+    )
+    publish_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Execute the publish (default: dry run, prints the report only).",
+    )
+    publish_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Only publish the first N eligible products (e.g. to smoke-test checkout).",
+    )
     return parser
 
 

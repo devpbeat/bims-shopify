@@ -32,6 +32,7 @@ _VALID_COMMANDS = {
     "rekey",
     "fix_tracking",
     "cleanup_no_stock",
+    "publish",
     "sync",
 }
 
@@ -45,6 +46,7 @@ class RunJobRequest(BaseModel):
         "rekey",
         "fix_tracking",
         "cleanup_no_stock",
+        "publish",
         "sync",
     ]
     options: dict[str, Any] = Field(default_factory=dict)
@@ -100,6 +102,15 @@ def _validate_options(command: str, options: dict[str, Any]) -> dict[str, Any]:
             "apply": bool(options.get("apply", False)),
             "mode": mode,
             "force": bool(options.get("force", False)),
+        }
+
+    if command == "publish":
+        limit = options.get("limit")
+        if limit is not None and (not isinstance(limit, int) or limit < 0):
+            raise HTTPException(status_code=422, detail="options.limit must be a non-negative integer")
+        return {
+            "apply": bool(options.get("apply", False)),
+            "limit": limit,
         }
 
     # status

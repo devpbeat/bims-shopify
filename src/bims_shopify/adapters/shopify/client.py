@@ -110,10 +110,31 @@ query ListAllProductsWithSkus($cursor: String) {
       id
       title
       status
+      mediaCount { count }
+      resourcePublicationsV2(first: 10) {
+        nodes { publication { id } isPublished }
+      }
       variants(first: 100) {
         nodes { sku }
       }
     }
+  }
+}
+"""
+
+_PUBLICATIONS = """
+query Publications {
+  publications(first: 25) {
+    nodes { id name }
+  }
+}
+"""
+
+_PUBLISHABLE_PUBLISH = """
+mutation PublishablePublish($id: ID!, $input: [PublicationInput!]!) {
+  publishablePublish(id: $id, input: $input) {
+    publishable { ... on Product { id } }
+    userErrors { field message }
   }
 }
 """
@@ -453,11 +474,18 @@ class ShopifyClient:
                     (v.get("sku") or "").strip()
                     for v in (node.get("variants") or {}).get("nodes") or []
                 ]
+                published_publication_ids = [
+                    pub_node["publication"]["id"]
+                    for pub_node in (node.get("resourcePublicationsV2") or {}).get("nodes") or []
+                    if pub_node.get("isPublished")
+                ]
                 yield {
                     "id": node["id"],
                     "title": node.get("title"),
                     "status": node.get("status"),
                     "skus": [s for s in skus if s],
+                    "media_count": (node.get("mediaCount") or {}).get("count") or 0,
+                    "published_publication_ids": published_publication_ids,
                 }
             page_info = connection["pageInfo"]
             if not page_info["hasNextPage"]:
@@ -475,6 +503,28 @@ class ShopifyClient:
         result = data.get("productSet")
         self._check_user_errors(result)
         return (result or {}).get("product")
+
+    async def fetch_publications(self) -> list[dict[str, Any]]:
+        """Return every sales-channel publication in the shop (``{id, name}``)."""
+        data = await self._graphql(_PUBLICATIONS, {})
+        return data["publications"]["nodes"]
+
+    async def publish_product(self, product_id: str, publication_ids: list[str]) -> None:
+        """Publish a product to the given sales-channel publications via ``publishablePublish``.
+
+        This is independent of ``set_product_status`` -- Shopify's "published"
+        is two separate things, ``status: ACTIVE`` and being on a
+        publication; a product can be ACTIVE and still invisible in the
+        storefront if it was never published to the Online Store channel.
+        """
+        data = await self._graphql(
+            _PUBLISHABLE_PUBLISH,
+            {
+                "id": product_id,
+                "input": [{"publicationId": pub_id} for pub_id in publication_ids],
+            },
+        )
+        self._check_user_errors(data.get("publishablePublish"))
 
 
 class ShopifyGraphQLError(RuntimeError):

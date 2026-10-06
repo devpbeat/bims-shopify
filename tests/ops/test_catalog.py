@@ -1239,3 +1239,378 @@ async def test_run_import_incremental_still_respects_only_with_stock(tenant):
     assert summary["incremental"] is True
     assert summary["products"] == 1
     assert summary["sample"][0]["skus"] == ["SKU-IN"]
+
+
+# -- publish (DRAFT -> ACTIVE + Online Store publication, images+stock gated) -
+
+_ONLINE_STORE_PUBLICATION_ID = "gid://shopify/Publication/1"
+
+
+def _publish_product(
+    product_id: str,
+    *,
+    status: str = "DRAFT",
+    skus: list[str] | None = None,
+    media_count: int = 1,
+    published_publication_ids: list[str] | None = None,
+    title: str = "Shirt",
+) -> dict:
+    return {
+        "id": product_id,
+        "title": title,
+        "status": status,
+        "skus": skus if skus is not None else ["SKU-A"],
+        "media_count": media_count,
+        "published_publication_ids": published_publication_ids or [],
+    }
+
+
+def test_compute_publish_plan_happy_path_is_target():
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1")]
+    stock = {"SKU-A": 3.0}
+    plan = compute_publish_plan(products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert [t["product_id"] for t in plan.targets] == ["p1"]
+    assert plan.skipped_no_images == []
+    assert plan.skipped_no_stock == []
+    assert plan.unknown == []
+    assert plan.already_done == 0
+
+
+def test_compute_publish_plan_no_images_is_skipped():
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1", media_count=0)]
+    stock = {"SKU-A": 3.0}
+    plan = compute_publish_plan(products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert plan.targets == []
+    assert [s["product_id"] for s in plan.skipped_no_images] == ["p1"]
+
+
+def test_compute_publish_plan_all_zero_stock_is_skipped():
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1")]
+    stock = {"SKU-A": 0.0}
+    plan = compute_publish_plan(products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert plan.targets == []
+    assert [s["product_id"] for s in plan.skipped_no_stock] == ["p1"]
+
+
+def test_compute_publish_plan_at_least_one_sku_with_stock_is_enough():
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1", skus=["SKU-A", "SKU-B"])]
+    stock = {"SKU-A": 0.0, "SKU-B": 2.0}
+    plan = compute_publish_plan(products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert [t["product_id"] for t in plan.targets] == ["p1"]
+
+
+def test_compute_publish_plan_no_skus_is_unknown():
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1", skus=[])]
+    plan = compute_publish_plan(products, {}, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert plan.targets == []
+    assert [u["product_id"] for u in plan.unknown] == ["p1"]
+
+
+def test_compute_publish_plan_unknown_sku_is_reported_not_touched():
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1", skus=["SKU-GONE"])]
+    plan = compute_publish_plan(products, {}, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert plan.targets == []
+    assert [u["product_id"] for u in plan.unknown] == ["p1"]
+
+
+def test_compute_publish_plan_already_active_and_published_is_already_done():
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [
+        _publish_product(
+            "p1", status="ACTIVE", published_publication_ids=[_ONLINE_STORE_PUBLICATION_ID]
+        )
+    ]
+    stock = {"SKU-A": 3.0}
+    plan = compute_publish_plan(products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert plan.targets == []
+    assert plan.already_done == 1
+
+
+def test_compute_publish_plan_active_but_not_on_publication_is_still_a_target():
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1", status="ACTIVE", published_publication_ids=[])]
+    stock = {"SKU-A": 3.0}
+    plan = compute_publish_plan(products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert [t["product_id"] for t in plan.targets] == ["p1"]
+    assert plan.already_done == 0
+
+
+def test_compute_publish_plan_precedence_unknown_before_no_images():
+    """A product with an unknown SKU is reported as unknown even with no images."""
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1", skus=["SKU-GONE"], media_count=0)]
+    plan = compute_publish_plan(products, {}, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert [u["product_id"] for u in plan.unknown] == ["p1"]
+    assert plan.skipped_no_images == []
+
+
+def test_compute_publish_plan_precedence_no_images_before_no_stock():
+    """A product with no images and zero stock is reported as no_images, not no_stock."""
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [_publish_product("p1", media_count=0)]
+    stock = {"SKU-A": 0.0}
+    plan = compute_publish_plan(products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert [s["product_id"] for s in plan.skipped_no_images] == ["p1"]
+    assert plan.skipped_no_stock == []
+
+
+def test_compute_publish_plan_precedence_no_stock_before_already_done():
+    """A zero-stock product that happens to already be published is reported as no_stock."""
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [
+        _publish_product(
+            "p1", status="ACTIVE", published_publication_ids=[_ONLINE_STORE_PUBLICATION_ID]
+        )
+    ]
+    stock = {"SKU-A": 0.0}
+    plan = compute_publish_plan(products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID)
+    assert [s["product_id"] for s in plan.skipped_no_stock] == ["p1"]
+    assert plan.already_done == 0
+
+
+def test_compute_publish_plan_limit_truncates_targets_only_after_full_scan():
+    from bims_shopify.ops.catalog import compute_publish_plan
+
+    products = [
+        _publish_product("p1"),
+        _publish_product("p2"),
+        _publish_product("p3", media_count=0),
+    ]
+    stock = {"SKU-A": 3.0}
+    plan = compute_publish_plan(
+        products, stock, publication_id=_ONLINE_STORE_PUBLICATION_ID, limit=1
+    )
+    assert len(plan.targets) == 1
+    assert plan.total_products == 3
+    assert len(plan.skipped_no_images) == 1
+
+
+def test_build_publish_report_shape_and_sample_caps():
+    from bims_shopify.ops.catalog import PublishPlan, build_publish_report
+
+    plan = PublishPlan(
+        total_products=50,
+        targets=[{"product_id": f"p{i}", "title": "X", "skus": []} for i in range(25)],
+        skipped_no_images=[{"product_id": f"i{i}", "title": "Y", "skus": []} for i in range(12)],
+        skipped_no_stock=[{"product_id": f"s{i}", "title": "Z", "skus": []} for i in range(12)],
+        unknown=[{"product_id": f"u{i}", "title": "W", "skus": []} for i in range(12)],
+        already_done=4,
+    )
+    report = build_publish_report(plan)
+    assert report["total_products"] == 50
+    assert report["targets"]["count"] == 25
+    assert len(report["targets"]["sample"]) == 20
+    assert report["skipped_no_images"]["count"] == 12
+    assert len(report["skipped_no_images"]["sample"]) == 10
+    assert report["skipped_no_stock"]["count"] == 12
+    assert len(report["skipped_no_stock"]["sample"]) == 10
+    assert report["unknown"]["count"] == 12
+    assert len(report["unknown"]["sample"]) == 10
+    assert report["already_done"] == 4
+
+
+async def test_apply_publish_sets_active_and_publishes_isolating_failures():
+    from bims_shopify.adapters.shopify.client import ShopifyGraphQLError
+    from bims_shopify.ops.catalog import apply_publish
+
+    calls: dict = {}
+
+    class _FakeShopifyClient:
+        async def set_product_status(self, product_id, status):
+            calls.setdefault("status", []).append((product_id, status))
+
+        async def publish_product(self, product_id, publication_ids):
+            if product_id == "p2":
+                raise ShopifyGraphQLError("boom")
+            calls.setdefault("published", []).append((product_id, publication_ids))
+
+    targets = [
+        {"product_id": "p1", "title": "A", "skus": []},
+        {"product_id": "p2", "title": "B", "skus": []},
+    ]
+    result = await apply_publish(
+        _FakeShopifyClient(), targets, publication_ids=[_ONLINE_STORE_PUBLICATION_ID]
+    )
+    assert result.processed == 1
+    assert calls["status"] == [("p1", "ACTIVE"), ("p2", "ACTIVE")]
+    assert calls["published"] == [("p1", [_ONLINE_STORE_PUBLICATION_ID])]
+    assert result.failed == [{"product_id": "p2", "error": "ShopifyGraphQLError: boom"}]
+
+
+def _publish_fake_clients(products: list[dict], stock_by_sku: dict[str, float], calls: dict):
+    class _FakeShopifyClient:
+        def __init__(self, tenant):
+            pass
+
+        async def iter_all_products_with_skus(self):
+            for product in products:
+                yield product
+
+        async def fetch_publications(self):
+            return [
+                {"id": "gid://shopify/Publication/9", "name": "Point of Sale"},
+                {"id": _ONLINE_STORE_PUBLICATION_ID, "name": "Online Store"},
+            ]
+
+        async def set_product_status(self, product_id, status):
+            calls.setdefault("status", []).append((product_id, status))
+
+        async def publish_product(self, product_id, publication_ids):
+            calls.setdefault("published", []).append((product_id, publication_ids))
+
+        async def aclose(self):
+            pass
+
+    class _FakeBimsClient:
+        def __init__(self, tenant):
+            pass
+
+        async def stock_fenicio(self, *, skus, warehouse_ids, request_id):
+            return {
+                "data": {
+                    "stockPorSku": [
+                        {"sku": sku, "stock": stock_by_sku[sku]}
+                        for sku in skus
+                        if sku in stock_by_sku
+                    ]
+                }
+            }
+
+        async def aclose(self):
+            pass
+
+    return _FakeShopifyClient, _FakeBimsClient
+
+
+async def test_run_publish_dry_run_reports_without_mutating(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    products = [
+        _publish_product("p1"),
+        _publish_product("p2", media_count=0),
+    ]
+    stock = {"SKU-A": 3.0}
+    calls: dict = {}
+    fake_shopify, fake_bims = _publish_fake_clients(products, stock, calls)
+
+    shopify_target = catalog_ops.ShopifyClient
+    bims_target = catalog_ops.BIMSClient
+    catalog_ops.ShopifyClient = fake_shopify  # type: ignore[assignment]
+    catalog_ops.BIMSClient = fake_bims  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(["acme", "publish"])
+        report = await catalog_ops._run_publish(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = shopify_target  # type: ignore[assignment]
+        catalog_ops.BIMSClient = bims_target  # type: ignore[assignment]
+
+    assert report["dry_run"] is True
+    assert report["targets"]["count"] == 1
+    assert report["targets"]["sample"][0]["product_id"] == "p1"
+    assert report["skipped_no_images"]["count"] == 1
+    assert calls == {}
+
+
+async def test_run_publish_apply_sets_active_and_publishes(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.id = None  # skip real-DB audit write
+    products = [_publish_product("p1")]
+    stock = {"SKU-A": 3.0}
+    calls: dict = {}
+    fake_shopify, fake_bims = _publish_fake_clients(products, stock, calls)
+
+    shopify_target = catalog_ops.ShopifyClient
+    bims_target = catalog_ops.BIMSClient
+    catalog_ops.ShopifyClient = fake_shopify  # type: ignore[assignment]
+    catalog_ops.BIMSClient = fake_bims  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(["acme", "publish", "--apply"])
+        report = await catalog_ops._run_publish(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = shopify_target  # type: ignore[assignment]
+        catalog_ops.BIMSClient = bims_target  # type: ignore[assignment]
+
+    assert report["apply"]["processed"] == 1
+    assert calls["status"] == [("p1", "ACTIVE")]
+    assert calls["published"] == [("p1", [_ONLINE_STORE_PUBLICATION_ID])]
+
+
+async def test_run_publish_apply_respects_limit(tenant):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.id = None
+    products = [_publish_product("p1"), _publish_product("p2")]
+    stock = {"SKU-A": 3.0}
+    calls: dict = {}
+    fake_shopify, fake_bims = _publish_fake_clients(products, stock, calls)
+
+    shopify_target = catalog_ops.ShopifyClient
+    bims_target = catalog_ops.BIMSClient
+    catalog_ops.ShopifyClient = fake_shopify  # type: ignore[assignment]
+    catalog_ops.BIMSClient = fake_bims  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(
+            ["acme", "publish", "--apply", "--limit", "1"]
+        )
+        report = await catalog_ops._run_publish(tenant, args)
+    finally:
+        catalog_ops.ShopifyClient = shopify_target  # type: ignore[assignment]
+        catalog_ops.BIMSClient = bims_target  # type: ignore[assignment]
+
+    assert report["apply"]["processed"] == 1
+    assert len(calls["status"]) == 1
+
+
+async def test_run_publish_missing_online_store_publication_raises():
+    from bims_shopify.ops import catalog as catalog_ops
+
+    class _NoOnlineStoreShopifyClient:
+        def __init__(self, tenant):
+            pass
+
+        async def iter_all_products_with_skus(self):
+            return
+            yield  # pragma: no cover
+
+        async def fetch_publications(self):
+            return [{"id": "gid://shopify/Publication/9", "name": "Point of Sale"}]
+
+        async def aclose(self):
+            pass
+
+    class _FakeBimsClient:
+        def __init__(self, tenant):
+            pass
+
+        async def aclose(self):
+            pass
+
+    shopify_target = catalog_ops.ShopifyClient
+    bims_target = catalog_ops.BIMSClient
+    catalog_ops.ShopifyClient = _NoOnlineStoreShopifyClient  # type: ignore[assignment]
+    catalog_ops.BIMSClient = _FakeBimsClient  # type: ignore[assignment]
+    try:
+        args = catalog_ops._build_arg_parser().parse_args(["acme", "publish"])
+        with pytest.raises(SystemExit):
+            await catalog_ops._run_publish(object(), args)
+    finally:
+        catalog_ops.ShopifyClient = shopify_target  # type: ignore[assignment]
+        catalog_ops.BIMSClient = bims_target  # type: ignore[assignment]

@@ -239,6 +239,45 @@ async def test_cleanup_no_stock_bad_mode_is_422(app_and_tenant):
     assert response.status_code == 422
 
 
+async def test_publish_bad_limit_is_422(app_and_tenant):
+    app, _tenant, _sf = app_and_tenant
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/ops/acme/run",
+            json={"command": "publish", "options": {"limit": -1}},
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+    assert response.status_code == 422
+
+
+async def test_publish_options_pass_through(app_and_tenant, monkeypatch):
+    app, _tenant, session_factory = app_and_tenant
+    seen_options: list[dict] = []
+
+    async def _capture_runner(tenant, options, progress):
+        seen_options.append(options)
+        return {"total_products": 0}
+
+    monkeypatch.setitem(
+        __import__("bims_shopify.ops.job_runner", fromlist=["_COMMAND_RUNNERS"])._COMMAND_RUNNERS,
+        "publish",
+        _capture_runner,
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/ops/acme/run",
+            json={"command": "publish", "options": {"apply": True, "limit": 5}},
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        assert response.status_code == 200
+        await _wait_for_status(session_factory, response.json()["job_id"], {"succeeded", "failed"})
+
+    assert seen_options == [{"apply": True, "limit": 5}]
+
+
 async def test_cleanup_no_stock_options_pass_through(app_and_tenant, monkeypatch):
     app, _tenant, session_factory = app_and_tenant
     seen_options: list[dict] = []
