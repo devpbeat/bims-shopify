@@ -12,7 +12,8 @@ SHOP_DOMAIN_RE = re.compile(r"^[a-z0-9-]+\.myshopify\.com$")
 
 DEFAULT_SCOPES = (
     "read_products,write_products,read_inventory,write_inventory,"
-    "read_orders,write_orders,read_locations"
+    "read_orders,write_orders,read_locations,"
+    "read_publications,write_publications"
 )
 
 _PRIMARY_LOCATION_QUERY = """

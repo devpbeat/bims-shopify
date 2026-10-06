@@ -8,7 +8,7 @@ application_url = "https://mystoresync.ignitesolutions.click"
 embedded = false
 
 [access_scopes]
-scopes = "read_products,write_products,read_inventory,write_inventory,read_orders,write_orders,read_locations"
+scopes = "read_products,write_products,read_inventory,write_inventory,read_orders,write_orders,read_locations,read_publications,write_publications"
 
 [auth]
 redirect_urls = [
