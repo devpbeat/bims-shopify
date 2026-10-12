@@ -264,6 +264,13 @@ export const es: Messages = {
         confirmApplyNoImages:
           'Esto publicará los productos listados en la tienda online, incluyendo productos sin imágenes. ¿Continuar?',
       },
+      diagnose: {
+        title: 'Diagnosticar un producto',
+        description:
+          'Solo lectura. Explica por qué un producto de BIMS está o no publicado en Shopify: para cada coincidencia indica la primera condición que no cumple (deshabilitado, excluido de e-commerce, sin code2, code2 duplicado, sin stock, ausente en Shopify, borrador, sin publicar) o confirma que está publicado, junto con sus datos de BIMS, el stock por depósito y el estado en Shopify. No se crea, modifica ni publica nada.',
+        queryLabel: 'ID, código, code2 o parte del nombre',
+        queryPlaceholder: 'p. ej., el código impreso en la etiqueta',
+      },
     },
     jobStatus: {
       queued: 'En cola',

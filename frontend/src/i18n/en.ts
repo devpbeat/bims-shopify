@@ -259,6 +259,13 @@ export const en: Messages = {
         confirmApplyNoImages:
           'This will publish the listed products to the Online Store, including products with no images. Continue?',
       },
+      diagnose: {
+        title: 'Diagnose a product',
+        description:
+          'Read-only. Explains why a BIMS product is or is not live in Shopify: for every match it names the first gate it fails (disabled, excluded from e-commerce, missing code2, duplicate code2, no stock, not in Shopify, draft, not published) or confirms it is live, with its BIMS fields, per-warehouse stock and Shopify state. Nothing is created, changed or published.',
+        queryLabel: 'ID, code, code2 or part of the name',
+        queryPlaceholder: 'e.g. the code printed on the tag',
+      },
     },
     jobStatus: {
       queued: 'Queued',

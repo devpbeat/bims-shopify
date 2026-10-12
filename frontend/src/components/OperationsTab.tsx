@@ -124,6 +124,8 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
   const [publishLimit, setPublishLimit] = useState('')
   const [publishRequireImages, setPublishRequireImages] = useState(true)
 
+  const [diagnoseQuery, setDiagnoseQuery] = useState('')
+
   const [wipeAdvancedOpen, setWipeAdvancedOpen] = useState(false)
   const [wipeConfirmText, setWipeConfirmText] = useState('')
 
@@ -228,6 +230,7 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
   const fixTrackingJob = latestJobFor('fix_tracking')
   const cleanupJob = latestJobFor('cleanup_no_stock')
   const publishJob = latestJobFor('publish')
+  const diagnoseJob = latestJobFor('diagnose')
   const syncJob = latestJobFor('sync')
 
   return (
@@ -588,6 +591,31 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
           {t.operator.runButton}
         </button>
         {publishJob && <JobPanel job={publishJob} />}
+      </div>
+
+      <div className="ops-card">
+        <h3>{t.operator.commands.diagnose.title}</h3>
+        <p className="muted">{t.operator.commands.diagnose.description}</p>
+        {runError.diagnose && <p className="error-text">{runError.diagnose}</p>}
+        <label className="ops-field">
+          {t.operator.commands.diagnose.queryLabel}
+          <input
+            type="text"
+            maxLength={200}
+            placeholder={t.operator.commands.diagnose.queryPlaceholder}
+            value={diagnoseQuery}
+            onChange={(e) => setDiagnoseQuery(e.target.value)}
+          />
+        </label>
+        <button
+          type="button"
+          className="btn btn-primary"
+          disabled={diagnoseQuery.trim() === ''}
+          onClick={() => launch('diagnose', { query: diagnoseQuery.trim() })}
+        >
+          {t.operator.runButton}
+        </button>
+        {diagnoseJob && <JobPanel job={diagnoseJob} />}
       </div>
 
       <div className="ops-card ops-card-danger">

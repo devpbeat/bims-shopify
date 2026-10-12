@@ -206,6 +206,12 @@ export interface Messages {
         confirmApply: string
         confirmApplyNoImages: string
       }
+      diagnose: {
+        title: string
+        description: string
+        queryLabel: string
+        queryPlaceholder: string
+      }
     }
     jobStatus: {
       queued: string

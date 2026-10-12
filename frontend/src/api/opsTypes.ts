@@ -7,6 +7,7 @@ export type OpsCommand =
   | 'fix_tracking'
   | 'cleanup_no_stock'
   | 'publish'
+  | 'diagnose'
   | 'sync'
 
 export type OpsJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
@@ -25,6 +26,7 @@ export interface OpsRunOptions {
   dry_run?: boolean
   full?: boolean
   require_images?: boolean
+  query?: string
 }
 
 export interface OpsRunResponse {
