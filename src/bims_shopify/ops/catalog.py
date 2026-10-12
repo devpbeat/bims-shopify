@@ -194,6 +194,33 @@ def _is_truthy(value: Any) -> bool:
     return bool(value)
 
 
+def bims_gate_failure(raw: dict[str, Any]) -> str | None:
+    """Name the first import gate a raw BIMS row fails, or ``None`` if it passes.
+
+    The single source of truth for the row-level gates, in pipeline order:
+    ``disabled`` (``enabled`` falsy), ``excluded_from_ecommerce``
+    (``exclude_ecommerce`` truthy), ``missing_code2``. Shared by
+    ``filter_and_dedupe_rows`` and the ``diagnose`` command so a diagnosis
+    can never disagree with what the import actually does.
+    """
+    if not _is_truthy(raw.get("enabled", True)):
+        return "disabled"
+    if _is_truthy(raw.get("exclude_ecommerce", False)):
+        return "excluded_from_ecommerce"
+    if not raw.get("code2"):
+        return "missing_code2"
+    return None
+
+
+def has_stock(stock_by_sku: dict[str, float], sku: str) -> bool:
+    """The pipeline's stock predicate: confirmed stock strictly above zero.
+
+    A SKU absent from the stock response counts as no stock, exactly like
+    the ``only_with_stock`` filter.
+    """
+    return stock_by_sku.get(sku, 0.0) > 0
+
+
 def filter_and_dedupe_rows(raw_rows: list[dict[str, Any]]) -> tuple[list[BimsRow], list[dict[str, Any]]]:
     """Keep enabled, e-commerce-visible rows with a non-empty ``code2``.
 
@@ -202,14 +229,9 @@ def filter_and_dedupe_rows(raw_rows: list[dict[str, Any]]) -> tuple[list[BimsRow
     seen: dict[str, BimsRow] = {}
     duplicates: list[dict[str, Any]] = []
     for raw in raw_rows:
-        if not _is_truthy(raw.get("enabled", True)):
+        if bims_gate_failure(raw) is not None:
             continue
-        if _is_truthy(raw.get("exclude_ecommerce", False)):
-            continue
-        code2 = raw.get("code2")
-        if not code2:
-            continue
-        code2 = str(code2)
+        code2 = str(raw["code2"])
         row = BimsRow(
             bims_id=str(raw.get("id")),
             name=raw.get("name") or "",
@@ -324,8 +346,16 @@ async def fetch_bims_catalog_rows(
     *,
     since: datetime | None = None,
     tenant_timezone: str = "America/Asuncion",
+    mode: str = "simple",
 ) -> list[dict[str, Any]]:
-    """Page through BIMS ``/api/products/index.json`` (mode=simple) for a company.
+    """Page through BIMS ``/api/products/index.json`` for a company.
+
+    ``mode`` defaults to ``"simple"``, which returns only (id, name, code2,
+    sell_price, enabled, exclude_ecommerce, company_id) at roughly 3x the
+    throughput of ``"full"`` -- every existing caller relies on that.
+    Pass ``mode="full"`` only for one-off, human-triggered diagnostics
+    (``diagnose``) that need fields ``simple`` omits, such as ``code``; the
+    slower pull is acceptable there but not for scheduled imports.
 
     ``since``, when given (an aware UTC datetime), narrows the pull to
     products BIMS reports as created/modified after that point via the
@@ -334,7 +364,7 @@ async def fetch_bims_catalog_rows(
     default used by manual imports and the very first scheduled auto-import.
     """
     params: dict[str, Any] = {
-        "mode": "simple",
+        "mode": mode,
         "company_id": company_id,
         "limit": BIMS_PAGE_LIMIT,
     }
@@ -357,9 +387,13 @@ async def fetch_bims_catalog_rows(
 
 
 async def fetch_stock_by_sku(
-    bims_client: BIMSClient, skus: list[str], warehouse_ids: list[int]
+    bims_client: BIMSClient, skus: list[str], warehouse_ids: list[int] | None
 ) -> dict[str, float]:
-    """Fetch aggregated stock per SKU, batched, clamping negative totals to 0."""
+    """Fetch aggregated stock per SKU, batched, clamping negative totals to 0.
+
+    ``warehouse_ids=None`` leaves the request unscoped (no ``warehouse_ids``
+    in the payload); only ``diagnose`` uses that.
+    """
     result: dict[str, float] = {}
     unique_skus = list(dict.fromkeys(skus))
     for i in range(0, len(unique_skus), STOCK_BATCH_SIZE):
@@ -1244,7 +1278,7 @@ async def _run_import(
             all_skus = [v.sku for g in groups for v in g.variants]
             stock_by_sku = await fetch_stock_by_sku(bims_client, all_skus, tenant.stock_warehouse_ids)
             groups = [
-                g for g in groups if any(stock_by_sku.get(v.sku, 0.0) > 0 for v in g.variants)
+                g for g in groups if any(has_stock(stock_by_sku, v.sku) for v in g.variants)
             ]
 
         if args.limit is not None:
