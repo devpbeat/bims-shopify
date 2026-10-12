@@ -388,6 +388,7 @@ def test_bims_fields_are_reported_as_plain_data():
         "code": "TAG-1",
         "code2": "SKU-1",
         "name": "Blue Shirt (M)",
+        "company_id": None,
         "enabled": True,
         "exclude_ecommerce": False,
         "sell_price": 1500,
@@ -722,3 +723,110 @@ def test_job_runner_registers_diagnose():
     from bims_shopify.ops.job_runner import _COMMAND_RUNNERS
 
     assert _COMMAND_RUNNERS["diagnose"] is catalog_ops.run_diagnose
+
+
+# -- wrong_company (rows BIMS only returns when the company filter is dropped) -
+
+
+def _diagnose_in_company(raws, matched_ids, *, tenant_company_id=1, stock=None, shopify=None):
+    from bims_shopify.ops.catalog import compute_diagnosis
+
+    matched = [r for r in raws if r["id"] in matched_ids]
+    return compute_diagnosis(
+        raws,
+        matched,
+        stock_by_sku=stock if stock is not None else {},
+        stock_by_warehouse={},
+        stock_total_all={},
+        shopify_index=shopify if shopify is not None else {},
+        online_store_publication_id=ONLINE_STORE,
+        tenant_company_id=tenant_company_id,
+    )
+
+
+def _company_raw(bims_id, company_id, **kwargs):
+    return {**_raw(bims_id, **kwargs), "company_id": company_id}
+
+
+@respx.mock
+async def test_fetch_bims_catalog_rows_omits_company_id_when_none(tenant):
+    route = respx.get(f"{BIMS_URL}/api/products/index.json").mock(
+        return_value=httpx.Response(200, json={"status": "ok", "data": []})
+    )
+    await fetch_bims_catalog_rows(BIMSClient(tenant), None, mode="full")
+    assert "company_id" not in route.calls[0].request.url.params
+
+
+@respx.mock
+async def test_fetch_bims_catalog_rows_still_sends_company_id_by_default(tenant):
+    route = respx.get(f"{BIMS_URL}/api/products/index.json").mock(
+        return_value=httpx.Response(200, json={"status": "ok", "data": []})
+    )
+    await fetch_bims_catalog_rows(BIMSClient(tenant), tenant.bims_company_id)
+    assert route.calls[0].request.url.params["company_id"] == str(tenant.bims_company_id)
+
+
+def test_verdict_wrong_company_reports_both_company_ids():
+    (d,) = _diagnose_in_company([_company_raw(1, 2)], {1}, tenant_company_id=6)
+    assert d.verdict == "wrong_company"
+    assert d.wrong_company == {"row_company_id": 2, "tenant_company_id": 6}
+    assert d.bims["company_id"] == 2
+
+
+def test_wrong_company_takes_precedence_over_disabled():
+    (d,) = _diagnose_in_company([_company_raw(1, 2, enabled=False)], {1}, tenant_company_id=6)
+    assert d.verdict == "wrong_company"
+
+
+def test_wrong_company_takes_precedence_over_missing_code2():
+    (d,) = _diagnose_in_company([_company_raw(1, 2, code2=None)], {1}, tenant_company_id=6)
+    assert d.verdict == "wrong_company"
+
+
+def test_wrong_company_compares_ids_as_strings():
+    """BIMS may return ids as strings; "6" is the tenant's company 6."""
+    (d,) = _diagnose_in_company(
+        [_company_raw(1, "6")], {1}, tenant_company_id=6, stock={"SKU-1": 1.0}
+    )
+    assert d.verdict == "not_in_shopify"
+    assert d.wrong_company is None
+
+
+def test_own_company_row_is_unaffected():
+    (d,) = _diagnose_in_company([_company_raw(1, 6, enabled=False)], {1}, tenant_company_id=6)
+    assert d.verdict == "disabled"
+
+
+def test_row_without_company_id_is_not_wrong_company():
+    (d,) = _diagnose_in_company([_raw(1)], {1}, tenant_company_id=6, stock={"SKU-1": 1.0})
+    assert d.verdict == "not_in_shopify"
+
+
+def test_other_company_rows_do_not_affect_duplicates_or_groups():
+    """The real import never sees other companies' rows, so they cannot win a code2."""
+    raws = [
+        _company_raw(1, 2, name="Other", code2="DUP"),
+        _company_raw(2, 6, name="Mine", code2="DUP"),
+    ]
+    other, mine = _diagnose_in_company(raws, {1, 2}, tenant_company_id=6, stock={"DUP": 1.0})
+    assert other.verdict == "wrong_company"
+    assert mine.verdict == "not_in_shopify"
+    assert mine.duplicate_of is None
+
+
+async def test_run_diagnose_pulls_every_company_and_finds_other_company_rows(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.bims_company_id = 6
+    rec = _install_fakes(
+        monkeypatch,
+        raw_rows=[_company_raw(1, 2, name="Blue Shirt (M)", code2="SKU-1")],
+        stock_by_wh={},
+        products=[],
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "blue shirt"})
+
+    assert all("company_id" not in p for p in rec.catalog_params)
+    assert report["total_matches"] == 1
+    assert report["rows"][0]["verdict"] == "wrong_company"
+    assert report["rows"][0]["wrong_company"] == {"row_company_id": 2, "tenant_company_id": 6}

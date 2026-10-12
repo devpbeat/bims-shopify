@@ -48,7 +48,7 @@ only ever makes products more visible), so unlike ``cleanup_no_stock``/
 (matched case-insensitively against a BIMS product's ``id``, ``code``,
 ``code2`` or part of its ``name``) it reports, for every match (capped), the
 first import gate the product fails -- disabled, excluded from e-commerce,
-missing ``code2``, duplicate ``code2``, no stock, not in Shopify, draft, not
+belongs to another company, missing ``code2``, duplicate ``code2``, no stock, not in Shopify, draft, not
 published -- or ``live``, plus the raw BIMS fields, per-warehouse stock and
 the Shopify product state. It exists to answer "product X is in BIMS but not
 in Shopify" without guessing.
@@ -353,7 +353,7 @@ def _parse_since(since_iso: str | None) -> datetime | None:
 
 async def fetch_bims_catalog_rows(
     bims_client: BIMSClient,
-    company_id: int,
+    company_id: int | None,
     *,
     since: datetime | None = None,
     tenant_timezone: str = "America/Asuncion",
@@ -368,17 +368,24 @@ async def fetch_bims_catalog_rows(
     (``diagnose``) that need fields ``simple`` omits, such as ``code``; the
     slower pull is acceptable there but not for scheduled imports.
 
+    ``company_id`` is a SERVER-SIDE filter: products of any other company
+    never come back. Every import path passes the tenant's company. Pass
+    ``None`` to omit the param and get every company's products -- only
+    ``diagnose`` does, so it can say "this product belongs to another
+    company" instead of "no matches". The unfiltered catalog is larger than
+    one company's (by however many products the other companies own) and the
+    page loop is sequential, so the runtime grows with it; acceptable for a
+    one-off human-triggered diagnostic, not for scheduled work.
+
     ``since``, when given (an aware UTC datetime), narrows the pull to
     products BIMS reports as created/modified after that point via the
     ``last_update`` filter (converted to BIMS local time). ``None`` means a
     full pull of the company's catalog -- the historical, always-correct
     default used by manual imports and the very first scheduled auto-import.
     """
-    params: dict[str, Any] = {
-        "mode": mode,
-        "company_id": company_id,
-        "limit": BIMS_PAGE_LIMIT,
-    }
+    params: dict[str, Any] = {"mode": mode, "limit": BIMS_PAGE_LIMIT}
+    if company_id is not None:
+        params["company_id"] = company_id
     if since is not None:
         params["last_update"] = to_bims_local(since, tenant_timezone)
 
@@ -1199,6 +1206,7 @@ class RowDiagnosis:
     group_has_stock: bool | None = None
     duplicate_of: dict[str, Any] | None = None
     shadowed_by: dict[str, Any] | None = None
+    wrong_company: dict[str, Any] | None = None
     shopify: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -1210,6 +1218,7 @@ class RowDiagnosis:
             "group_has_stock": self.group_has_stock,
             "duplicate_of": self.duplicate_of,
             "shadowed_by": self.shadowed_by,
+            "wrong_company": self.wrong_company,
             "shopify": self.shopify,
         }
 
@@ -1256,9 +1265,26 @@ class _PipelineView:
     shadowed_by_sku: dict[str, dict[str, Any]]
 
 
-def _pipeline_view(raw_rows: list[dict[str, Any]]) -> _PipelineView:
+def _is_other_company(raw: dict[str, Any], tenant_company_id: int | None) -> bool:
+    """True when the row carries a ``company_id`` different from the tenant's.
+
+    Compared as strings (BIMS may send ids as strings). A row without a
+    ``company_id``, or no tenant company to compare against, is never "other".
+    """
+    row_company = raw.get("company_id")
+    if tenant_company_id is None or row_company is None:
+        return False
+    return str(row_company) != str(tenant_company_id)
+
+
+def _pipeline_view(
+    raw_rows: list[dict[str, Any]], tenant_company_id: int | None = None
+) -> _PipelineView:
     # Runs the REAL pipeline functions so a diagnosis cannot drift from them.
-    rows, _duplicates = filter_and_dedupe_rows(raw_rows)
+    # The import only ever receives the tenant's own company (server-side
+    # filter), so other companies' rows must not take part in dedupe/grouping.
+    own_rows = [r for r in raw_rows if not _is_other_company(r, tenant_company_id)]
+    rows, _duplicates = filter_and_dedupe_rows(own_rows)
     grouping = group_rows(rows)
     group_by_sku = {v.sku: g for g in grouping.groups for v in g.variants}
     shadowed_by_sku = {
@@ -1274,14 +1300,18 @@ def _pipeline_view(raw_rows: list[dict[str, Any]]) -> _PipelineView:
     )
 
 
-def diagnosis_stock_skus(raw_rows: list[dict[str, Any]], matched: list[dict[str, Any]]) -> list[str]:
+def diagnosis_stock_skus(
+    raw_rows: list[dict[str, Any]],
+    matched: list[dict[str, Any]],
+    tenant_company_id: int | None = None,
+) -> list[str]:
     """SKUs whose tenant-scoped stock ``compute_diagnosis`` needs.
 
     Each matched row's own ``code2`` plus the other variants of its product
     group: the import's stock gate is evaluated per GROUP (any variant with
     stock keeps the whole product), not per row.
     """
-    view = _pipeline_view(raw_rows)
+    view = _pipeline_view(raw_rows, tenant_company_id)
     skus: dict[str, None] = {}
     for raw in matched:
         code2 = raw.get("code2")
@@ -1323,6 +1353,7 @@ def _bims_facts(raw: dict[str, Any]) -> dict[str, Any]:
         "code": raw.get("code"),
         "code2": raw.get("code2"),
         "name": raw.get("name"),
+        "company_id": raw.get("company_id"),
         "enabled": raw.get("enabled"),
         "exclude_ecommerce": raw.get("exclude_ecommerce"),
         "sell_price": raw.get("sell_price"),
@@ -1338,6 +1369,7 @@ def compute_diagnosis(
     stock_total_all: dict[str, float],
     shopify_index: dict[str, dict[str, Any]],
     online_store_publication_id: str | None,
+    tenant_company_id: int | None = None,
 ) -> list[RowDiagnosis]:
     """Pure: name the first gate each ``matched`` row fails, from fetched data.
 
@@ -1346,8 +1378,12 @@ def compute_diagnosis(
     ``stock_by_warehouse`` is ``{warehouse_id: {sku: qty}}`` and
     ``stock_total_all`` the unscoped total, both for display only.
 
+    ``tenant_company_id`` enables the earliest gate: ``wrong_company`` (the
+    row belongs to another company, which the import's server-side filter
+    would never fetch). ``None`` skips that gate.
+
     Verdicts, in the pipeline's own order (first failure wins):
-    ``disabled``, ``excluded_from_ecommerce``, ``missing_code2``,
+    ``wrong_company``, ``disabled``, ``excluded_from_ecommerce``, ``missing_code2``,
     ``duplicate_code2``, ``shadowed_variant`` (lost a same-size collision
     inside its product), ``no_stock`` (no variant of its product group has
     stock > 0), ``not_in_shopify`` (passes everything, yet no Shopify
@@ -1357,13 +1393,22 @@ def compute_diagnosis(
     publication could not be resolved; ``unknown_status`` covers any other
     Shopify status.
     """
-    view = _pipeline_view(raw_rows)
+    view = _pipeline_view(raw_rows, tenant_company_id)
     results: list[RowDiagnosis] = []
     for raw in matched:
         diagnosis = RowDiagnosis(verdict="", bims=_bims_facts(raw))
         results.append(diagnosis)
 
-        gate = bims_gate_failure(raw)
+        gate = (
+            "wrong_company"
+            if _is_other_company(raw, tenant_company_id)
+            else bims_gate_failure(raw)
+        )
+        if gate == "wrong_company":
+            diagnosis.wrong_company = {
+                "row_company_id": raw.get("company_id"),
+                "tenant_company_id": tenant_company_id,
+            }
         code2 = str(raw["code2"]) if raw.get("code2") else None
         if code2 is not None:
             diagnosis.stock_by_warehouse = {
@@ -1445,8 +1490,10 @@ async def _run_diagnose(
     every other command uses) because ``simple`` omits ``code`` -- the field
     printed on the physical tag an operator searches by. ``full`` is roughly
     3x slower per page, an acceptable price for a one-off, human-triggered
-    diagnostic. The pull is a full-catalog one (no ``last_update`` filter):
-    duplicate detection and product grouping need every row.
+    diagnostic. The pull is a full-catalog one (no ``last_update`` filter,
+    and no ``company_id`` filter so rows of other companies surface as
+    ``wrong_company`` instead of "no matches"): duplicate detection and
+    product grouping need every row of the tenant's company.
     """
     query = (args.query or "").strip()
     if not query:
@@ -1458,7 +1505,7 @@ async def _run_diagnose(
         await _emit_progress(progress, 0, None, "pulling BIMS catalog")
         raw_rows = await fetch_bims_catalog_rows(
             bims_client,
-            tenant.bims_company_id,
+            None,  # every company: a row of another company must be explained, not hidden
             tenant_timezone=tenant.bims_timezone,
             mode="full",
         )
@@ -1473,7 +1520,7 @@ async def _run_diagnose(
         if own_skus:
             warehouse_ids = tenant.stock_warehouse_ids
             stock_by_sku = await fetch_stock_by_sku(
-                bims_client, diagnosis_stock_skus(raw_rows, matched), warehouse_ids
+                bims_client, diagnosis_stock_skus(raw_rows, matched, tenant.bims_company_id), warehouse_ids
             )
             for warehouse_id in warehouse_ids:
                 stock_by_warehouse[warehouse_id] = await fetch_stock_by_sku(
@@ -1502,6 +1549,7 @@ async def _run_diagnose(
             stock_total_all=stock_total_all,
             shopify_index=index_products_by_sku(products),
             online_store_publication_id=publication_id,
+            tenant_company_id=tenant.bims_company_id,
         )
         return build_diagnose_report(
             DiagnoseReport(
