@@ -102,6 +102,7 @@ PUBLISH_TARGET_SAMPLE_SIZE = 20
 PUBLISH_SKIPPED_NO_IMAGES_SAMPLE_SIZE = 10
 PUBLISH_SKIPPED_NO_STOCK_SAMPLE_SIZE = 10
 PUBLISH_UNKNOWN_SAMPLE_SIZE = 10
+DIAGNOSE_MAX_MATCHES = 25
 ONLINE_STORE_PUBLICATION_NAME = "Online Store"
 
 #: Progress callback signature shared by the CLI and the background job
@@ -1166,6 +1167,260 @@ async def _run_publish(
     finally:
         await bims_client.aclose()
         await shopify_client.aclose()
+
+
+# -- diagnose (read-only: explain why a BIMS product is or is not live) -----
+
+
+@dataclass
+class RowDiagnosis:
+    """Verdict plus supporting facts for one matched BIMS product row.
+
+    ``verdict`` names the FIRST gate the row fails, in the import pipeline's
+    own order (see ``compute_diagnosis``). ``stock_by_warehouse`` /
+    ``stock_total_all_warehouses`` are ``None`` for rows without a ``code2``
+    (there is no SKU to look up).
+    """
+
+    verdict: str
+    bims: dict[str, Any]
+    stock_by_warehouse: dict[int, float] | None = None
+    stock_total_all_warehouses: float | None = None
+    group_has_stock: bool | None = None
+    duplicate_of: dict[str, Any] | None = None
+    shadowed_by: dict[str, Any] | None = None
+    shopify: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "verdict": self.verdict,
+            "bims": self.bims,
+            "stock_by_warehouse": self.stock_by_warehouse,
+            "stock_total_all_warehouses": self.stock_total_all_warehouses,
+            "group_has_stock": self.group_has_stock,
+            "duplicate_of": self.duplicate_of,
+            "shadowed_by": self.shadowed_by,
+            "shopify": self.shopify,
+        }
+
+
+@dataclass
+class DiagnoseReport:
+    query: str
+    total_matches: int
+    diagnoses: list[RowDiagnosis] = field(default_factory=list)
+    online_store_publication_id: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+def match_catalog_rows(raw_rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Return every raw BIMS row matching ``query``, in catalog order.
+
+    Case-insensitive. ``id``, ``code`` and ``code2`` must equal the (trimmed)
+    query exactly -- they are identifiers, and a substring match on a short
+    code would drown the operator in noise -- while ``name`` matches on a
+    substring so a partial title returns every product/size that contains it.
+    A blank query matches nothing.
+    """
+    needle = query.strip().casefold()
+    if not needle:
+        return []
+    matches: list[dict[str, Any]] = []
+    for raw in raw_rows:
+        identifiers = (raw.get("id"), raw.get("code"), raw.get("code2"))
+        is_identifier_match = any(
+            v is not None and str(v).strip().casefold() == needle for v in identifiers
+        )
+        if is_identifier_match or needle in str(raw.get("name") or "").casefold():
+            matches.append(raw)
+    return matches
+
+
+@dataclass
+class _PipelineView:
+    """What the real import pipeline does with a full set of raw BIMS rows."""
+
+    winners_by_code2: dict[str, BimsRow]
+    grouping: GroupingReport
+    group_by_sku: dict[str, ProductGroup]
+    shadowed_by_sku: dict[str, dict[str, Any]]
+
+
+def _pipeline_view(raw_rows: list[dict[str, Any]]) -> _PipelineView:
+    # Runs the REAL pipeline functions so a diagnosis cannot drift from them.
+    rows, _duplicates = filter_and_dedupe_rows(raw_rows)
+    grouping = group_rows(rows)
+    group_by_sku = {v.sku: g for g in grouping.groups for v in g.variants}
+    shadowed_by_sku = {
+        sku: {"kept_sku": entry["kept_sku"], "title": entry["title"], "size": entry["size"]}
+        for entry in grouping.shadowed_size_duplicates
+        for sku in entry["shadowed_skus"]
+    }
+    return _PipelineView(
+        winners_by_code2={r.code2: r for r in rows},
+        grouping=grouping,
+        group_by_sku=group_by_sku,
+        shadowed_by_sku=shadowed_by_sku,
+    )
+
+
+def diagnosis_stock_skus(raw_rows: list[dict[str, Any]], matched: list[dict[str, Any]]) -> list[str]:
+    """SKUs whose tenant-scoped stock ``compute_diagnosis`` needs.
+
+    Each matched row's own ``code2`` plus the other variants of its product
+    group: the import's stock gate is evaluated per GROUP (any variant with
+    stock keeps the whole product), not per row.
+    """
+    view = _pipeline_view(raw_rows)
+    skus: dict[str, None] = {}
+    for raw in matched:
+        code2 = raw.get("code2")
+        if not code2:
+            continue
+        sku = str(code2)
+        skus[sku] = None
+        group = view.group_by_sku.get(sku)
+        if group is not None:
+            for variant in group.variants:
+                skus[variant.sku] = None
+    return list(skus)
+
+
+def index_products_by_sku(products: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Map each Shopify variant SKU to its product; the first product wins."""
+    index: dict[str, dict[str, Any]] = {}
+    for product in products:
+        for sku in product.get("skus") or []:
+            index.setdefault(sku, product)
+    return index
+
+
+def _shopify_facts(product: dict[str, Any], publication_id: str | None) -> dict[str, Any]:
+    published_ids = list(product.get("published_publication_ids") or [])
+    return {
+        "product_id": product.get("id"),
+        "title": product.get("title"),
+        "status": product.get("status"),
+        "media_count": product.get("media_count") or 0,
+        "published_publication_ids": published_ids,
+        "on_online_store": None if publication_id is None else publication_id in published_ids,
+    }
+
+
+def _bims_facts(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": raw.get("id"),
+        "code": raw.get("code"),
+        "code2": raw.get("code2"),
+        "name": raw.get("name"),
+        "enabled": raw.get("enabled"),
+        "exclude_ecommerce": raw.get("exclude_ecommerce"),
+        "sell_price": raw.get("sell_price"),
+    }
+
+
+def compute_diagnosis(
+    raw_rows: list[dict[str, Any]],
+    matched: list[dict[str, Any]],
+    *,
+    stock_by_sku: dict[str, float],
+    stock_by_warehouse: dict[int, dict[str, float]],
+    stock_total_all: dict[str, float],
+    shopify_index: dict[str, dict[str, Any]],
+    online_store_publication_id: str | None,
+) -> list[RowDiagnosis]:
+    """Pure: name the first gate each ``matched`` row fails, from fetched data.
+
+    ``raw_rows`` is the FULL catalog (duplicate detection and grouping need
+    it); ``stock_by_sku`` is the tenant-scoped aggregate the import uses;
+    ``stock_by_warehouse`` is ``{warehouse_id: {sku: qty}}`` and
+    ``stock_total_all`` the unscoped total, both for display only.
+
+    Verdicts, in the pipeline's own order (first failure wins):
+    ``disabled``, ``excluded_from_ecommerce``, ``missing_code2``,
+    ``duplicate_code2``, ``shadowed_variant`` (lost a same-size collision
+    inside its product), ``no_stock`` (no variant of its product group has
+    stock > 0), ``not_in_shopify`` (passes everything, yet no Shopify
+    variant carries the SKU -- the import should have created it), then by
+    Shopify state ``draft``, ``archived``, ``not_published``, ``live``.
+    ``publication_unknown`` replaces the last two when the Online Store
+    publication could not be resolved; ``unknown_status`` covers any other
+    Shopify status.
+    """
+    view = _pipeline_view(raw_rows)
+    results: list[RowDiagnosis] = []
+    for raw in matched:
+        diagnosis = RowDiagnosis(verdict="", bims=_bims_facts(raw))
+        results.append(diagnosis)
+
+        gate = bims_gate_failure(raw)
+        code2 = str(raw["code2"]) if raw.get("code2") else None
+        if code2 is not None:
+            diagnosis.stock_by_warehouse = {
+                wid: per_sku.get(code2, 0.0) for wid, per_sku in stock_by_warehouse.items()
+            }
+            diagnosis.stock_total_all_warehouses = stock_total_all.get(code2, 0.0)
+            # Report the Shopify side whenever the SKU is there, whatever the
+            # verdict: e.g. a row disabled in BIMS that is still live.
+            product = shopify_index.get(code2)
+            if product is not None:
+                diagnosis.shopify = _shopify_facts(product, online_store_publication_id)
+        if gate is not None:
+            diagnosis.verdict = gate
+            continue
+
+        assert code2 is not None  # guaranteed by the missing_code2 gate
+        winner = view.winners_by_code2[code2]
+        if winner.bims_id != str(raw.get("id")):
+            diagnosis.verdict = "duplicate_code2"
+            diagnosis.duplicate_of = {"bims_id": winner.bims_id, "name": winner.name}
+            continue
+
+        if code2 in view.shadowed_by_sku:
+            diagnosis.verdict = "shadowed_variant"
+            diagnosis.shadowed_by = view.shadowed_by_sku[code2]
+            continue
+
+        group = view.group_by_sku[code2]
+        diagnosis.group_has_stock = any(has_stock(stock_by_sku, v.sku) for v in group.variants)
+        if not diagnosis.group_has_stock:
+            diagnosis.verdict = "no_stock"
+            continue
+
+        if diagnosis.shopify is None:
+            diagnosis.verdict = "not_in_shopify"
+            continue
+
+        status = diagnosis.shopify["status"]
+        if status == "DRAFT":
+            diagnosis.verdict = "draft"
+        elif status == "ARCHIVED":
+            diagnosis.verdict = "archived"
+        elif status != "ACTIVE":
+            diagnosis.verdict = "unknown_status"
+        elif online_store_publication_id is None:
+            diagnosis.verdict = "publication_unknown"
+        elif diagnosis.shopify["on_online_store"]:
+            diagnosis.verdict = "live"
+        else:
+            diagnosis.verdict = "not_published"
+    return results
+
+
+def build_diagnose_report(report: DiagnoseReport) -> dict[str, Any]:
+    verdict_counts: dict[str, int] = {}
+    for diagnosis in report.diagnoses:
+        verdict_counts[diagnosis.verdict] = verdict_counts.get(diagnosis.verdict, 0) + 1
+    return {
+        "query": report.query,
+        "total_matches": report.total_matches,
+        "diagnosed": len(report.diagnoses),
+        "truncated": report.total_matches > len(report.diagnoses),
+        "online_store_publication_id": report.online_store_publication_id,
+        "notes": report.notes,
+        "verdict_counts": verdict_counts,
+        "rows": [d.to_dict() for d in report.diagnoses],
+    }
 
 
 async def _run_fix_tracking(

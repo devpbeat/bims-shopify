@@ -90,3 +90,373 @@ async def test_fetch_bims_catalog_rows_accepts_explicit_mode(tenant):
     rows = await fetch_bims_catalog_rows(BIMSClient(tenant), tenant.bims_company_id, mode="full")
     assert route.calls[0].request.url.params["mode"] == "full"
     assert rows == [{"id": 1, "code": "TAG-1"}]
+
+
+# -- row matching ------------------------------------------------------------
+
+
+def _raw(
+    bims_id: int | str,
+    name: str = "Blue Shirt (M)",
+    *,
+    code: str | None = None,
+    code2: str | None = "SKU-1",
+    enabled: object = True,
+    exclude: object = False,
+    price: float = 1000,
+) -> dict:
+    return {
+        "id": bims_id,
+        "code": code,
+        "code2": code2,
+        "name": name,
+        "enabled": enabled,
+        "exclude_ecommerce": exclude,
+        "sell_price": price,
+    }
+
+
+def test_match_catalog_rows_by_id():
+    from bims_shopify.ops.catalog import match_catalog_rows
+
+    rows = [_raw(101, "A", code2="X1"), _raw(1010, "B", code2="X2")]
+    assert [r["id"] for r in match_catalog_rows(rows, "101")] == [101]
+
+
+def test_match_catalog_rows_by_code_case_insensitive():
+    from bims_shopify.ops.catalog import match_catalog_rows
+
+    rows = [_raw(1, "A", code="Tag-77", code2="X1"), _raw(2, "B", code=None, code2="X2")]
+    assert [r["id"] for r in match_catalog_rows(rows, "tag-77")] == [1]
+
+
+def test_match_catalog_rows_by_code2_case_insensitive():
+    from bims_shopify.ops.catalog import match_catalog_rows
+
+    rows = [_raw(1, "A", code2="ab-123"), _raw(2, "B", code2="ZZ")]
+    assert [r["id"] for r in match_catalog_rows(rows, " AB-123 ")] == [1]
+
+
+def test_match_catalog_rows_by_name_substring_returns_every_match():
+    from bims_shopify.ops.catalog import match_catalog_rows
+
+    rows = [
+        _raw(1, "Blue Shirt (S)", code2="A"),
+        _raw(2, "BLUE SHIRT (M)", code2="B"),
+        _raw(3, "Red Pants", code2="C"),
+    ]
+    assert [r["id"] for r in match_catalog_rows(rows, "blue shirt")] == [1, 2]
+
+
+def test_match_catalog_rows_ids_codes_are_exact_not_substring():
+    from bims_shopify.ops.catalog import match_catalog_rows
+
+    rows = [_raw(1, "A", code="TAG-77", code2="SKU-77")]
+    assert match_catalog_rows(rows, "77") == []
+
+
+def test_match_catalog_rows_blank_query_matches_nothing():
+    from bims_shopify.ops.catalog import match_catalog_rows
+
+    assert match_catalog_rows([_raw(1)], "   ") == []
+
+
+# -- verdicts (pure) ---------------------------------------------------------
+
+ONLINE_STORE = "gid://shopify/Publication/1"
+
+
+def _shopify(
+    sku: str = "SKU-1",
+    *,
+    status: str = "ACTIVE",
+    publications: list[str] | None = None,
+    media: int = 2,
+    product_id: str = "gid://shopify/Product/1",
+) -> dict:
+    return {
+        sku: {
+            "id": product_id,
+            "title": "Blue Shirt",
+            "status": status,
+            "skus": [sku],
+            "media_count": media,
+            "published_publication_ids": [ONLINE_STORE] if publications is None else publications,
+        }
+    }
+
+
+def _diagnose(raws, matched_ids, *, stock=None, per_warehouse=None, total=None,
+              shopify=None, publication=ONLINE_STORE):
+    from bims_shopify.ops.catalog import compute_diagnosis
+
+    matched = [r for r in raws if r["id"] in matched_ids]
+    return compute_diagnosis(
+        raws,
+        matched,
+        stock_by_sku=stock if stock is not None else {},
+        stock_by_warehouse=per_warehouse if per_warehouse is not None else {},
+        stock_total_all=total if total is not None else {},
+        shopify_index=shopify if shopify is not None else {},
+        online_store_publication_id=publication,
+    )
+
+
+def test_verdict_disabled():
+    (d,) = _diagnose([_raw(1, enabled=False)], {1})
+    assert d.verdict == "disabled"
+    assert d.shopify is None
+
+
+def test_verdict_excluded_from_ecommerce():
+    (d,) = _diagnose([_raw(1, exclude="1")], {1})
+    assert d.verdict == "excluded_from_ecommerce"
+
+
+def test_verdict_missing_code2():
+    (d,) = _diagnose([_raw(1, code2=None)], {1})
+    assert d.verdict == "missing_code2"
+    assert d.stock_by_warehouse is None
+    assert d.stock_total_all_warehouses is None
+
+
+def test_precedence_disabled_before_missing_code2():
+    (d,) = _diagnose([_raw(1, enabled=False, code2="")], {1})
+    assert d.verdict == "disabled"
+
+
+def test_precedence_disabled_before_excluded():
+    (d,) = _diagnose([_raw(1, enabled=False, exclude=True)], {1})
+    assert d.verdict == "disabled"
+
+
+def test_verdict_duplicate_code2_names_the_winning_row():
+    raws = [_raw(1, "Winner (M)", code2="DUP"), _raw(2, "Loser (M)", code2="DUP")]
+    winner, loser = _diagnose(raws, {1, 2}, stock={"DUP": 3.0})
+    assert loser.verdict == "duplicate_code2"
+    assert loser.duplicate_of == {"bims_id": "1", "name": "Winner (M)"}
+    assert winner.verdict == "not_in_shopify"
+    assert winner.duplicate_of is None
+
+
+def test_disabled_row_does_not_win_a_duplicate_code2():
+    """The pipeline skips disabled rows before dedupe, so the next row wins."""
+    raws = [_raw(1, "Off", code2="DUP", enabled=False), _raw(2, "On", code2="DUP")]
+    off, on = _diagnose(raws, {1, 2}, stock={"DUP": 1.0})
+    assert off.verdict == "disabled"
+    assert on.verdict != "duplicate_code2"
+
+
+def test_verdict_shadowed_variant_when_option_value_collides():
+    raws = [
+        _raw(1, "Blue Shirt (M)", code2="A-M"),
+        _raw(2, "Blue Shirt (M)", code2="B-M"),
+    ]
+    kept, shadowed = _diagnose(raws, {1, 2}, stock={"A-M": 2.0, "B-M": 2.0})
+    assert kept.verdict == "not_in_shopify"
+    assert shadowed.verdict == "shadowed_variant"
+    assert shadowed.shadowed_by == {"kept_sku": "A-M", "title": "Blue Shirt", "size": "M"}
+
+
+def test_verdict_no_stock():
+    (d,) = _diagnose([_raw(1)], {1}, stock={"SKU-1": 0.0})
+    assert d.verdict == "no_stock"
+
+
+def test_verdict_no_stock_when_sku_absent_from_stock_response():
+    (d,) = _diagnose([_raw(1)], {1}, stock={})
+    assert d.verdict == "no_stock"
+
+
+def test_no_stock_requires_strictly_positive_stock():
+    (d,) = _diagnose([_raw(1)], {1}, stock={"SKU-1": -1.0})
+    assert d.verdict == "no_stock"
+
+
+def test_stock_gate_is_group_level_like_only_with_stock():
+    """A zero-stock size is still imported when a sibling size has stock."""
+    raws = [
+        _raw(1, "Blue Shirt (S)", code2="S"),
+        _raw(2, "Blue Shirt (M)", code2="M"),
+    ]
+    small, medium = _diagnose(raws, {1, 2}, stock={"S": 0.0, "M": 4.0})
+    assert small.verdict == "not_in_shopify"
+    assert small.group_has_stock is True
+    assert medium.verdict == "not_in_shopify"
+
+
+def test_no_stock_when_whole_group_is_empty():
+    raws = [_raw(1, "Blue Shirt (S)", code2="S"), _raw(2, "Blue Shirt (M)", code2="M")]
+    small, medium = _diagnose(raws, {1, 2}, stock={"S": 0.0, "M": 0.0})
+    assert small.verdict == medium.verdict == "no_stock"
+    assert small.group_has_stock is False
+
+
+def test_no_stock_in_synced_warehouses_but_stock_elsewhere():
+    """Stock only in a warehouse the tenant does not sync -> no_stock, total > 0."""
+    (d,) = _diagnose(
+        [_raw(1)],
+        {1},
+        stock={"SKU-1": 0.0},
+        per_warehouse={5: {"SKU-1": 0.0}, 6: {"SKU-1": 0.0}},
+        total={"SKU-1": 7.0},
+    )
+    assert d.verdict == "no_stock"
+    assert d.stock_by_warehouse == {5: 0.0, 6: 0.0}
+    assert d.stock_total_all_warehouses == 7.0
+
+
+def test_stock_by_warehouse_reports_each_synced_warehouse():
+    (d,) = _diagnose(
+        [_raw(1)],
+        {1},
+        stock={"SKU-1": 5.0},
+        per_warehouse={5: {"SKU-1": 3.0}, 6: {"SKU-1": 2.0}},
+        total={"SKU-1": 9.0},
+    )
+    assert d.stock_by_warehouse == {5: 3.0, 6: 2.0}
+    assert d.stock_total_all_warehouses == 9.0
+
+
+def test_verdict_not_in_shopify_is_the_alarming_one():
+    (d,) = _diagnose([_raw(1)], {1}, stock={"SKU-1": 3.0})
+    assert d.verdict == "not_in_shopify"
+    assert d.shopify is None
+
+
+def test_verdict_draft():
+    (d,) = _diagnose([_raw(1)], {1}, stock={"SKU-1": 3.0}, shopify=_shopify(status="DRAFT"))
+    assert d.verdict == "draft"
+    assert d.shopify["status"] == "DRAFT"
+
+
+def test_verdict_archived():
+    (d,) = _diagnose([_raw(1)], {1}, stock={"SKU-1": 3.0}, shopify=_shopify(status="ARCHIVED"))
+    assert d.verdict == "archived"
+
+
+def test_verdict_not_published():
+    (d,) = _diagnose(
+        [_raw(1)], {1}, stock={"SKU-1": 3.0}, shopify=_shopify(publications=["gid://other"])
+    )
+    assert d.verdict == "not_published"
+    assert d.shopify["on_online_store"] is False
+
+
+def test_verdict_live():
+    (d,) = _diagnose([_raw(1)], {1}, stock={"SKU-1": 3.0}, shopify=_shopify())
+    assert d.verdict == "live"
+    assert d.shopify == {
+        "product_id": "gid://shopify/Product/1",
+        "title": "Blue Shirt",
+        "status": "ACTIVE",
+        "media_count": 2,
+        "published_publication_ids": [ONLINE_STORE],
+        "on_online_store": True,
+    }
+
+
+def test_shopify_side_does_not_depend_on_bims_stock_for_live_rows():
+    """A live product with zero stock is still reported with its Shopify facts."""
+    (d,) = _diagnose([_raw(1)], {1}, stock={"SKU-1": 0.0}, shopify=_shopify())
+    assert d.verdict == "no_stock"
+    assert d.shopify is not None
+    assert d.shopify["status"] == "ACTIVE"
+
+
+def test_unresolved_online_store_publication_degrades_gracefully():
+    (d,) = _diagnose(
+        [_raw(1)], {1}, stock={"SKU-1": 3.0}, shopify=_shopify(), publication=None
+    )
+    assert d.verdict == "publication_unknown"
+    assert d.shopify["on_online_store"] is None
+    assert d.shopify["status"] == "ACTIVE"
+
+
+def test_unresolved_publication_does_not_affect_draft_verdict():
+    (d,) = _diagnose(
+        [_raw(1)], {1}, stock={"SKU-1": 3.0}, shopify=_shopify(status="DRAFT"), publication=None
+    )
+    assert d.verdict == "draft"
+
+
+def test_bims_fields_are_reported_as_plain_data():
+    raws = [_raw(1, "Blue Shirt (M)", code="TAG-1", code2="SKU-1", price=1500)]
+    (d,) = _diagnose(raws, {1}, stock={"SKU-1": 1.0})
+    assert d.bims == {
+        "id": 1,
+        "code": "TAG-1",
+        "code2": "SKU-1",
+        "name": "Blue Shirt (M)",
+        "enabled": True,
+        "exclude_ecommerce": False,
+        "sell_price": 1500,
+    }
+
+
+def test_diagnosis_stock_skus_include_own_code2_and_group_siblings():
+    from bims_shopify.ops.catalog import diagnosis_stock_skus
+
+    raws = [
+        _raw(1, "Blue Shirt (S)", code2="S"),
+        _raw(2, "Blue Shirt (M)", code2="M"),
+        _raw(3, "Red Pants", code2="P"),
+        _raw(4, "Off Hat", code2="H", enabled=False),
+    ]
+    matched = [raws[0], raws[3]]
+    assert sorted(diagnosis_stock_skus(raws, matched)) == ["H", "M", "S"]
+
+
+# -- report ------------------------------------------------------------------
+
+
+def test_build_diagnose_report_shape_and_verdict_counts():
+    from bims_shopify.ops.catalog import DiagnoseReport, build_diagnose_report
+
+    raws = [_raw(1, enabled=False), _raw(2, "Other", code2="O")]
+    diagnoses = _diagnose(raws, {1, 2}, stock={"O": 1.0})
+    report = build_diagnose_report(
+        DiagnoseReport(
+            query="shirt",
+            total_matches=2,
+            diagnoses=diagnoses,
+            online_store_publication_id=ONLINE_STORE,
+            notes=["a note"],
+        )
+    )
+    assert report["query"] == "shirt"
+    assert report["total_matches"] == 2
+    assert report["diagnosed"] == 2
+    assert report["truncated"] is False
+    assert report["online_store_publication_id"] == ONLINE_STORE
+    assert report["notes"] == ["a note"]
+    assert report["verdict_counts"] == {"disabled": 1, "not_in_shopify": 1}
+    assert report["rows"][0]["verdict"] == "disabled"
+    assert report["rows"][0]["bims"]["id"] == 1
+    assert "stock_by_warehouse" in report["rows"][0]
+    assert "stock_total_all_warehouses" in report["rows"][0]
+
+
+def test_build_diagnose_report_flags_truncation():
+    from bims_shopify.ops.catalog import DiagnoseReport, build_diagnose_report
+
+    report = build_diagnose_report(
+        DiagnoseReport(query="x", total_matches=40, diagnoses=[], online_store_publication_id=None)
+    )
+    assert report["truncated"] is True
+    assert report["total_matches"] == 40
+    assert report["diagnosed"] == 0
+
+
+def test_diagnose_max_matches_constant():
+    from bims_shopify.ops.catalog import DIAGNOSE_MAX_MATCHES
+
+    assert DIAGNOSE_MAX_MATCHES == 25
+
+
+def test_shopify_side_reported_even_for_a_bims_gate_failure():
+    """A row disabled in BIMS but still present in Shopify shows both facts."""
+    (d,) = _diagnose([_raw(1, enabled=False)], {1}, shopify=_shopify())
+    assert d.verdict == "disabled"
+    assert d.shopify is not None
+    assert d.shopify["status"] == "ACTIVE"
