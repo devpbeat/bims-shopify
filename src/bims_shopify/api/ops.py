@@ -33,8 +33,12 @@ _VALID_COMMANDS = {
     "fix_tracking",
     "cleanup_no_stock",
     "publish",
+    "diagnose",
     "sync",
 }
+
+#: Upper bound for the free-text ``diagnose`` query (an id, code or title).
+_MAX_DIAGNOSE_QUERY_LENGTH = 200
 
 
 class RunJobRequest(BaseModel):
@@ -47,6 +51,7 @@ class RunJobRequest(BaseModel):
         "fix_tracking",
         "cleanup_no_stock",
         "publish",
+        "diagnose",
         "sync",
     ]
     options: dict[str, Any] = Field(default_factory=dict)
@@ -116,6 +121,18 @@ def _validate_options(command: str, options: dict[str, Any]) -> dict[str, Any]:
             "limit": limit,
             "require_images": require_images,
         }
+
+    if command == "diagnose":
+        query = options.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise HTTPException(status_code=422, detail="options.query must be a non-empty string")
+        query = query.strip()
+        if len(query) > _MAX_DIAGNOSE_QUERY_LENGTH:
+            raise HTTPException(
+                status_code=422,
+                detail=f"options.query must be at most {_MAX_DIAGNOSE_QUERY_LENGTH} characters",
+            )
+        return {"query": query}
 
     # status
     return {}

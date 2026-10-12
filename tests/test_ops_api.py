@@ -464,3 +464,55 @@ async def test_run_job_failure_records_error(app_and_tenant, monkeypatch):
 
     assert job.status == "failed"
     assert "kaboom" in job.error
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"query": ""},
+        {"query": "   "},
+        {"query": None},
+        {"query": 123},
+        {"query": ["tag"]},
+        {"query": "x" * 201},
+    ],
+)
+async def test_diagnose_invalid_query_is_422(app_and_tenant, options):
+    app, _tenant, _sf = app_and_tenant
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/ops/acme/run",
+            json={"command": "diagnose", "options": options},
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+    assert response.status_code == 422
+    assert "options.query" in response.json()["detail"]
+
+
+async def test_diagnose_query_is_stripped_and_extra_options_dropped(app_and_tenant, monkeypatch):
+    app, _tenant, session_factory = app_and_tenant
+    seen_options: list[dict] = []
+
+    async def _capture_runner(tenant, options, progress):
+        seen_options.append(options)
+        return {"total_matches": 0}
+
+    monkeypatch.setitem(
+        __import__("bims_shopify.ops.job_runner", fromlist=["_COMMAND_RUNNERS"])._COMMAND_RUNNERS,
+        "diagnose",
+        _capture_runner,
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/ops/acme/run",
+            json={"command": "diagnose", "options": {"query": "  TAG-77  ", "apply": True}},
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        assert response.status_code == 200
+        await _wait_for_status(session_factory, response.json()["job_id"], {"succeeded", "failed"})
+
+    assert seen_options == [{"query": "TAG-77"}]
