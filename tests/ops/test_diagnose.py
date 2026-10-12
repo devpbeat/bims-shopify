@@ -460,3 +460,265 @@ def test_shopify_side_reported_even_for_a_bims_gate_failure():
     assert d.verdict == "disabled"
     assert d.shopify is not None
     assert d.shopify["status"] == "ACTIVE"
+
+
+# -- runner (_run_diagnose / run_diagnose) -----------------------------------
+
+
+class _Recorder:
+    """Shared call log for the fake clients; also proves the command is read-only."""
+
+    def __init__(self) -> None:
+        self.catalog_params: list[dict] = []
+        self.stock_calls: list[dict] = []
+        self.progress: list[str] = []
+
+
+def _install_fakes(
+    monkeypatch,
+    *,
+    raw_rows: list[dict],
+    stock_by_wh: dict[int | None, dict[str, float]],
+    products: list[dict],
+    publications: list[dict] | None = None,
+    publications_error: Exception | None = None,
+) -> _Recorder:
+    from bims_shopify.ops import catalog as catalog_ops
+
+    rec = _Recorder()
+    pubs = (
+        publications
+        if publications is not None
+        else [{"id": ONLINE_STORE, "name": "Online Store"}]
+    )
+
+    class _FakeBims:
+        def __init__(self, tenant):
+            pass
+
+        async def get(self, path, params=None):
+            rec.catalog_params.append(dict(params or {}))
+            offset = (params or {}).get("offset", 0)
+            page = raw_rows[offset : offset + catalog_ops.BIMS_PAGE_LIMIT]
+            return {"data": [{"Product": r} for r in page]}
+
+        async def stock_fenicio(self, *, skus, warehouse_ids, request_id):
+            rec.stock_calls.append({"skus": list(skus), "warehouse_ids": warehouse_ids})
+            if warehouse_ids is None:
+                scope: dict[str, float] = {}
+                for per_sku in stock_by_wh.values():
+                    for sku, qty in per_sku.items():
+                        scope[sku] = scope.get(sku, 0.0) + qty
+            else:
+                scope = {}
+                for wid in warehouse_ids:
+                    for sku, qty in stock_by_wh.get(wid, {}).items():
+                        scope[sku] = scope.get(sku, 0.0) + qty
+            return {
+                "data": {
+                    "stockPorSku": [
+                        {"sku": sku, "stock": scope[sku]} for sku in skus if sku in scope
+                    ]
+                }
+            }
+
+        async def aclose(self):
+            pass
+
+    class _FakeShopify:
+        """Read-only surface only: any mutation attempt raises AttributeError."""
+
+        def __init__(self, tenant):
+            pass
+
+        async def iter_all_products_with_skus(self):
+            for product in products:
+                yield product
+
+        async def fetch_publications(self):
+            if publications_error is not None:
+                raise publications_error
+            return pubs
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(catalog_ops, "BIMSClient", _FakeBims)
+    monkeypatch.setattr(catalog_ops, "ShopifyClient", _FakeShopify)
+    return rec
+
+
+def _sf_product(sku="SKU-1", *, status="ACTIVE", publications=None):
+    return {
+        "id": "gid://shopify/Product/1",
+        "title": "Blue Shirt",
+        "status": status,
+        "skus": [sku],
+        "media_count": 1,
+        "published_publication_ids": [ONLINE_STORE] if publications is None else publications,
+    }
+
+
+async def test_run_diagnose_end_to_end_reports_live_row(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.bims_warehouse_id = 5
+    rec = _install_fakes(
+        monkeypatch,
+        raw_rows=[_raw(1, "Blue Shirt (M)", code="TAG-9", code2="SKU-1")],
+        stock_by_wh={5: {"SKU-1": 3.0}, 9: {"SKU-1": 4.0}},
+        products=[_sf_product()],
+    )
+    messages: list[str] = []
+    report = await catalog_ops.run_diagnose(
+        tenant, {"query": "tag-9"}, progress=lambda d, t, m: messages.append(m)
+    )
+
+    assert report["total_matches"] == 1
+    assert report["truncated"] is False
+    (row,) = report["rows"]
+    assert row["verdict"] == "live"
+    assert row["bims"]["code"] == "TAG-9"
+    assert row["stock_by_warehouse"] == {5: 3.0}
+    assert row["stock_total_all_warehouses"] == 7.0
+    assert row["shopify"]["on_online_store"] is True
+    assert report["online_store_publication_id"] == ONLINE_STORE
+    assert messages == [
+        "pulling BIMS catalog",
+        "checking stock",
+        "scanning Shopify",
+    ]
+    # Full catalog, no incremental filter, richer mode so `code` is present.
+    assert all(p["mode"] == "full" for p in rec.catalog_params)
+    assert all("last_update" not in p for p in rec.catalog_params)
+
+
+async def test_run_diagnose_calls_stock_once_per_synced_warehouse_plus_unscoped(
+    tenant, monkeypatch
+):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.bims_warehouse_ids = [5, 6]
+    rec = _install_fakes(
+        monkeypatch,
+        raw_rows=[_raw(1, code2="SKU-1")],
+        stock_by_wh={},
+        products=[],
+    )
+    await catalog_ops.run_diagnose(tenant, {"query": "SKU-1"})
+    scopes = [c["warehouse_ids"] for c in rec.stock_calls]
+    assert sorted(scopes, key=lambda s: (s is None, s or [])) == [[5], [5, 6], [6], None]
+
+
+async def test_run_diagnose_unsynced_warehouse_stock_is_visible(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.bims_warehouse_id = 5
+    _install_fakes(
+        monkeypatch,
+        raw_rows=[_raw(1, code2="SKU-1")],
+        stock_by_wh={77: {"SKU-1": 8.0}},
+        products=[],
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "1"})
+    (row,) = report["rows"]
+    assert row["verdict"] == "no_stock"
+    assert row["stock_by_warehouse"] == {5: 0.0}
+    assert row["stock_total_all_warehouses"] == 8.0
+
+
+async def test_run_diagnose_truncates_past_the_cap(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    raws = [_raw(i, f"Shirt {i}", code2=f"S{i}") for i in range(1, 31)]
+    _install_fakes(monkeypatch, raw_rows=raws, stock_by_wh={}, products=[])
+    report = await catalog_ops.run_diagnose(tenant, {"query": "shirt"})
+
+    assert report["total_matches"] == 30
+    assert report["diagnosed"] == catalog_ops.DIAGNOSE_MAX_MATCHES == 25
+    assert report["truncated"] is True
+    assert [r["bims"]["id"] for r in report["rows"]] == list(range(1, 26))
+
+
+async def test_run_diagnose_no_match_returns_empty_report(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    rec = _install_fakes(
+        monkeypatch, raw_rows=[_raw(1)], stock_by_wh={}, products=[]
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "nothing-like-this"})
+    assert report["total_matches"] == 0
+    assert report["rows"] == []
+    assert rec.stock_calls == []
+
+
+async def test_run_diagnose_degrades_when_online_store_publication_missing(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    _install_fakes(
+        monkeypatch,
+        raw_rows=[_raw(1, code2="SKU-1")],
+        stock_by_wh={1: {"SKU-1": 3.0}},
+        products=[_sf_product()],
+        publications=[{"id": "gid://shopify/Publication/9", "name": "Point of Sale"}],
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "SKU-1"})
+
+    assert report["online_store_publication_id"] is None
+    (row,) = report["rows"]
+    assert row["verdict"] == "publication_unknown"
+    assert row["shopify"]["on_online_store"] is None
+    assert any("Online Store" in note for note in report["notes"])
+
+
+async def test_run_diagnose_degrades_when_publication_lookup_errors(tenant, monkeypatch):
+    from bims_shopify.adapters.shopify.client import ShopifyGraphQLError
+    from bims_shopify.ops import catalog as catalog_ops
+
+    _install_fakes(
+        monkeypatch,
+        raw_rows=[_raw(1, code2="SKU-1")],
+        stock_by_wh={1: {"SKU-1": 3.0}},
+        products=[_sf_product()],
+        publications_error=ShopifyGraphQLError("boom"),
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "SKU-1"})
+    assert report["online_store_publication_id"] is None
+    assert report["rows"][0]["verdict"] == "publication_unknown"
+    assert report["notes"]
+
+
+async def test_run_diagnose_is_read_only_and_never_audits(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    _install_fakes(
+        monkeypatch,
+        raw_rows=[_raw(1, code2="SKU-1")],
+        stock_by_wh={1: {"SKU-1": 3.0}},
+        products=[_sf_product(status="DRAFT")],
+    )
+
+    async def _no_audit(*args, **kwargs):  # pragma: no cover - must not run
+        raise AssertionError("diagnose must not write audit rows")
+
+    monkeypatch.setattr(catalog_ops, "_audit", _no_audit)
+    report = await catalog_ops.run_diagnose(tenant, {"query": "SKU-1"})
+    assert report["rows"][0]["verdict"] == "draft"
+    assert "dry_run" not in report and "apply" not in report
+
+
+def test_argparse_diagnose_subcommand_takes_query_and_no_apply():
+    from bims_shopify.ops import catalog as catalog_ops
+
+    parser = catalog_ops._build_arg_parser()
+    args = parser.parse_args(["acme", "diagnose", "blue shirt"])
+    assert args.command == "diagnose"
+    assert args.query == "blue shirt"
+    assert not hasattr(args, "apply")
+
+
+def test_job_runner_registers_diagnose():
+    from bims_shopify.ops import catalog as catalog_ops
+    from bims_shopify.ops.job_runner import _COMMAND_RUNNERS
+
+    assert _COMMAND_RUNNERS["diagnose"] is catalog_ops.run_diagnose

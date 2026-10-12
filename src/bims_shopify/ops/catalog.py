@@ -9,6 +9,7 @@ Usage::
     python -m bims_shopify.ops.catalog <tenant_slug> dedupe [--apply] [--force]
     python -m bims_shopify.ops.catalog <tenant_slug> publish [--apply] [--limit N] \\
         [--no-require-images]
+    python -m bims_shopify.ops.catalog <tenant_slug> diagnose <query>
 
 ``wipe`` deletes every product in the tenant's Shopify store. ``import``
 rebuilds the catalog from the tenant's BIMS company (``tenant.bims_company_id``):
@@ -42,6 +43,15 @@ rollout). Pass ``--no-require-images`` to also publish products with no
 images (stock is still required regardless). Non-destructive by nature (it
 only ever makes products more visible), so unlike ``cleanup_no_stock``/
 ``dedupe`` it has no safety-guard ratio or ``--force`` escape hatch.
+
+``diagnose`` is read-only (no ``--apply`` at all). Given a free-text query
+(matched case-insensitively against a BIMS product's ``id``, ``code``,
+``code2`` or part of its ``name``) it reports, for every match (capped), the
+first import gate the product fails -- disabled, excluded from e-commerce,
+missing ``code2``, duplicate ``code2``, no stock, not in Shopify, draft, not
+published -- or ``live``, plus the raw BIMS fields, per-warehouse stock and
+the Shopify product state. It exists to answer "product X is in BIMS but not
+in Shopify" without guessing.
 
 ``status`` pulls both sides (BIMS-eligible rows, Shopify's live catalog) and
 prints a reconciliation report: counts on each side, SKUs present in one but
@@ -1423,6 +1433,90 @@ def build_diagnose_report(report: DiagnoseReport) -> dict[str, Any]:
     }
 
 
+async def _run_diagnose(
+    tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
+) -> dict[str, Any]:
+    """Explain why each BIMS product matching ``args.query`` is or is not live.
+
+    STRICTLY read-only: it only pulls from BIMS and Shopify, never mutates
+    either, writes no audit row, and has no ``apply`` option.
+
+    The BIMS catalog is pulled in ``mode="full"`` (not the ``simple`` mode
+    every other command uses) because ``simple`` omits ``code`` -- the field
+    printed on the physical tag an operator searches by. ``full`` is roughly
+    3x slower per page, an acceptable price for a one-off, human-triggered
+    diagnostic. The pull is a full-catalog one (no ``last_update`` filter):
+    duplicate detection and product grouping need every row.
+    """
+    query = (args.query or "").strip()
+    if not query:
+        raise SystemExit("diagnose: a non-empty query is required")
+
+    bims_client = BIMSClient(tenant)
+    shopify_client = ShopifyClient(tenant)
+    try:
+        await _emit_progress(progress, 0, None, "pulling BIMS catalog")
+        raw_rows = await fetch_bims_catalog_rows(
+            bims_client,
+            tenant.bims_company_id,
+            tenant_timezone=tenant.bims_timezone,
+            mode="full",
+        )
+        all_matches = match_catalog_rows(raw_rows, query)
+        matched = all_matches[:DIAGNOSE_MAX_MATCHES]
+
+        await _emit_progress(progress, 0, None, "checking stock")
+        own_skus = list(dict.fromkeys(str(r["code2"]) for r in matched if r.get("code2")))
+        stock_by_sku: dict[str, float] = {}
+        stock_by_warehouse: dict[int, dict[str, float]] = {}
+        stock_total_all: dict[str, float] = {}
+        if own_skus:
+            warehouse_ids = tenant.stock_warehouse_ids
+            stock_by_sku = await fetch_stock_by_sku(
+                bims_client, diagnosis_stock_skus(raw_rows, matched), warehouse_ids
+            )
+            for warehouse_id in warehouse_ids:
+                stock_by_warehouse[warehouse_id] = await fetch_stock_by_sku(
+                    bims_client, own_skus, [warehouse_id]
+                )
+            stock_total_all = await fetch_stock_by_sku(bims_client, own_skus, None)
+
+        await _emit_progress(progress, 0, None, "scanning Shopify")
+        notes: list[str] = []
+        publication_id: str | None = None
+        try:
+            publication_id = await _resolve_online_store_publication_id(shopify_client)
+        except (SystemExit, *_TRANSIENT_SHOPIFY_EXCEPTIONS) as exc:
+            # A diagnostic must never fail on a secondary lookup.
+            notes.append(
+                "Could not resolve the 'Online Store' publication "
+                f"({type(exc).__name__}); publication status is unknown."
+            )
+        products = await fetch_products_with_skus(shopify_client)
+
+        diagnoses = compute_diagnosis(
+            raw_rows,
+            matched,
+            stock_by_sku=stock_by_sku,
+            stock_by_warehouse=stock_by_warehouse,
+            stock_total_all=stock_total_all,
+            shopify_index=index_products_by_sku(products),
+            online_store_publication_id=publication_id,
+        )
+        return build_diagnose_report(
+            DiagnoseReport(
+                query=query,
+                total_matches=len(all_matches),
+                diagnoses=diagnoses,
+                online_store_publication_id=publication_id,
+                notes=notes,
+            )
+        )
+    finally:
+        await bims_client.aclose()
+        await shopify_client.aclose()
+
+
 async def _run_fix_tracking(
     tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
 ) -> dict[str, Any]:
@@ -1749,6 +1843,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         return await _run_cleanup_no_stock(tenant, args)
     if args.command == "publish":
         return await _run_publish(tenant, args)
+    if args.command == "diagnose":
+        return await _run_diagnose(tenant, args)
     return await _run_import(tenant, args)
 
 
@@ -1819,6 +1915,11 @@ async def run_publish(tenant: Tenant, options: dict[str, Any], progress: Progres
         require_images=bool(options.get("require_images", True)),
     )
     return await _run_publish(tenant, args, progress=progress)
+
+
+async def run_diagnose(tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None) -> dict[str, Any]:
+    args = argparse.Namespace(query=str(options.get("query", "")))
+    return await _run_diagnose(tenant, args, progress=progress)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -1952,6 +2053,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Also publish products with no images (default: require at least one image). "
             "Stock is still required regardless of this flag."
         ),
+    )
+
+    diagnose_parser = subparsers.add_parser(
+        "diagnose",
+        help=(
+            "Read-only: explain why BIMS products matching a query are or are not live "
+            "in Shopify."
+        ),
+    )
+    diagnose_parser.add_argument(
+        "query",
+        help="Matched case-insensitively against BIMS id, code, code2, or part of the name.",
     )
 
     return parser
