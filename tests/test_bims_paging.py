@@ -173,3 +173,19 @@ async def test_complete_pull_logs_nothing(monkeypatch):
     fetch, _ = _scripted([{"count": 2, "data": _rows(1, 2)}, {"data": []}])
     await paginate_products(fetch)
     assert events == []
+
+
+async def test_repeated_page_after_reaching_the_count_is_still_complete():
+    """Some servers re-serve the last page past the end; the count proves nothing was lost."""
+    same = {"count": 3, "data": _rows(1, 3)}
+    fetch, _offsets = _scripted([same] * 5)
+    pull = await paginate_products(fetch)
+    assert pull.stop_reason == "repeated_page"
+    assert pull.complete is True
+
+
+async def test_abnormal_stop_without_a_count_is_incomplete():
+    same = {"data": _rows(1, 3)}
+    fetch, _offsets = _scripted([same] * 5)
+    pull = await paginate_products(fetch)
+    assert pull.complete is False

@@ -882,7 +882,9 @@ async def test_phase_two_runs_only_when_phase_one_is_empty(tenant, monkeypatch):
 
     assert report["searched_all_companies"] is True
     assert report["rows"][0]["verdict"] == "wrong_company"
-    assert [p.get("company_id") for p in rec.catalog_params] == [6, None]
+    # Phase 1: one (empty) page. Phase 2: one page of rows, then the empty page
+    # that ends it -- paging stops on an empty page, never on a short one.
+    assert [p.get("company_id") for p in rec.catalog_params] == [6, None, None]
     assert "pulling BIMS catalog (all companies)" in messages
 
 

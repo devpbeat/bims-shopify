@@ -76,6 +76,7 @@ from typing import Any
 import httpx
 
 from bims_shopify.adapters.bims.client import BIMSClient
+from bims_shopify.adapters.bims.paging import PagedPull, paginate_products
 from bims_shopify.adapters.bims.timezones import to_bims_local
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.crypto import SecretBox
@@ -361,15 +362,21 @@ def _parse_since(since_iso: str | None) -> datetime | None:
     return parsed
 
 
-async def fetch_bims_catalog_rows(
+async def fetch_bims_catalog_pull(
     bims_client: BIMSClient,
     company_id: int | None,
     *,
     since: datetime | None = None,
     tenant_timezone: str = "America/Asuncion",
     mode: str = "simple",
-) -> list[dict[str, Any]]:
-    """Page through BIMS ``/api/products/index.json`` for a company.
+) -> PagedPull:
+    """Page through BIMS ``/api/products/index.json`` and report completeness.
+
+    Returns the rows plus what the server's own envelope ``count`` says about
+    them (see ``PagedPull``): a pull that falls short of the count is a
+    data-loss condition and is logged and flagged ``complete: False`` instead
+    of passing as a success. Paging stops on an EMPTY page, never on a short
+    one, and advances ``offset`` by the rows actually received.
 
     ``mode`` defaults to ``"simple"``, which returns only (id, name, code2,
     sell_price, enabled, exclude_ecommerce, company_id) at roughly 3x the
@@ -382,10 +389,10 @@ async def fetch_bims_catalog_rows(
     ``company_id`` is a SERVER-SIDE filter: products of any other company
     never come back. Every import path passes the tenant's company. Pass
     ``None`` to omit the param and get every company's products -- only
-    ``diagnose``'s fallback phase does, so it can say "this product belongs to another
-    company" instead of "no matches". The unfiltered catalog is larger than
-    one company's (by however many products the other companies own) and the
-    page loop is sequential, so the runtime grows with it; acceptable for a
+    ``diagnose``'s fallback phase does, so it can say "this product belongs to
+    another company" instead of "no matches". The unfiltered catalog is larger
+    than one company's (by however many products the other companies own) and
+    the page loop is sequential, so the runtime grows with it; acceptable for a
     one-off human-triggered diagnostic, not for scheduled work.
 
     ``since``, when given (an aware UTC datetime), narrows the pull to
@@ -400,19 +407,27 @@ async def fetch_bims_catalog_rows(
     if since is not None:
         params["last_update"] = to_bims_local(since, tenant_timezone)
 
-    rows: list[dict[str, Any]] = []
-    offset = 0
-    while True:
-        body = await bims_client.get(
-            "/api/products/index.json",
-            params={**params, "offset": offset},
+    async def fetch_page(offset: int) -> dict[str, Any]:
+        return await bims_client.get(
+            "/api/products/index.json", params={**params, "offset": offset}
         )
-        page = body.get("data") or []
-        for item in page:
-            rows.append(item.get("Product") or item)
-        if len(page) < BIMS_PAGE_LIMIT:
-            return rows
-        offset += BIMS_PAGE_LIMIT
+
+    return await paginate_products(fetch_page)
+
+
+async def fetch_bims_catalog_rows(
+    bims_client: BIMSClient,
+    company_id: int | None,
+    *,
+    since: datetime | None = None,
+    tenant_timezone: str = "America/Asuncion",
+    mode: str = "simple",
+) -> list[dict[str, Any]]:
+    """Rows of ``fetch_bims_catalog_pull``, for callers that do not need its summary."""
+    pull = await fetch_bims_catalog_pull(
+        bims_client, company_id, since=since, tenant_timezone=tenant_timezone, mode=mode
+    )
+    return pull.rows
 
 
 async def fetch_stock_by_sku(
@@ -1242,6 +1257,7 @@ class DiagnoseReport:
     online_store_publication_id: str | None = None
     notes: list[str] = field(default_factory=list)
     searched_all_companies: bool = False
+    catalog_pull: dict[str, Any] | None = None
 
 
 def match_catalog_rows(raw_rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
@@ -1488,6 +1504,7 @@ def build_diagnose_report(report: DiagnoseReport) -> dict[str, Any]:
         "diagnosed": len(report.diagnoses),
         "truncated": report.total_matches > len(report.diagnoses),
         "searched_all_companies": report.searched_all_companies,
+        "catalog_pull": report.catalog_pull,
         "online_store_publication_id": report.online_store_publication_id,
         "notes": report.notes,
         "verdict_counts": verdict_counts,
@@ -1520,18 +1537,20 @@ async def _run_diagnose(
     shopify_client = ShopifyClient(tenant)
     try:
         await _emit_progress(progress, 0, None, "pulling BIMS catalog")
-        raw_rows = await fetch_bims_catalog_rows(
+        pull = await fetch_bims_catalog_pull(
             bims_client, tenant.bims_company_id, tenant_timezone=tenant.bims_timezone
         )
+        raw_rows = pull.rows
         all_matches = match_catalog_rows(raw_rows, query)
         searched_all_companies = False
         if not all_matches:
             # Nothing in the tenant's company: look at every company so a
             # product that belongs elsewhere is explained, not hidden.
             await _emit_progress(progress, 0, None, "pulling BIMS catalog (all companies)")
-            raw_rows = await fetch_bims_catalog_rows(
+            pull = await fetch_bims_catalog_pull(
                 bims_client, None, tenant_timezone=tenant.bims_timezone
             )
+            raw_rows = pull.rows
             all_matches = match_catalog_rows(raw_rows, query)
             searched_all_companies = True
         matched = all_matches[:DIAGNOSE_MAX_MATCHES]
@@ -1554,6 +1573,12 @@ async def _run_diagnose(
 
         await _emit_progress(progress, 0, None, "scanning Shopify")
         notes: list[str] = []
+        if pull.complete is False:
+            notes.append(
+                f"The BIMS catalog pull is incomplete ({len(pull.rows)} rows received, "
+                f"server reports {pull.reported_count}); a missing product is NOT "
+                "conclusive evidence that it does not exist in BIMS."
+            )
         publication_id: str | None = None
         try:
             publication_id = await _resolve_online_store_publication_id(shopify_client)
@@ -1583,6 +1608,7 @@ async def _run_diagnose(
                 online_store_publication_id=publication_id,
                 notes=notes,
                 searched_all_companies=searched_all_companies,
+                catalog_pull=pull.summary(),
             )
         )
     finally:
@@ -1686,13 +1712,13 @@ async def _run_import(
             None,
             "pulling BIMS catalog (incremental)" if since is not None else "pulling BIMS catalog",
         )
-        raw_rows = await fetch_bims_catalog_rows(
+        pull = await fetch_bims_catalog_pull(
             bims_client,
             tenant.bims_company_id,
             since=since,
             tenant_timezone=tenant.bims_timezone,
         )
-        rows, duplicates = filter_and_dedupe_rows(raw_rows)
+        rows, duplicates = filter_and_dedupe_rows(pull.rows)
         grouping = group_rows(rows)
         groups = grouping.groups
 
@@ -1716,6 +1742,7 @@ async def _run_import(
                 "items": grouping.shadowed_size_duplicates,
             },
             "incremental": since is not None,
+            "catalog_pull": pull.summary(),
         }
 
         if not args.apply:
@@ -1829,8 +1856,8 @@ async def _run_status(
     shopify_client = ShopifyClient(tenant)
     try:
         await _emit_progress(progress, 0, None, "pulling BIMS catalog")
-        raw_rows = await fetch_bims_catalog_rows(bims_client, tenant.bims_company_id)
-        rows, duplicates = filter_and_dedupe_rows(raw_rows)
+        pull = await fetch_bims_catalog_pull(bims_client, tenant.bims_company_id)
+        rows, duplicates = filter_and_dedupe_rows(pull.rows)
         grouping = group_rows(rows)
         bims_skus = {v.sku for g in grouping.groups for v in g.variants}
 
@@ -1874,6 +1901,7 @@ async def _run_status(
                 "variants_with_sku": shopify_variants_with_sku,
             },
             "reconciliation": reconciliation,
+            "catalog_pull": pull.summary(),
             "last_activity": await _fetch_last_activity(tenant.id),
         }
 

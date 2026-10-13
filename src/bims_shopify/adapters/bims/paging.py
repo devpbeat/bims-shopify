@@ -32,8 +32,9 @@ class PagedPull:
 
     ``reported_count`` is the envelope ``count`` of the first response that
     carried a usable one, or ``None`` when the server sent none -- unknown,
-    not zero. ``complete`` is ``None`` when it cannot be judged (no count),
-    ``False`` when the pull ended abnormally or fell short of the count.
+    not zero. With a count, ``complete`` is whether the rows reach it. Without
+    one it is ``None`` (cannot be judged) after a normal end, ``False`` after
+    an abnormal stop (repeated page / page cap).
     """
 
     rows: list[dict[str, Any]] = field(default_factory=list)
@@ -44,11 +45,9 @@ class PagedPull:
 
     @property
     def complete(self) -> bool | None:
-        if self.stop_reason != STOP_EMPTY_PAGE:
-            return False
-        if self.reported_count is None:
-            return None
-        return len(self.rows) >= self.reported_count
+        if self.reported_count is not None:
+            return len(self.rows) >= self.reported_count
+        return None if self.stop_reason == STOP_EMPTY_PAGE else False
 
     def summary(self) -> dict[str, Any]:
         return {
