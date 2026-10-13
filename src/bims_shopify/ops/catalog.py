@@ -110,6 +110,9 @@ CLEANUP_TARGET_SAMPLE_SIZE = 20
 CLEANUP_UNKNOWN_SAMPLE_SIZE = 10
 CLEANUP_MAX_TARGET_RATIO = 0.6
 PUBLISH_PROGRESS_EVERY = 50
+#: Default cap on in-flight Shopify operations for import/publish. The client
+#: already retries THROTTLED/429/5xx with backoff, so this only bounds load.
+DEFAULT_SHOPIFY_CONCURRENCY = 8
 PUBLISH_TARGET_SAMPLE_SIZE = 20
 PUBLISH_SKIPPED_NO_IMAGES_SAMPLE_SIZE = 10
 PUBLISH_SKIPPED_NO_STOCK_SAMPLE_SIZE = 10
@@ -134,6 +137,57 @@ async def _emit_progress(progress: ProgressFn | None, done: int, total: int | No
     outcome = progress(done, total, message)
     if inspect.isawaitable(outcome):
         await outcome
+
+
+async def _run_bounded[T, R](
+    items: list[T],
+    worker: Callable[[T], Awaitable[R]],
+    *,
+    concurrency: int,
+    progress: ProgressFn | None,
+    progress_every: int,
+) -> list[R]:
+    """Run ``worker`` over ``items`` with at most ``concurrency`` in flight.
+
+    Results are returned in input order regardless of completion order. Tasks
+    are spawned lazily (one per free semaphore slot) so memory stays bounded
+    for very large inputs. Progress reports the number of COMPLETED items
+    every ``progress_every`` completions; the counter is only touched between
+    awaits, so it needs no lock, and emits are serialized so the reported
+    counts are monotonic. Exceptions the worker does not handle propagate and
+    cancel the remaining tasks.
+    """
+    if concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
+    total = len(items)
+    results: list[Any] = [None] * total
+    semaphore = asyncio.Semaphore(concurrency)
+    emit_lock = asyncio.Lock()
+    completed = 0
+
+    async def run(index: int, item: T) -> None:
+        nonlocal completed
+        try:
+            results[index] = await worker(item)
+            completed += 1
+            done = completed
+        finally:
+            semaphore.release()
+        if done % progress_every == 0:
+            message = f"{done}/{total} products processed"
+            async with emit_lock:
+                print(f"  ... {message}")
+                await _emit_progress(progress, done, total, message)
+
+    try:
+        async with asyncio.TaskGroup() as group:
+            for index, item in enumerate(items):
+                await semaphore.acquire()
+                group.create_task(run(index, item))
+    except ExceptionGroup as exc_group:
+        # Callers expect the original exception, as with the old sequential loop.
+        raise exc_group.exceptions[0] from None
+    return results
 
 
 def _new_bims_client(tenant: Tenant) -> BIMSClient:
@@ -590,27 +644,39 @@ async def apply_import(
     status: str,
     location_id: str = "",
     progress: ProgressFn | None = None,
+    concurrency: int = DEFAULT_SHOPIFY_CONCURRENCY,
 ) -> ImportResult:
-    """Create each product group via productSet, isolating failures per product."""
-    result = ImportResult()
-    for index, group in enumerate(groups, start=1):
+    """Create each product group via productSet, isolating failures per product.
+
+    Up to ``concurrency`` productSet calls run at once; result lists keep input order.
+    """
+
+    async def import_one(group: ProductGroup) -> tuple[str, dict[str, Any] | str]:
         skus = group_skus(group)
         if skus and (skus & existing_skus):
-            result.skipped_existing.append(group.title)
+            return "skipped", group.title
+        product_input = build_product_set_input(group, status=status, location_id=location_id)
+        try:
+            product = await shopify_client.product_set(product_input)
+        except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
+            return "failed", {"title": group.title, "error": f"{type(exc).__name__}: {exc}"}
+        return "created", {"title": group.title, "product_id": (product or {}).get("id")}
+
+    outcomes = await _run_bounded(
+        groups,
+        import_one,
+        concurrency=concurrency,
+        progress=progress,
+        progress_every=IMPORT_PROGRESS_EVERY,
+    )
+    result = ImportResult()
+    for kind, payload in outcomes:
+        if kind == "skipped":
+            result.skipped_existing.append(payload)  # type: ignore[arg-type]
+        elif kind == "failed":
+            result.failed.append(payload)  # type: ignore[arg-type]
         else:
-            product_input = build_product_set_input(group, status=status, location_id=location_id)
-            try:
-                product = await shopify_client.product_set(product_input)
-            except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
-                result.failed.append({"title": group.title, "error": f"{type(exc).__name__}: {exc}"})
-            else:
-                result.created.append({"title": group.title, "product_id": (product or {}).get("id")})
-
-        if index % IMPORT_PROGRESS_EVERY == 0:
-            message = f"{index}/{len(groups)} products processed"
-            print(f"  ... {message}")
-            await _emit_progress(progress, index, len(groups), message)
-
+            result.created.append(payload)  # type: ignore[arg-type]
     return result
 
 
@@ -1120,27 +1186,38 @@ async def apply_publish(
     *,
     publication_ids: list[str],
     progress: ProgressFn | None = None,
+    concurrency: int = DEFAULT_SHOPIFY_CONCURRENCY,
 ) -> PublishApplyResult:
     """Set each target to ACTIVE and publish it to the given publications.
 
     Isolates per-product failures the same way ``apply_cleanup`` does: one
     product failing (e.g. a transient Shopify error) does not abort the
-    rest of the batch.
+    rest of the batch. Different products overlap (up to ``concurrency``),
+    but the status-then-publish pair for ONE product is always sequential.
     """
-    result = PublishApplyResult()
-    for index, target in enumerate(targets, start=1):
+
+    async def publish_one(target: dict[str, Any]) -> dict[str, Any] | None:
         product_id = target["product_id"]
         try:
             await shopify_client.set_product_status(product_id, "ACTIVE")
             await shopify_client.publish_product(product_id, publication_ids)
         except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
-            result.failed.append({"product_id": product_id, "error": f"{type(exc).__name__}: {exc}"})
-        else:
+            return {"product_id": product_id, "error": f"{type(exc).__name__}: {exc}"}
+        return None
+
+    outcomes = await _run_bounded(
+        targets,
+        publish_one,
+        concurrency=concurrency,
+        progress=progress,
+        progress_every=PUBLISH_PROGRESS_EVERY,
+    )
+    result = PublishApplyResult()
+    for failure in outcomes:
+        if failure is None:
             result.processed += 1
-        if index % PUBLISH_PROGRESS_EVERY == 0:
-            message = f"{index}/{len(targets)} products processed"
-            print(f"  ... {message}")
-            await _emit_progress(progress, index, len(targets), message)
+        else:
+            result.failed.append(failure)
     return result
 
 
