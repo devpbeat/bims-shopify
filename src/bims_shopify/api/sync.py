@@ -237,12 +237,22 @@ async def _do_run_sync(
         # succeeded end-to-end.
         await sync_state_repo.set_last_run(tenant.id, run_started_at)
         await sync_state_repo.clear_last_error(tenant.id)
+        # Real per-phase durations, persisted so a minimum safe scheduler
+        # interval can be derived from measured runs instead of guessed.
+        timings = {
+            "catalog_pull_seconds": (
+                erp.last_catalog_pull.duration_seconds if erp.last_catalog_pull else None
+            ),
+            "stock_fetch_seconds": erp.last_stock_fetch_seconds,
+        }
         summary = {
             "status": "ok",
             "matched": len(deltas),
             "updated": len(deltas),
             "duration_seconds": duration,
             "ran_at": run_started_at.isoformat(),
+            "timings": timings,
+            "catalog_pull": erp.last_catalog_pull.summary() if erp.last_catalog_pull else None,
         }
         await sync_state_repo.set_last_run_summary(tenant.id, summary)
         logger.info(
@@ -260,7 +270,7 @@ async def _do_run_sync(
             tenant_id=tenant.id,
             payload={"matched": len(deltas), "updated": len(deltas)},
         )
-        return {"status": "ok", "synced_deltas": len(deltas)}
+        return {"status": "ok", "synced_deltas": len(deltas), "timings": timings}
     finally:
         await client.aclose()
 

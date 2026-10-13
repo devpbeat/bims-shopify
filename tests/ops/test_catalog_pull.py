@@ -160,6 +160,9 @@ async def test_status_reports_catalog_pull(tenant, monkeypatch):
     assert report["catalog_pull"]["complete"] is False
     assert report["catalog_pull"]["rows"] == 1
     assert report["catalog_pull"]["reported_count"] == 3
+    assert report["catalog_pull"]["duration_seconds"] >= 0
+    assert report["timings"]["catalog_pull_seconds"] == report["catalog_pull"]["duration_seconds"]
+    assert report["timings"]["stock_fetch_seconds"] >= 0
 
 
 async def test_diagnose_reports_catalog_pull_and_warns_when_a_miss_is_not_conclusive(

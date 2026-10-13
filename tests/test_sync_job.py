@@ -237,7 +237,10 @@ async def test_sync_job_force_pushes_end_to_end(
         job = await _wait_for_status(session_factory, job_id, {"succeeded", "failed"})
 
     assert job.status == "succeeded", job.error
-    assert job.result == {"status": "ok", "synced_deltas": 1}
+    assert job.result["status"] == "ok"
+    assert job.result["synced_deltas"] == 1
+    assert job.result["timings"]["catalog_pull_seconds"] > 0
+    assert job.result["timings"]["stock_fetch_seconds"] > 0
 
     # Same persistence as the HTTP path: last_run + product_hashes advance.
     from bims_shopify.adapters.persistence.sync_state_repository import (

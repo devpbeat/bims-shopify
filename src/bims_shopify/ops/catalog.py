@@ -77,6 +77,7 @@ import inspect
 import json
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -2023,7 +2024,9 @@ async def _run_status(
         bims_skus = {v.sku for g in grouping.groups for v in g.variants}
 
         all_skus = list(bims_skus)
+        stock_started = time.perf_counter()
         stock_by_sku = await fetch_stock_by_sku(bims_client, all_skus, tenant.stock_warehouse_ids)
+        stock_fetch_seconds = time.perf_counter() - stock_started
         bims_with_stock = sum(
             1
             for g in grouping.groups
@@ -2063,6 +2066,10 @@ async def _run_status(
             },
             "reconciliation": reconciliation,
             "catalog_pull": pull.summary(),
+            "timings": {
+                "catalog_pull_seconds": pull.duration_seconds,
+                "stock_fetch_seconds": stock_fetch_seconds,
+            },
             "last_activity": await _fetch_last_activity(tenant.id),
         }
 

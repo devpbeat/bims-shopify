@@ -334,3 +334,26 @@ async def test_get_reconciliation_requires_admin_auth(app_and_tenant):
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/sync/acme/reconciliation")
     assert response.status_code == 401
+
+
+async def test_sync_summary_persists_real_phase_timings(
+    app_and_tenant, mock_bims_one_product_and_shopify_variant
+):
+    """Per-phase durations are persisted (not just logged) so a minimum safe
+    scheduler interval can be derived from them later."""
+    transport = ASGITransport(app=app_and_tenant)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        run = await client.post(
+            "/sync/acme/run",
+            params={"dry_run": "false", "force": "true"},
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        status = await client.get(
+            "/sync/acme/status", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        )
+    summary = status.json()["last_run_summary"]
+    for timings in (run.json()["timings"], summary["timings"]):
+        assert 0 < timings["catalog_pull_seconds"] <= summary["duration_seconds"]
+        assert 0 < timings["stock_fetch_seconds"] <= summary["duration_seconds"]
+    assert summary["catalog_pull"]["rows"] == 1
+    assert summary["catalog_pull"]["complete"] is True
