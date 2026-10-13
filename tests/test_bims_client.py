@@ -62,3 +62,15 @@ def test_parse_sale_response_unconfirmed():
         {"status": "error", "code": "500", "retryable": False, "retry_after_ms": None, "message": "unknown"}
     )
     assert result.kind == SaleResultKind.UNCONFIRMED
+
+
+@respx.mock
+async def test_get_product_hits_documented_view_endpoint_with_id_param(bims_client, tenant):
+    route = respx.get(f"{tenant.bims_base_url}/api/products/view.json").mock(
+        return_value=httpx.Response(
+            200, json={"status": "ok", "code": "200", "data": {"Product": {"id": 1293603}}}
+        )
+    )
+    response = await bims_client.get_product(1293603)
+    assert route.calls.last.request.url.params["id"] == "1293603"
+    assert response["data"]["Product"]["id"] == 1293603

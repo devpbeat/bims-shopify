@@ -104,6 +104,10 @@ class BIMSClient:
         """GET /api/products/index.json. Supports ``last_update`` for incremental pulls."""
         return await self.get("/api/products/index.json", params=params)
 
+    async def get_product(self, product_id: int | str) -> dict[str, Any]:
+        """GET /api/products/view.json?id=... (single-product lookup, ``id`` required)."""
+        return await self.get("/api/products/view.json", params={"id": product_id})
+
     async def list_deleted_products(self, last_update: str) -> dict[str, Any]:
         """GET /api/products/deleted.json?last_update=... (required filter)."""
         return await self.get("/api/products/deleted.json", params={"last_update": last_update})
