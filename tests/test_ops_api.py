@@ -516,3 +516,76 @@ async def test_diagnose_query_is_stripped_and_extra_options_dropped(app_and_tena
         await _wait_for_status(session_factory, response.json()["job_id"], {"succeeded", "failed"})
 
     assert seen_options == [{"query": "TAG-77"}]
+
+
+async def _post_refresh(app, options):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.post(
+            "/ops/acme/run",
+            json={"command": "refresh", "options": options},
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+
+
+async def test_refresh_whitelists_options_and_drops_extras(app_and_tenant, monkeypatch):
+    app, _tenant, session_factory = app_and_tenant
+    seen_options: list[dict] = []
+
+    async def _capture_runner(tenant, options, progress):
+        seen_options.append(options)
+        return {"phases": {}}
+
+    monkeypatch.setitem(
+        __import__("bims_shopify.ops.job_runner", fromlist=["_COMMAND_RUNNERS"])._COMMAND_RUNNERS,
+        "refresh",
+        _capture_runner,
+    )
+
+    response = await _post_refresh(app, {"apply": True, "limit": 5, "publish": True, "full": True})
+    assert response.status_code == 200
+    await _wait_for_status(session_factory, response.json()["job_id"], {"succeeded", "failed"})
+
+    assert seen_options == [
+        {"apply": True, "only_with_stock": False, "require_images": True, "limit": 5}
+    ]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"limit": -1},
+        {"limit": "10"},
+        {"apply": "yes"},
+        {"only_with_stock": 1},
+        {"require_images": "false"},
+    ],
+)
+async def test_refresh_rejects_bad_options_with_422(app_and_tenant, options):
+    app, _tenant, _sf = app_and_tenant
+    response = await _post_refresh(app, options)
+    assert response.status_code == 422
+
+
+async def test_refresh_failure_marks_job_failed_but_keeps_partial_result(app_and_tenant, monkeypatch):
+    from bims_shopify.ops.refresh_job import RefreshFailed
+
+    app, _tenant, session_factory = app_and_tenant
+    partial = {"phases": {"import": {"products": 1}}, "failed_phase": "sync", "error": "boom"}
+
+    async def _failing_runner(tenant, options, progress):
+        raise RefreshFailed(partial)
+
+    monkeypatch.setitem(
+        __import__("bims_shopify.ops.job_runner", fromlist=["_COMMAND_RUNNERS"])._COMMAND_RUNNERS,
+        "refresh",
+        _failing_runner,
+    )
+
+    response = await _post_refresh(app, {})
+    assert response.status_code == 200
+    job = await _wait_for_status(session_factory, response.json()["job_id"], {"succeeded", "failed"})
+
+    assert job.status == "failed"
+    assert job.result == partial
+    assert "sync" in job.error

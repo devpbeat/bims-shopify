@@ -10,6 +10,8 @@ Usage::
     python -m bims_shopify.ops.catalog <tenant_slug> publish [--apply] [--limit N] \\
         [--no-require-images]
     python -m bims_shopify.ops.catalog <tenant_slug> diagnose <query>
+    python -m bims_shopify.ops.catalog <tenant_slug> refresh [--apply] [--only-with-stock] \\
+        [--limit N] [--no-require-images]
 
 ``wipe`` deletes every product in the tenant's Shopify store. ``import``
 rebuilds the catalog from the tenant's BIMS company (``tenant.bims_company_id``):
@@ -52,6 +54,13 @@ belongs to another company, missing ``code2``, duplicate ``code2``, no stock, no
 published -- or ``live``, plus the raw BIMS fields, per-warehouse stock and
 the Shopify product state. It exists to answer "product X is in BIMS but not
 in Shopify" without guessing.
+
+``refresh`` is the "do everything" composite: ``import`` -> ``sync`` ->
+``publish`` run in that order as one job (see ``ops/refresh_job.py``), with
+every phase's own report nested under ``phases``. ``--apply`` is a dry-run
+switch for all three phases; ``--only-with-stock`` goes to import,
+``--limit`` and ``--no-require-images`` to publish. It stops at the first
+failing phase.
 
 ``status`` pulls both sides (BIMS-eligible rows, Shopify's live catalog) and
 prints a reconciliation report: counts on each side, SKUs present in one but
@@ -2094,6 +2103,19 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         return await _run_publish(tenant, args)
     if args.command == "diagnose":
         return await _run_diagnose(tenant, args)
+    if args.command == "refresh":
+        # Local import: refresh_job imports this module.
+        from bims_shopify.ops.refresh_job import run_refresh
+
+        return await run_refresh(
+            tenant,
+            {
+                "apply": args.apply,
+                "only_with_stock": args.only_with_stock,
+                "require_images": args.require_images,
+                "limit": args.limit,
+            },
+        )
     return await _run_import(tenant, args)
 
 
@@ -2316,12 +2338,49 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Matched case-insensitively against BIMS id, code, code2, or part of the name.",
     )
 
+    refresh_parser = subparsers.add_parser(
+        "refresh",
+        help="Run import -> sync -> publish in order as one job (dry run unless --apply).",
+    )
+    refresh_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Execute all three phases (default: dry run for every phase).",
+    )
+    refresh_parser.add_argument(
+        "--only-with-stock",
+        dest="only_with_stock",
+        action="store_true",
+        help="Import phase: only import product groups that have stock > 0.",
+    )
+    refresh_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Publish phase: only publish the first N eligible products.",
+    )
+    refresh_parser.add_argument(
+        "--no-require-images",
+        dest="require_images",
+        action="store_false",
+        default=True,
+        help="Publish phase: also publish products with no images.",
+    )
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _build_arg_parser().parse_args(argv)
-    summary = asyncio.run(_run(args))
+    try:
+        summary = asyncio.run(_run(args))
+    except Exception as exc:
+        partial = getattr(exc, "report", None)
+        if not isinstance(partial, dict):
+            raise
+        # A failed composite command still prints what completed, then exits non-zero.
+        print(json.dumps(partial, indent=2))
+        raise SystemExit(1) from exc
     print(json.dumps(summary, indent=2))
 
 

@@ -13,6 +13,7 @@ with wipes/imports.
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -27,7 +28,7 @@ from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenant
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.config import Settings
 from bims_shopify.logging import get_logger
-from bims_shopify.ops import catalog, rekey_skus, sync_job
+from bims_shopify.ops import catalog, refresh_job, rekey_skus, sync_job
 
 logger = get_logger(__name__)
 
@@ -46,6 +47,7 @@ _COMMAND_RUNNERS = {
     "publish": catalog.run_publish,
     "diagnose": catalog.run_diagnose,
     "sync": sync_job.run_sync,
+    "refresh": refresh_job.run_refresh,
 }
 
 
@@ -141,6 +143,13 @@ class JobRunner:
             await self._update_progress(job_id, done, total, message)
 
         runner = _COMMAND_RUNNERS[command]
+        if command == "refresh" and self._tenant_sync_lock_provider is not None:
+            # The composite job's sync phase must serialize with the
+            # scheduler tick and manual HTTP sync, like a plain "sync" job.
+            # run_refresh holds the lock around that phase only.
+            runner = functools.partial(
+                runner, sync_lock=self._tenant_sync_lock_provider(tenant_id)
+            )
         try:
             result = await runner(tenant, options, progress)
         except SystemExit as exc:
@@ -148,7 +157,14 @@ class JobRunner:
             await self._audit_finished(tenant_id, job_id, command, "failed")
         except Exception as exc:  # a job failure must not crash the process
             logger.error("ops_job_failed", job_id=job_id, command=command, error=str(exc))
-            await self._mark_finished(job_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+            # Composite jobs (refresh) attach the partial report to the exception.
+            partial = getattr(exc, "report", None)
+            await self._mark_finished(
+                job_id,
+                status="failed",
+                result=partial if isinstance(partial, dict) else None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
             await self._audit_finished(tenant_id, job_id, command, "failed")
         else:
             await self._mark_finished(job_id, status="succeeded", result=result)

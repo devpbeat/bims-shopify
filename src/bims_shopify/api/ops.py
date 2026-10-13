@@ -35,6 +35,7 @@ _VALID_COMMANDS = {
     "publish",
     "diagnose",
     "sync",
+    "refresh",
 }
 
 #: Upper bound for the free-text ``diagnose`` query (an id, code or title).
@@ -53,6 +54,7 @@ class RunJobRequest(BaseModel):
         "publish",
         "diagnose",
         "sync",
+        "refresh",
     ]
     options: dict[str, Any] = Field(default_factory=dict)
 
@@ -121,6 +123,19 @@ def _validate_options(command: str, options: dict[str, Any]) -> dict[str, Any]:
             "limit": limit,
             "require_images": require_images,
         }
+
+    if command == "refresh":
+        limit = options.get("limit")
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise HTTPException(status_code=422, detail="options.limit must be a non-negative integer")
+        result = {}
+        for key, default in (("apply", False), ("only_with_stock", False), ("require_images", True)):
+            value = options.get(key, default)
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=422, detail=f"options.{key} must be a boolean")
+            result[key] = value
+        result["limit"] = limit
+        return result
 
     if command == "diagnose":
         query = options.get("query")
