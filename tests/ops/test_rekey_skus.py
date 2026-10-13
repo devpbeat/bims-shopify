@@ -748,6 +748,31 @@ async def test_bims_company6_index_pagination_collects_code2_across_pages(tenant
     assert result.unresolved == []
 
 
+@respx.mock
+async def test_bims_company6_index_survives_a_short_page_mid_catalog(tenant):
+    """A short page must not end the pull: SKUs after it are still collected."""
+    _mock_graphql_variants(
+        [_variant("gid://shopify/ProductVariant/1", "SKU-LATE", "gid://shopify/Product/1", "Widget")]
+    )
+
+    pages = {
+        0: [{"id": 1, "code2": "SKU-0"}, {"id": 2, "code2": "SKU-1"}, {"id": 3, "code2": "SKU-2"}],
+        3: [{"id": 4, "code2": "SKU-LATE"}],
+    }
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        offset = int(request.url.params.get("offset"))
+        return httpx.Response(200, json={"status": "ok", "count": 4, "data": pages.get(offset, [])})
+
+    respx.get(f"{BIMS_URL}/api/products/index.json").mock(side_effect=responder)
+    _mock_view_lookup({})
+
+    result = await scan(ShopifyClient(tenant), BIMSClient(tenant))
+
+    assert result.already_keyed == 1
+    assert result.unresolved == []
+
+
 def _bulk_delete_result() -> dict:
     return {
         "data": {

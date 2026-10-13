@@ -189,3 +189,12 @@ async def test_abnormal_stop_without_a_count_is_incomplete():
     fetch, _offsets = _scripted([same] * 5)
     pull = await paginate_products(fetch)
     assert pull.complete is False
+
+
+async def test_rows_without_an_id_still_trip_the_repeated_page_guard():
+    same = {"data": [{"code2": "A"}, {"code2": "B"}]}
+    fetch, offsets = _scripted([same] * 50)
+    pull = await paginate_products(fetch)
+    assert pull.stop_reason == "repeated_page"
+    assert len(pull.rows) == 2
+    assert len(offsets) == 2

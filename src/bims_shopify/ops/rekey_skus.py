@@ -39,6 +39,7 @@ from openpyxl.styles import Font
 from openpyxl.worksheet.worksheet import Worksheet
 
 from bims_shopify.adapters.bims.client import BIMSAPIError, BIMSClient
+from bims_shopify.adapters.bims.paging import paginate_products
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.adapters.persistence.database import create_engine_and_sessionmaker
@@ -190,9 +191,9 @@ async def fetch_company6_catalog(
     """
     code2_values: set[str] = set()
     code2_to_bims_id: dict[str, str] = {}
-    offset = 0
-    while True:
-        body = await bims_client.get(
+
+    async def fetch_page(offset: int) -> dict[str, Any]:
+        return await bims_client.get(
             "/api/products/index.json",
             params={
                 "mode": "simple",
@@ -201,19 +202,18 @@ async def fetch_company6_catalog(
                 "offset": offset,
             },
         )
-        page = body.get("data") or []
-        for item in page:
-            # mode=simple rows are wrapped as {"Product": {...}}.
-            product = item.get("Product") or item
-            code2 = product.get("code2")
-            if code2 not in (None, ""):
-                code2_values.add(str(code2))
-                bims_id = product.get("id")
-                if bims_id not in (None, ""):
-                    code2_to_bims_id[str(code2)] = str(bims_id)
-        if len(page) < BIMS_INDEX_PAGE_LIMIT:
-            return code2_values, code2_to_bims_id
-        offset += BIMS_INDEX_PAGE_LIMIT
+
+    # The shared pager stops on an EMPTY page (never a short one) and logs
+    # when the rows fall short of the server-reported count.
+    pull = await paginate_products(fetch_page)
+    for product in pull.rows:
+        code2 = product.get("code2")
+        if code2 not in (None, ""):
+            code2_values.add(str(code2))
+            bims_id = product.get("id")
+            if bims_id not in (None, ""):
+                code2_to_bims_id[str(code2)] = str(bims_id)
+    return code2_values, code2_to_bims_id
 
 
 async def fetch_company_code2_set(bims_client: BIMSClient, company_id: int) -> set[str]:

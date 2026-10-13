@@ -9,6 +9,7 @@ accumulated rows reach the server-reported ``count``.
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -80,7 +81,7 @@ async def paginate_products(
 
     ``fetch_page`` returns the raw response envelope for the given offset.
     Rows are unwrapped from ``{"Product": {...}}`` and de-duplicated by
-    ``id``. The pull also stops, flagged as incomplete, when a page brings no
+    ``id`` (by content when a row has none). The pull also stops, flagged as incomplete, when a page brings no
     new row (the server is ignoring ``offset``) or after ``max_pages``.
     """
     pull = PagedPull()
@@ -112,11 +113,12 @@ async def paginate_products(
         for item in page:
             row = item.get("Product") or item
             row_id = row.get("id")
-            if row_id is not None:
-                key = str(row_id)
-                if key in seen_ids:
-                    continue
-                seen_ids.add(key)
+            # Rows without an id fall back to their content so a repeated page
+            # of id-less rows is still detected.
+            key = str(row_id) if row_id is not None else json.dumps(row, sort_keys=True, default=str)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
             pull.rows.append(row)
             new_rows += 1
 
