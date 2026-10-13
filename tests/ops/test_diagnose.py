@@ -55,7 +55,7 @@ def test_filter_and_dedupe_rows_agrees_with_bims_gate_failure():
         {"id": 3, "name": "ex", "code2": "C", "enabled": True, "exclude_ecommerce": True},
         {"id": 4, "name": "nocode", "code2": "", "enabled": True},
     ]
-    rows, _, _ = filter_and_dedupe_rows(raws, company_id=None)
+    rows, _ = filter_and_dedupe_rows(raws)
     assert [r.bims_id for r in rows] == [
         str(r["id"]) for r in raws if bims_gate_failure(r) is None
     ]
@@ -1059,22 +1059,3 @@ async def test_fallback_degrades_gracefully_on_network_error(tenant, monkeypatch
     report = await catalog_ops.run_diagnose(tenant, {"query": "1293603"})
     assert report["found_via_direct_lookup"] is None
     assert "could not be completed" in " ".join(report["notes"])
-
-
-async def test_run_diagnose_reports_rows_by_company_over_the_raw_pull(tenant, monkeypatch):
-    from bims_shopify.ops import catalog as catalog_ops
-
-    _install_fakes(
-        monkeypatch,
-        raw_rows=[
-            {**_raw(1, "Blue Shirt (M)", code="TAG-9", code2="SKU-1"), "company_id": "1"},
-            {**_raw(2, "Other", code="TAG-8", code2="SKU-2"), "company_id": "6"},
-            {**_raw(3, "Other 2", code="TAG-7", code2="SKU-3"), "company_id": "6"},
-            _raw(4, "Nameless", code="TAG-6", code2="SKU-4"),
-        ],
-        stock_by_wh={},
-        products=[],
-    )
-    report = await catalog_ops.run_diagnose(tenant, {"query": "other"})  # no match in the tenant company -> unfiltered pull
-    assert report["searched_all_companies"] is True
-    assert report["rows_by_company"] == {"6": 2, "1": 1, "(missing company_id)": 1}

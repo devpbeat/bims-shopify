@@ -65,7 +65,7 @@ def test_split_size_suffix_no_suffix_returns_none():
 
 def test_filter_and_dedupe_rows_dedupes_by_code2_first_wins():
     raw = [_row("1", "Widget", "SKU-1"), _row("2", "Widget Dup", "SKU-1")]
-    rows, duplicates, _ = filter_and_dedupe_rows(raw, company_id=None)
+    rows, duplicates = filter_and_dedupe_rows(raw)
     assert len(rows) == 1
     assert rows[0].bims_id == "1"
     assert len(duplicates) == 1
@@ -79,68 +79,8 @@ def test_filter_and_dedupe_rows_excludes_disabled_and_ecommerce_excluded():
         _row("3", "C", ""),
         _row("4", "D", "SKU-D"),
     ]
-    rows, _, _ = filter_and_dedupe_rows(raw, company_id=None)
+    rows, _ = filter_and_dedupe_rows(raw)
     assert [r.code2 for r in rows] == ["SKU-D"]
-
-
-def _co(company, bims_id="1", code2="SKU", **kw) -> dict:
-    return {**_row(bims_id, "N", code2, **kw), "company_id": company}
-
-
-def test_filter_drops_and_counts_rows_of_another_company():
-    raw = [_co("6", "1", "A"), _co("1", "2", "B"), _co("1", "3", "C")]
-    rows, duplicates, dropped = filter_and_dedupe_rows(raw, company_id=6)
-    assert [r.code2 for r in rows] == ["A"]
-    assert dropped == 2
-    assert duplicates == []
-
-
-def test_filter_company_none_disables_the_gate():
-    raw = [_co("6", "1", "A"), _co("1", "2", "B")]
-    rows, _, dropped = filter_and_dedupe_rows(raw, company_id=None)
-    assert [r.code2 for r in rows] == ["A", "B"]
-    assert dropped == 0
-
-
-def test_filter_compares_company_ids_as_strings():
-    assert filter_and_dedupe_rows([_co("6", code2="A")], company_id=6)[2] == 0
-    assert filter_and_dedupe_rows([_co(6, code2="A")], company_id="6")[2] == 0
-    assert len(filter_and_dedupe_rows([_co("6", code2="A")], company_id=6)[0]) == 1
-
-
-def test_filter_company_gate_runs_before_other_gates_and_dedupe():
-    raw = [
-        _co("1", "1", "A", enabled=False),  # wrong company AND disabled
-        _co("1", "2", ""),  # wrong company AND missing code2
-        _co("1", "3", "DUP"),
-        _co("6", "4", "DUP"),
-        _co("6", "5", "DUP"),
-    ]
-    rows, duplicates, dropped = filter_and_dedupe_rows(raw, company_id=6)
-    assert dropped == 3
-    assert [r.bims_id for r in rows] == ["4"]
-    assert [d["bims_id"] for d in duplicates] == ["5"]
-
-
-def test_filter_keeps_rows_without_company_id():
-    rows, _, dropped = filter_and_dedupe_rows([_co(None, code2="A")], company_id=6)
-    assert len(rows) == 1 and dropped == 0
-
-
-def test_count_rows_by_company_counts_the_raw_pull_including_missing():
-    from bims_shopify.adapters.bims.company import MISSING_COMPANY_KEY, count_rows_by_company
-
-    raw = [
-        _co("1", "1", "A", enabled=False),
-        _co("1", "2", ""),
-        _co("1", "6", "F"),
-        _co(6, "3", "C"),
-        {"id": "4", "code2": "D"},
-        _co(None, "5", "E"),
-    ]
-    counts = count_rows_by_company(raw)
-    assert counts == {"1": 3, MISSING_COMPANY_KEY: 2, "6": 1}
-    assert list(counts) == ["1", MISSING_COMPANY_KEY, "6"]
 
 
 def test_group_rows_groups_size_suffixed_rows_into_one_product():
@@ -553,8 +493,6 @@ async def test_run_status_prints_full_reconciliation_report(monkeypatch, tmp_pat
         "eligible_products": 2,
         "eligible_variants": 2,
         "duplicate_code2": 0,
-        "dropped_wrong_company": 0,
-        "rows_by_company": {"(missing company_id)": 2},
         "with_stock": 1,
     }
     assert report["shopify"] == {"products": 1, "variants": 2, "variants_with_sku": 2}
