@@ -494,13 +494,21 @@ def _install_fakes(
     )
 
     class _FakeBims:
-        def __init__(self, tenant):
+        def __init__(self, tenant, **kwargs):
             pass
 
         async def get(self, path, params=None):
             rec.catalog_params.append(dict(params or {}))
             offset = (params or {}).get("offset", 0)
-            page = raw_rows[offset : offset + catalog_ops.BIMS_PAGE_LIMIT]
+            company = (params or {}).get("company_id")
+            visible = [
+                r
+                for r in raw_rows
+                if company is None
+                or r.get("company_id") is None
+                or str(r["company_id"]) == str(company)
+            ]
+            page = visible[offset : offset + catalog_ops.BIMS_PAGE_LIMIT]
             return {"data": [{"Product": r} for r in page]}
 
         async def stock_fenicio(self, *, skus, warehouse_ids, request_id):
@@ -589,8 +597,8 @@ async def test_run_diagnose_end_to_end_reports_live_row(tenant, monkeypatch):
         "checking stock",
         "scanning Shopify",
     ]
-    # Full catalog, no incremental filter, richer mode so `code` is present.
-    assert all(p["mode"] == "full" for p in rec.catalog_params)
+    # Full catalog, no incremental filter, cheap "simple" mode.
+    assert all(p["mode"] == "simple" for p in rec.catalog_params)
     assert all("last_update" not in p for p in rec.catalog_params)
 
 
@@ -814,7 +822,7 @@ def test_other_company_rows_do_not_affect_duplicates_or_groups():
     assert mine.duplicate_of is None
 
 
-async def test_run_diagnose_pulls_every_company_and_finds_other_company_rows(tenant, monkeypatch):
+async def test_run_diagnose_falls_back_to_every_company_and_finds_other_company_rows(tenant, monkeypatch):
     from bims_shopify.ops import catalog as catalog_ops
 
     tenant.bims_company_id = 6
@@ -826,7 +834,98 @@ async def test_run_diagnose_pulls_every_company_and_finds_other_company_rows(ten
     )
     report = await catalog_ops.run_diagnose(tenant, {"query": "blue shirt"})
 
-    assert all("company_id" not in p for p in rec.catalog_params)
+    assert "company_id" in rec.catalog_params[0]
+    assert "company_id" not in rec.catalog_params[-1]
+    assert report["searched_all_companies"] is True
     assert report["total_matches"] == 1
     assert report["rows"][0]["verdict"] == "wrong_company"
     assert report["rows"][0]["wrong_company"] == {"row_company_id": 2, "tenant_company_id": 6}
+
+
+# -- two-phase company pull, simple mode, configurable timeout ---------------
+
+
+async def test_phase_two_is_skipped_when_the_tenant_company_matches(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.bims_company_id = 6
+    rec = _install_fakes(
+        monkeypatch,
+        raw_rows=[
+            _company_raw(1, 6, name="Jerico Mine", code2="A"),
+            _company_raw(2, 2, name="Jerico Other", code2="B"),
+        ],
+        stock_by_wh={},
+        products=[],
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "jerico"})
+
+    assert report["searched_all_companies"] is False
+    assert [r["bims"]["id"] for r in report["rows"]] == [1]
+    assert all(p.get("company_id") == 6 for p in rec.catalog_params)
+
+
+async def test_phase_two_runs_only_when_phase_one_is_empty(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    tenant.bims_company_id = 6
+    rec = _install_fakes(
+        monkeypatch,
+        raw_rows=[_company_raw(2, 2, name="Jerico Other", code2="B")],
+        stock_by_wh={},
+        products=[],
+    )
+    messages: list[str] = []
+    report = await catalog_ops.run_diagnose(
+        tenant, {"query": "jerico"}, progress=lambda d, t, m: messages.append(m)
+    )
+
+    assert report["searched_all_companies"] is True
+    assert report["rows"][0]["verdict"] == "wrong_company"
+    assert [p.get("company_id") for p in rec.catalog_params] == [6, None]
+    assert "pulling BIMS catalog (all companies)" in messages
+
+
+async def test_not_found_anywhere_is_reported_as_searched_everywhere(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    _install_fakes(monkeypatch, raw_rows=[_raw(1)], stock_by_wh={}, products=[])
+    report = await catalog_ops.run_diagnose(tenant, {"query": "no-such-thing"})
+    assert report["total_matches"] == 0
+    assert report["searched_all_companies"] is True
+
+
+async def test_diagnose_requests_simple_mode_in_both_phases(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    rec = _install_fakes(monkeypatch, raw_rows=[], stock_by_wh={}, products=[])
+    await catalog_ops.run_diagnose(tenant, {"query": "x"})
+    assert [p["mode"] for p in rec.catalog_params] == ["simple", "simple"]
+
+
+def test_bims_client_timeout_is_configurable_with_a_conservative_default(tenant):
+    from bims_shopify.adapters.bims.client import DEFAULT_TIMEOUT_SECONDS
+
+    assert BIMSClient(tenant)._client.timeout.read == DEFAULT_TIMEOUT_SECONDS == 30.0
+    assert BIMSClient(tenant, timeout=7.0)._client.timeout.read == 7.0
+
+
+async def test_catalog_commands_build_the_bims_client_with_the_catalog_timeout(
+    tenant, monkeypatch
+):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    seen: list[dict] = []
+    rec = _install_fakes(monkeypatch, raw_rows=[], stock_by_wh={}, products=[])
+    fake_cls = catalog_ops.BIMSClient
+
+    class _Spy(fake_cls):  # type: ignore[misc, valid-type]
+        def __init__(self, tenant, **kwargs):
+            seen.append(kwargs)
+            super().__init__(tenant)
+
+    monkeypatch.setattr(catalog_ops, "BIMSClient", _Spy)
+    await catalog_ops.run_diagnose(tenant, {"query": "x"})
+    assert seen == [{"timeout": catalog_ops.CATALOG_PULL_TIMEOUT_SECONDS}]
+    assert catalog_ops.CATALOG_PULL_TIMEOUT_SECONDS == 120.0
+    assert rec.catalog_params

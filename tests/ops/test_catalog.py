@@ -608,7 +608,7 @@ async def test_run_dedupe_dry_run_reports_without_deleting(tenant):
     from bims_shopify.ops import catalog as catalog_ops
 
     class _FakeShopifyClient:
-        def __init__(self, tenant):
+        def __init__(self, tenant, **kwargs):
             pass
 
         async def iter_all_products_with_skus(self):
@@ -638,7 +638,7 @@ async def test_run_dedupe_safety_guard_blocks_over_60_percent(tenant):
     from bims_shopify.ops import catalog as catalog_ops
 
     class _FakeShopifyClient:
-        def __init__(self, tenant):
+        def __init__(self, tenant, **kwargs):
             pass
 
         async def iter_all_products_with_skus(self):
@@ -669,7 +669,7 @@ async def test_run_dedupe_safety_guard_blocks_over_60_percent(tenant):
 
 def _fix_tracking_fake_client(variants: list[dict], calls: dict):
     class _FakeShopifyClient:
-        def __init__(self, tenant):
+        def __init__(self, tenant, **kwargs):
             pass
 
         async def iter_all_variants(self):
@@ -783,7 +783,7 @@ async def test_run_fix_tracking_isolates_per_product_failures(tenant):
     ]
 
     class _FailingFakeClient:
-        def __init__(self, tenant):
+        def __init__(self, tenant, **kwargs):
             pass
 
         async def iter_all_variants(self):
@@ -931,7 +931,7 @@ async def test_apply_cleanup_delete_mode_deletes_products():
 
 def _cleanup_fake_clients(products: list[dict], stock_by_sku: dict[str, float], calls: dict):
     class _FakeShopifyClient:
-        def __init__(self, tenant):
+        def __init__(self, tenant, **kwargs):
             pass
 
         async def iter_all_products_with_skus(self):
@@ -948,7 +948,7 @@ def _cleanup_fake_clients(products: list[dict], stock_by_sku: dict[str, float], 
             pass
 
     class _FakeBimsClient:
-        def __init__(self, tenant):
+        def __init__(self, tenant, **kwargs):
             pass
 
         async def stock_fenicio(self, *, skus, warehouse_ids, request_id):
@@ -1492,7 +1492,7 @@ async def test_apply_publish_sets_active_and_publishes_isolating_failures():
 
 def _publish_fake_clients(products: list[dict], stock_by_sku: dict[str, float], calls: dict):
     class _FakeShopifyClient:
-        def __init__(self, tenant):
+        def __init__(self, tenant, **kwargs):
             pass
 
         async def iter_all_products_with_skus(self):
@@ -1515,7 +1515,7 @@ def _publish_fake_clients(products: list[dict], stock_by_sku: dict[str, float], 
             pass
 
     class _FakeBimsClient:
-        def __init__(self, tenant):
+        def __init__(self, tenant, **kwargs):
             pass
 
         async def stock_fenicio(self, *, skus, warehouse_ids, request_id):
@@ -1657,7 +1657,7 @@ async def test_run_publish_missing_online_store_publication_raises():
     from bims_shopify.ops import catalog as catalog_ops
 
     class _NoOnlineStoreShopifyClient:
-        def __init__(self, tenant):
+        def __init__(self, tenant, **kwargs):
             pass
 
         async def iter_all_products_with_skus(self):
@@ -1671,7 +1671,7 @@ async def test_run_publish_missing_online_store_publication_raises():
             pass
 
     class _FakeBimsClient:
-        def __init__(self, tenant):
+        def __init__(self, tenant, **kwargs):
             pass
 
         async def aclose(self):

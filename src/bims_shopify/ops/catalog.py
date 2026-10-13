@@ -114,6 +114,12 @@ PUBLISH_SKIPPED_NO_STOCK_SAMPLE_SIZE = 10
 PUBLISH_UNKNOWN_SAMPLE_SIZE = 10
 DIAGNOSE_MAX_MATCHES = 25
 ONLINE_STORE_PUBLICATION_NAME = "Online Store"
+#: Per-request timeout for the ops commands' BIMS client. Paged catalog reads
+#: (250 rows per page, more for ``mode=full`` or an unfiltered pull) routinely
+#: exceed the client's 30s default, which is tuned for the sale-writing path
+#: where retries make a long timeout counterproductive. Ops commands only
+#: read from BIMS, so a generous timeout is safe here.
+CATALOG_PULL_TIMEOUT_SECONDS = 120.0
 
 #: Progress callback signature shared by the CLI and the background job
 #: runner: (done, total-or-None, human message). May be sync or async.
@@ -126,6 +132,10 @@ async def _emit_progress(progress: ProgressFn | None, done: int, total: int | No
     outcome = progress(done, total, message)
     if inspect.isawaitable(outcome):
         await outcome
+
+
+def _new_bims_client(tenant: Tenant) -> BIMSClient:
+    return BIMSClient(tenant, timeout=CATALOG_PULL_TIMEOUT_SECONDS)
 
 
 def _print_progress(done: int, total: int | None, message: str) -> None:
@@ -364,14 +374,15 @@ async def fetch_bims_catalog_rows(
     ``mode`` defaults to ``"simple"``, which returns only (id, name, code2,
     sell_price, enabled, exclude_ecommerce, company_id) at roughly 3x the
     throughput of ``"full"`` -- every existing caller relies on that.
-    Pass ``mode="full"`` only for one-off, human-triggered diagnostics
-    (``diagnose``) that need fields ``simple`` omits, such as ``code``; the
-    slower pull is acceptable there but not for scheduled imports.
+    Pass ``mode="full"`` only for one-off, human-triggered work that needs
+    fields ``simple`` omits; it is much slower per page and a full-mode,
+    unfiltered 250-row page can exceed even a generous request timeout.
+    ``diagnose`` does NOT use it.
 
     ``company_id`` is a SERVER-SIDE filter: products of any other company
     never come back. Every import path passes the tenant's company. Pass
     ``None`` to omit the param and get every company's products -- only
-    ``diagnose`` does, so it can say "this product belongs to another
+    ``diagnose``'s fallback phase does, so it can say "this product belongs to another
     company" instead of "no matches". The unfiltered catalog is larger than
     one company's (by however many products the other companies own) and the
     page loop is sequential, so the runtime grows with it; acceptable for a
@@ -917,7 +928,7 @@ async def _run_cleanup_no_stock(
     if mode not in ("draft", "delete"):
         raise SystemExit(f"cleanup_no_stock: invalid mode '{mode}' (must be 'draft' or 'delete')")
 
-    bims_client = BIMSClient(tenant)
+    bims_client = _new_bims_client(tenant)
     shopify_client = ShopifyClient(tenant)
     try:
         await _emit_progress(progress, 0, None, "scanning Shopify catalog")
@@ -1133,7 +1144,7 @@ async def _run_publish(
     anything), so it intentionally has no safety-guard ratio/``--force``
     escape hatch.
     """
-    bims_client = BIMSClient(tenant)
+    bims_client = _new_bims_client(tenant)
     shopify_client = ShopifyClient(tenant)
     try:
         await _emit_progress(progress, 0, None, "resolving Online Store publication")
@@ -1230,6 +1241,7 @@ class DiagnoseReport:
     diagnoses: list[RowDiagnosis] = field(default_factory=list)
     online_store_publication_id: str | None = None
     notes: list[str] = field(default_factory=list)
+    searched_all_companies: bool = False
 
 
 def match_catalog_rows(raw_rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
@@ -1240,6 +1252,10 @@ def match_catalog_rows(raw_rows: list[dict[str, Any]], query: str) -> list[dict[
     code would drown the operator in noise -- while ``name`` matches on a
     substring so a partial title returns every product/size that contains it.
     A blank query matches nothing.
+
+    ``code`` is only present in ``mode=full`` rows and is null on every
+    sampled mystore row (see ``docs/bims-api-notes.md``), so for such tenants
+    matching it is a harmless no-op; ``diagnose`` pulls ``mode=simple``.
     """
     needle = query.strip().casefold()
     if not needle:
@@ -1471,6 +1487,7 @@ def build_diagnose_report(report: DiagnoseReport) -> dict[str, Any]:
         "total_matches": report.total_matches,
         "diagnosed": len(report.diagnoses),
         "truncated": report.total_matches > len(report.diagnoses),
+        "searched_all_companies": report.searched_all_companies,
         "online_store_publication_id": report.online_store_publication_id,
         "notes": report.notes,
         "verdict_counts": verdict_counts,
@@ -1486,30 +1503,37 @@ async def _run_diagnose(
     STRICTLY read-only: it only pulls from BIMS and Shopify, never mutates
     either, writes no audit row, and has no ``apply`` option.
 
-    The BIMS catalog is pulled in ``mode="full"`` (not the ``simple`` mode
-    every other command uses) because ``simple`` omits ``code`` -- the field
-    printed on the physical tag an operator searches by. ``full`` is roughly
-    3x slower per page, an acceptable price for a one-off, human-triggered
-    diagnostic. The pull is a full-catalog one (no ``last_update`` filter,
-    and no ``company_id`` filter so rows of other companies surface as
-    ``wrong_company`` instead of "no matches"): duplicate detection and
-    product grouping need every row of the tenant's company.
+    The BIMS catalog is pulled in ``mode="simple"`` with no ``last_update``
+    filter (duplicate detection and product grouping need every row of the
+    tenant's company). The pull is two-phase: phase 1 filters by the tenant's
+    ``company_id`` (fast; covers essentially every real query). Only when it
+    yields ZERO matches does phase 2 re-pull WITHOUT the company filter, so a
+    product of another company still gets a ``wrong_company`` verdict instead
+    of a dead-end "no matches". ``searched_all_companies`` in the report says
+    which of the two answered.
     """
     query = (args.query or "").strip()
     if not query:
         raise SystemExit("diagnose: a non-empty query is required")
 
-    bims_client = BIMSClient(tenant)
+    bims_client = _new_bims_client(tenant)
     shopify_client = ShopifyClient(tenant)
     try:
         await _emit_progress(progress, 0, None, "pulling BIMS catalog")
         raw_rows = await fetch_bims_catalog_rows(
-            bims_client,
-            None,  # every company: a row of another company must be explained, not hidden
-            tenant_timezone=tenant.bims_timezone,
-            mode="full",
+            bims_client, tenant.bims_company_id, tenant_timezone=tenant.bims_timezone
         )
         all_matches = match_catalog_rows(raw_rows, query)
+        searched_all_companies = False
+        if not all_matches:
+            # Nothing in the tenant's company: look at every company so a
+            # product that belongs elsewhere is explained, not hidden.
+            await _emit_progress(progress, 0, None, "pulling BIMS catalog (all companies)")
+            raw_rows = await fetch_bims_catalog_rows(
+                bims_client, None, tenant_timezone=tenant.bims_timezone
+            )
+            all_matches = match_catalog_rows(raw_rows, query)
+            searched_all_companies = True
         matched = all_matches[:DIAGNOSE_MAX_MATCHES]
 
         await _emit_progress(progress, 0, None, "checking stock")
@@ -1558,6 +1582,7 @@ async def _run_diagnose(
                 diagnoses=diagnoses,
                 online_store_publication_id=publication_id,
                 notes=notes,
+                searched_all_companies=searched_all_companies,
             )
         )
     finally:
@@ -1652,7 +1677,7 @@ async def _run_import(
 ) -> dict[str, Any]:
     since = _parse_since(getattr(args, "since_iso", None))
 
-    bims_client = BIMSClient(tenant)
+    bims_client = _new_bims_client(tenant)
     shopify_client = ShopifyClient(tenant)
     try:
         await _emit_progress(
@@ -1800,7 +1825,7 @@ async def _fetch_last_activity(tenant_id: int) -> dict[str, Any]:
 async def _run_status(
     tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
 ) -> dict[str, Any]:
-    bims_client = BIMSClient(tenant)
+    bims_client = _new_bims_client(tenant)
     shopify_client = ShopifyClient(tenant)
     try:
         await _emit_progress(progress, 0, None, "pulling BIMS catalog")
