@@ -76,6 +76,7 @@ from typing import Any
 import httpx
 
 from bims_shopify.adapters.bims.client import BIMSAPIError, BIMSClient
+from bims_shopify.adapters.bims.company import count_rows_by_company, is_other_company
 from bims_shopify.adapters.bims.paging import PagedPull, paginate_products
 from bims_shopify.adapters.bims.timezones import to_bims_local
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
@@ -243,14 +244,24 @@ def has_stock(stock_by_sku: dict[str, float], sku: str) -> bool:
     return stock_by_sku.get(sku, 0.0) > 0
 
 
-def filter_and_dedupe_rows(raw_rows: list[dict[str, Any]]) -> tuple[list[BimsRow], list[dict[str, Any]]]:
-    """Keep enabled, e-commerce-visible rows with a non-empty ``code2``.
+def filter_and_dedupe_rows(
+    raw_rows: list[dict[str, Any]], *, company_id: int | str | None
+) -> tuple[list[BimsRow], list[dict[str, Any]], int]:
+    """Keep the tenant's enabled, e-commerce-visible rows with a non-empty ``code2``.
 
+    BIMS ignores the ``company_id`` query param, so the company gate runs
+    here, FIRST, comparing ids as strings. ``company_id=None`` disables it.
     Deduplicates by ``code2``: the first row wins, later ones are reported.
+    Returns ``(rows, duplicates, dropped_wrong_company)``; rows dropped for
+    another company are counted, never dropped silently.
     """
     seen: dict[str, BimsRow] = {}
     duplicates: list[dict[str, Any]] = []
+    dropped_wrong_company = 0
     for raw in raw_rows:
+        if is_other_company(raw, company_id):
+            dropped_wrong_company += 1
+            continue
         if bims_gate_failure(raw) is not None:
             continue
         code2 = str(raw["code2"])
@@ -266,7 +277,7 @@ def filter_and_dedupe_rows(raw_rows: list[dict[str, Any]]) -> tuple[list[BimsRow
             duplicates.append({"code2": code2, "bims_id": row.bims_id, "name": row.name})
             continue
         seen[code2] = row
-    return list(seen.values()), duplicates
+    return list(seen.values()), duplicates, dropped_wrong_company
 
 
 def _option_value_for(variant: VariantRow) -> str:
@@ -1258,6 +1269,7 @@ class DiagnoseReport:
     notes: list[str] = field(default_factory=list)
     searched_all_companies: bool = False
     catalog_pull: dict[str, Any] | None = None
+    rows_by_company: dict[str, int] | None = None
     #: ``True``/``False`` once the single-product fallback ran and got a clear
     #: answer; ``None`` when it was skipped or its outcome is unknown.
     found_via_direct_lookup: bool | None = None
@@ -1345,26 +1357,13 @@ class _PipelineView:
     shadowed_by_sku: dict[str, dict[str, Any]]
 
 
-def _is_other_company(raw: dict[str, Any], tenant_company_id: int | None) -> bool:
-    """True when the row carries a ``company_id`` different from the tenant's.
-
-    Compared as strings (BIMS may send ids as strings). A row without a
-    ``company_id``, or no tenant company to compare against, is never "other".
-    """
-    row_company = raw.get("company_id")
-    if tenant_company_id is None or row_company is None:
-        return False
-    return str(row_company) != str(tenant_company_id)
-
-
 def _pipeline_view(
     raw_rows: list[dict[str, Any]], tenant_company_id: int | None = None
 ) -> _PipelineView:
     # Runs the REAL pipeline functions so a diagnosis cannot drift from them.
     # The import only ever receives the tenant's own company (server-side
     # filter), so other companies' rows must not take part in dedupe/grouping.
-    own_rows = [r for r in raw_rows if not _is_other_company(r, tenant_company_id)]
-    rows, _duplicates = filter_and_dedupe_rows(own_rows)
+    rows, _duplicates, _dropped = filter_and_dedupe_rows(raw_rows, company_id=tenant_company_id)
     grouping = group_rows(rows)
     group_by_sku = {v.sku: g for g in grouping.groups for v in g.variants}
     shadowed_by_sku = {
@@ -1481,7 +1480,7 @@ def compute_diagnosis(
 
         gate = (
             "wrong_company"
-            if _is_other_company(raw, tenant_company_id)
+            if is_other_company(raw, tenant_company_id)
             else bims_gate_failure(raw)
         )
         if gate == "wrong_company":
@@ -1553,6 +1552,7 @@ def build_diagnose_report(report: DiagnoseReport) -> dict[str, Any]:
         "truncated": report.total_matches > len(report.diagnoses),
         "searched_all_companies": report.searched_all_companies,
         "catalog_pull": report.catalog_pull,
+        "rows_by_company": report.rows_by_company,
         "found_via_direct_lookup": report.found_via_direct_lookup,
         "direct_lookup_row": report.direct_lookup_row,
         "online_store_publication_id": report.online_store_publication_id,
@@ -1669,6 +1669,7 @@ async def _run_diagnose(
                 notes=notes,
                 searched_all_companies=searched_all_companies,
                 catalog_pull=pull.summary(),
+                rows_by_company=count_rows_by_company(raw_rows),
                 found_via_direct_lookup=found_via_direct_lookup,
                 direct_lookup_row=direct_lookup_row,
             )
@@ -1780,7 +1781,9 @@ async def _run_import(
             since=since,
             tenant_timezone=tenant.bims_timezone,
         )
-        rows, duplicates = filter_and_dedupe_rows(pull.rows)
+        rows, duplicates, dropped_wrong_company = filter_and_dedupe_rows(
+            pull.rows, company_id=tenant.bims_company_id
+        )
         grouping = group_rows(rows)
         groups = grouping.groups
 
@@ -1798,6 +1801,8 @@ async def _run_import(
             "products": len(groups),
             "variants": sum(len(g.variants) for g in groups),
             "duplicate_code2": len(duplicates),
+            "dropped_wrong_company": dropped_wrong_company,
+            "rows_by_company": count_rows_by_company(pull.rows),
             "split_products": grouping.split_products,
             "shadowed_size_duplicates": {
                 "count": len(grouping.shadowed_size_duplicates),
@@ -1919,7 +1924,9 @@ async def _run_status(
     try:
         await _emit_progress(progress, 0, None, "pulling BIMS catalog")
         pull = await fetch_bims_catalog_pull(bims_client, tenant.bims_company_id)
-        rows, duplicates = filter_and_dedupe_rows(pull.rows)
+        rows, duplicates, dropped_wrong_company = filter_and_dedupe_rows(
+            pull.rows, company_id=tenant.bims_company_id
+        )
         grouping = group_rows(rows)
         bims_skus = {v.sku for g in grouping.groups for v in g.variants}
 
@@ -1955,6 +1962,8 @@ async def _run_status(
                 "eligible_products": len(grouping.groups),
                 "eligible_variants": len(rows),
                 "duplicate_code2": len(duplicates),
+                "dropped_wrong_company": dropped_wrong_company,
+                "rows_by_company": count_rows_by_company(pull.rows),
                 "with_stock": bims_with_stock,
             },
             "shopify": {

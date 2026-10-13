@@ -183,3 +183,20 @@ async def test_diagnose_complete_pull_adds_no_incompleteness_note(tenant, monkey
     report = await catalog_ops.run_diagnose(tenant, {"query": "shirt 1"})
     assert report["catalog_pull"]["complete"] is True
     assert report["notes"] == []
+
+
+async def test_import_drops_other_companies_and_reports_the_split(tenant, monkeypatch):
+    # tenant.bims_company_id is 1 in the shared fixture.
+    rows = [
+        _product(1, company_id="1"),
+        _product(2, company_id="6"),
+        _product(3, company_id="6"),
+        _product(4),
+    ]
+    _install(monkeypatch, [{"count": 4, "data": rows}, {"count": 4, "data": []}])
+    args = catalog_ops._build_arg_parser().parse_args(["acme", "import"])
+    summary = await catalog_ops._run_import(tenant, args)
+
+    assert summary["dropped_wrong_company"] == 2
+    assert summary["variants"] == 2
+    assert summary["rows_by_company"] == {"6": 2, "1": 1, "(missing company_id)": 1}
