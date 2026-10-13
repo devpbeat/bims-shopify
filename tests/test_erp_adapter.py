@@ -66,10 +66,17 @@ async def test_pagination_exhausts_all_pages(bims_client, tenant):
 
 
 @respx.mock
-async def test_filters_disabled_excluded_and_other_company_rows(bims_client, tenant):
-    """BIMS ignores the ``company_id`` query param (a pull for company 6 came
-    back with company 1 rows), so the sync enforces the tenant company
-    client-side and counts what it drops instead of dropping it silently.
+async def test_filters_disabled_and_excluded_but_keeps_other_companies(bims_client, tenant):
+    """company_id must NOT be used to drop rows.
+
+    ``products/index.json`` only ever returns the API key's default/current
+    company (here, company 1) regardless of any requested company_id --
+    the BIMS API key, not a query param, determines company scoping. The
+    catalog import (``filter_and_dedupe_rows`` in ``ops/catalog.py``) never
+    filtered by company_id, relying on ``code2`` as the cross-company join
+    key with stock fetched independently via stock_fenicio. The sync must
+    match that behavior instead of silently dropping every row whose
+    company_id happens to differ from ``tenant.bims_company_id``.
     """
     data = [
         _product(id=1, code2="OK-1", enabled=True, exclude_ecommerce=False, company_id="6"),
@@ -102,11 +109,10 @@ async def test_filters_disabled_excluded_and_other_company_rows(bims_client, ten
     adapter = BIMSERPAdapter(bims_client)
     snapshots = await adapter.list_products(tenant)
 
-    assert {s.sku for s in snapshots} == {"OK-1"}
+    assert {s.sku for s in snapshots} == {"OK-1", "OTHER-CO"}
     by_sku = {s.sku: s for s in snapshots}
     assert by_sku["OK-1"].stock == 5
-    assert adapter.last_dropped_wrong_company == 1
-    assert adapter.last_rows_by_company == {"6": 4, "7": 1}
+    assert by_sku["OTHER-CO"].stock == 3
 
 
 @respx.mock
