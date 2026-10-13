@@ -11,6 +11,10 @@ from bims_shopify.adapters.bims.client import BIMSClient
 from bims_shopify.adapters.bims.erp_adapter import BIMSERPAdapter
 
 
+# These mocks script BIMS responses by call order, so page sequentially.
+pytestmark = pytest.mark.usefixtures("sequential_paging")
+
+
 def _product(**overrides):
     base = {
         "id": 1,

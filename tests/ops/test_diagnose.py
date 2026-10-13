@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 import respx
 
 from bims_shopify.adapters.bims.client import BIMSClient
@@ -11,6 +12,10 @@ from bims_shopify.ops.catalog import (
     filter_and_dedupe_rows,
     has_stock,
 )
+
+# These mocks script BIMS responses by call order, so page sequentially.
+pytestmark = pytest.mark.usefixtures("sequential_paging")
+
 
 BIMS_URL = "https://bims.example.com"
 

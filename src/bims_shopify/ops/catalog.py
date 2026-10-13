@@ -432,6 +432,7 @@ async def fetch_bims_catalog_pull(
     since: datetime | None = None,
     tenant_timezone: str = "America/Asuncion",
     mode: str = "simple",
+    page_concurrency: int | None = None,
 ) -> PagedPull:
     """Page through BIMS ``/api/products/index.json`` and report completeness.
 
@@ -475,7 +476,9 @@ async def fetch_bims_catalog_pull(
             "/api/products/index.json", params={**params, "offset": offset}
         )
 
-    return await paginate_products(fetch_page)
+    return await paginate_products(
+        fetch_page, page_size=BIMS_PAGE_LIMIT, concurrency=page_concurrency
+    )
 
 
 async def fetch_bims_catalog_rows(

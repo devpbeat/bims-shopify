@@ -70,6 +70,7 @@ async def test_complete_false_when_rows_fall_short_of_reported_count():
         "pages": 2,
         "stop_reason": "empty_page",
         "warnings": pull.warnings,
+        "duration_seconds": pull.duration_seconds,
     }
     assert any("4" in w and "10" in w for w in pull.warnings)
 
@@ -198,3 +199,119 @@ async def test_rows_without_an_id_still_trip_the_repeated_page_guard():
     assert pull.stop_reason == "repeated_page"
     assert len(pull.rows) == 2
     assert len(offsets) == 2
+
+
+# -- windowed (concurrent) paging ---------------------------------------------
+
+
+def _catalog_server(total: int, page_size: int, *, short_page_at: int | None = None):
+    """A fake BIMS serving ``total`` rows; records offsets and max in-flight requests."""
+    import asyncio
+
+    state = {"in_flight": 0, "max_in_flight": 0, "offsets": []}
+
+    async def fetch_page(offset: int) -> dict[str, Any]:
+        state["offsets"].append(offset)
+        state["in_flight"] += 1
+        state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+        await asyncio.sleep(0.01)
+        state["in_flight"] -= 1
+        size = page_size
+        if short_page_at is not None and offset == short_page_at:
+            size = page_size - 2
+        n = max(0, min(size, total - offset))
+        return {"count": total, "data": _rows(offset + 1, n)}
+
+    return fetch_page, state
+
+
+async def test_windowed_pull_equals_sequential_pull():
+    fetch_a, _ = _catalog_server(23, 5)
+    fetch_b, _ = _catalog_server(23, 5)
+    sequential = await paginate_products(fetch_a)
+    windowed = await paginate_products(fetch_b, page_size=5, concurrency=4)
+    assert windowed.rows == sequential.rows
+    assert windowed.stop_reason == "empty_page"
+    assert windowed.complete is True
+    assert windowed.reported_count == 23
+    assert windowed.pages == sequential.pages
+
+
+async def test_windowed_overshoot_is_a_normal_termination():
+    # 10 rows / 5 per page: page 3 is empty; the window overshoots further.
+    fetch, _ = _catalog_server(10, 5)
+    pull = await paginate_products(fetch, page_size=5, concurrency=4)
+    assert len(pull.rows) == 10
+    assert pull.stop_reason == "empty_page"
+    assert pull.complete is True
+    assert pull.warnings == []
+
+
+async def test_windowed_never_exceeds_concurrency():
+    fetch, state = _catalog_server(100, 5)
+    await paginate_products(fetch, page_size=5, concurrency=3)
+    assert 1 < state["max_in_flight"] <= 3
+
+
+async def test_windowed_short_page_mid_catalog_loses_no_rows():
+    # The page at offset 5 comes back short (3 of 5): speculative offsets after
+    # it are wrong and must be re-requested from the true offset.
+    fetch_a, _ = _catalog_server(23, 5, short_page_at=5)
+    fetch_b, state = _catalog_server(23, 5, short_page_at=5)
+    sequential = await paginate_products(fetch_a)
+    windowed = await paginate_products(fetch_b, page_size=5, concurrency=4)
+    assert [r["id"] for r in windowed.rows] == [r["id"] for r in sequential.rows]
+    assert len({r["id"] for r in windowed.rows}) == len(windowed.rows)
+    assert 8 in state["offsets"]  # re-requested at the real offset 5 + 3
+
+
+async def test_windowed_deduplicates_rows_across_pages():
+    pages = {
+        0: {"data": _rows(1, 3)},
+        3: {"data": _rows(2, 3)},  # overlaps ids 2, 3 with the previous page
+        6: {"data": []},
+    }
+
+    async def fetch(offset: int) -> dict[str, Any]:
+        return pages.get(offset, {"data": []})
+
+    pull = await paginate_products(fetch, page_size=3, concurrency=3)
+    assert [r["id"] for r in pull.rows] == [1, 2, 3, 4]
+
+
+async def test_windowed_repeated_page_stops_incomplete():
+    async def fetch(offset: int) -> dict[str, Any]:
+        return {"data": _rows(1, 3)}  # server ignores offset
+
+    pull = await paginate_products(fetch, page_size=3, concurrency=4)
+    assert pull.stop_reason == "repeated_page"
+    assert pull.complete is False
+    assert len(pull.rows) == 3
+
+
+async def test_windowed_max_pages_never_requests_beyond_the_cap():
+    fetch, state = _catalog_server(1000, 5)
+    pull = await paginate_products(fetch, page_size=5, concurrency=4, max_pages=6)
+    assert pull.stop_reason == "max_pages"
+    assert pull.pages == 6
+    assert len(state["offsets"]) == 6
+    assert pull.complete is False
+
+
+async def test_windowed_failing_page_propagates():
+    import pytest
+
+    async def fetch(offset: int) -> dict[str, Any]:
+        if offset == 10:
+            raise RuntimeError("boom")
+        return {"data": _rows(offset + 1, 5)}
+
+    with pytest.raises(RuntimeError):
+        await paginate_products(fetch, page_size=5, concurrency=4)
+
+
+async def test_pull_records_duration():
+    fetch, _ = _catalog_server(10, 5)
+    pull = await paginate_products(fetch, page_size=5, concurrency=2)
+    assert pull.duration_seconds >= 0.01
+    assert pull.summary()["duration_seconds"] == pull.duration_seconds

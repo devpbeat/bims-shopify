@@ -41,8 +41,11 @@ class BIMSERPAdapter:
     parent/variant grouping is implemented.
     """
 
-    def __init__(self, client: BIMSClient) -> None:
+    def __init__(
+        self, client: BIMSClient, *, page_concurrency: int | None = None
+    ) -> None:
         self._client = client
+        self._page_concurrency = page_concurrency
         #: Completeness of the most recent ``list_products`` catalog pull
         #: (``None`` before the first one). A pull that fell short of the
         #: server-reported count is also logged by the pager.
@@ -105,7 +108,9 @@ class BIMSERPAdapter:
         async def fetch_page(offset: int) -> dict[str, Any]:
             return await self._client.list_products(**params, offset=offset)
 
-        pull = await paginate_products(fetch_page)
+        pull = await paginate_products(
+            fetch_page, page_size=PAGE_LIMIT, concurrency=self._page_concurrency
+        )
         self.last_catalog_pull = pull
         return pull.rows
 

@@ -30,3 +30,13 @@ def tenant() -> Tenant:
         field_mappings={},
         active=True,
     )
+
+
+@pytest.fixture
+def sequential_paging(monkeypatch):
+    """Force the catalog pager to one request at a time.
+
+    For tests whose respx mocks script responses by CALL ORDER: windowed paging
+    legitimately issues speculative offsets, which an ordered script can't serve.
+    """
+    monkeypatch.setattr("bims_shopify.adapters.bims.paging.DEFAULT_PAGE_CONCURRENCY", 1)
