@@ -62,6 +62,31 @@ GHCR → calls the Woodpecker API to trigger `.woodpecker.yml`, which:
 3. Polls `docker inspect` until the `app` container's HEALTHCHECK reports
    `healthy`, or fails the pipeline after ~75s.
 
+### Verify the deploy (required)
+
+A green CI run does **not** mean the container was replaced. The GitHub Actions
+`deploy` job only POSTs to the Woodpecker API; it goes green as soon as the POST
+is accepted, not when the new container is live. A full disk on the VPS can make
+the image pull fail silently, leaving the old container running (this already
+happened: CI was green while production ran six-day-old code).
+
+After every deploy, poll `GET /version` (public, no auth) until the returned
+`sha` equals the commit you pushed, and treat the deploy as **incomplete** until
+it does:
+
+```bash
+EXPECTED=$(git rev-parse origin/main)
+for i in $(seq 1 30); do
+  SHA=$(curl -sf https://mystoresync.ignitesolutions.click/version | jq -r .sha)
+  [ "$SHA" = "$EXPECTED" ] && echo "deployed: $SHA" && break
+  echo "running: ${SHA:-unreachable}, waiting..."; sleep 10
+done
+```
+
+If the SHA never changes, check `df -h` on the VPS first, then the Woodpecker
+pipeline logs and `docker compose -p bims-shopify pull`. `sha` is `unknown` for
+images built without the `GIT_SHA` build arg (local builds).
+
 Schema changes ship inside the image: the app runs `alembic upgrade head` on
 startup, so a deploy that includes a migration applies it before serving traffic.
 Confirm with `docker compose -p bims-shopify logs app | grep database_migrated`.
