@@ -124,6 +124,11 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
   const [publishLimit, setPublishLimit] = useState('')
   const [publishRequireImages, setPublishRequireImages] = useState(true)
 
+  const [refreshDryRun, setRefreshDryRun] = useState(true)
+  const [refreshOnlyWithStock, setRefreshOnlyWithStock] = useState(false)
+  const [refreshRequireImages, setRefreshRequireImages] = useState(true)
+  const [refreshLimit, setRefreshLimit] = useState('')
+
   const [diagnoseQuery, setDiagnoseQuery] = useState('')
 
   const [wipeAdvancedOpen, setWipeAdvancedOpen] = useState(false)
@@ -232,6 +237,7 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
   const publishJob = latestJobFor('publish')
   const diagnoseJob = latestJobFor('diagnose')
   const syncJob = latestJobFor('sync')
+  const refreshJob = latestJobFor('refresh')
 
   return (
     <div className="ops-tab">
@@ -256,6 +262,65 @@ export function OperationsTab({ slug, adminToken, onUnauthorized }: OperationsTa
           {t.operator.runButton}
         </button>
         {statusJob && <JobPanel job={statusJob} />}
+      </div>
+
+      <div className="ops-card">
+        <h3>{t.operator.commands.refresh.title}</h3>
+        <p className="muted">{t.operator.commands.refresh.description}</p>
+        {runError.refresh && <p className="error-text">{runError.refresh}</p>}
+        <label className="ops-toggle">
+          <input type="checkbox" checked={refreshDryRun} onChange={(e) => setRefreshDryRun(e.target.checked)} />
+          {t.operator.dryRun}
+        </label>
+        <label className="ops-toggle">
+          <input
+            type="checkbox"
+            checked={refreshOnlyWithStock}
+            onChange={(e) => setRefreshOnlyWithStock(e.target.checked)}
+          />
+          {t.operator.onlyWithStock}
+        </label>
+        <label className="ops-toggle">
+          <input
+            type="checkbox"
+            checked={refreshRequireImages}
+            onChange={(e) => setRefreshRequireImages(e.target.checked)}
+          />
+          {t.operator.requireImages}
+        </label>
+        <label className="ops-field">
+          {t.operator.limit}
+          <input
+            type="number"
+            min={0}
+            value={refreshLimit}
+            onChange={(e) => setRefreshLimit(e.target.value)}
+          />
+        </label>
+        <button
+          type="button"
+          className="btn btn-primary"
+          onClick={() => {
+            const options: OpsRunOptions = {
+              apply: !refreshDryRun,
+              only_with_stock: refreshOnlyWithStock,
+              require_images: refreshRequireImages,
+              ...(refreshLimit ? { limit: Number(refreshLimit) } : {}),
+            }
+            if (!refreshDryRun) {
+              setPendingConfirm({
+                title: t.operator.confirmTitle,
+                message: t.operator.commands.refresh.confirmApply,
+                onConfirm: () => launch('refresh', options),
+              })
+            } else {
+              launch('refresh', options)
+            }
+          }}
+        >
+          {t.operator.runButton}
+        </button>
+        {refreshJob && <JobPanel job={refreshJob} />}
       </div>
 
       <div className="ops-card">

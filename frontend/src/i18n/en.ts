@@ -243,6 +243,13 @@ export const en: Messages = {
           'Pulls current stock from BIMS and pushes changed quantities to Shopify. Runs in the background so it is not affected by request timeouts on large catalogs.',
         confirmApply: 'This will write inventory quantities to Shopify. Continue?',
       },
+      refresh: {
+        title: 'Refresh store',
+        description:
+          'The normal way to bring the store up to date. Runs three steps in order as a single job: import new products from BIMS as Draft, sync BIMS stock into Shopify, then publish the products that have an image and confirmed stock. It stops at the first step that fails, so nothing is published on top of stale stock. The limit applies to the publish step only. With the dry run on, nothing is changed anywhere.',
+        confirmApply:
+          'This will import products, write inventory quantities and publish products to the Online Store, in that order. Continue?',
+      },
       cleanupNoStock: {
         title: 'Cleanup no-stock products',
         description:

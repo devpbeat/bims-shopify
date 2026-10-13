@@ -248,6 +248,13 @@ export const es: Messages = {
           'Trae el stock actual desde BIMS y envía a Shopify las cantidades que cambiaron. Corre en segundo plano, así no lo afectan los timeouts de request en catálogos grandes.',
         confirmApply: 'Esto escribirá cantidades de inventario en Shopify. ¿Continuar?',
       },
+      refresh: {
+        title: 'Actualizar tienda',
+        description:
+          'La forma habitual de poner la tienda al día. Ejecuta tres pasos en orden como un solo trabajo: importa los productos nuevos de BIMS como Draft, sincroniza el stock de BIMS en Shopify y publica los productos que tienen imagen y stock confirmado. Se detiene en el primer paso que falle, de modo que nunca se publica sobre stock desactualizado. El límite se aplica solo al paso de publicación. Con la simulación activada, no se modifica nada.',
+        confirmApply:
+          'Esto importará productos, escribirá cantidades de inventario y publicará productos en la tienda online, en ese orden. ¿Continuar?',
+      },
       cleanupNoStock: {
         title: 'Limpiar productos sin stock',
         description:

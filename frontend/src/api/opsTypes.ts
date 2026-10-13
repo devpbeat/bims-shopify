@@ -9,6 +9,7 @@ export type OpsCommand =
   | 'publish'
   | 'diagnose'
   | 'sync'
+  | 'refresh'
 
 export type OpsJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
 

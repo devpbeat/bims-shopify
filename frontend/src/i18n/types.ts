@@ -194,6 +194,7 @@ export interface Messages {
       rekey: { title: string; description: string; confirmApply: string }
       fixTracking: { title: string; description: string; confirmApply: string }
       sync: { title: string; description: string; confirmApply: string }
+      refresh: { title: string; description: string; confirmApply: string }
       cleanupNoStock: {
         title: string
         description: string
