@@ -7,6 +7,13 @@ import httpx
 
 USER_AGENT = "bims-shopify-sync/0.1 (+https://github.com/devpbeat/bims-shopify)"
 
+#: Per-request timeout for every BIMS call unless a caller opts into another.
+#: Deliberately short for the sale-writing path: ``process_shopify_order``
+#: retries on deadlock/unconfirmed responses, so a long timeout there would
+#: make a stuck write worse, not better. Read-only catalog pulls pass their
+#: own, longer value (see ``CATALOG_PULL_TIMEOUT_SECONDS``).
+DEFAULT_TIMEOUT_SECONDS = 30.0
+
 
 class BIMSAPIError(RuntimeError):
     """Raised when BIMS answers with an error envelope (status == "error")."""
@@ -30,7 +37,13 @@ class BIMSClient:
     endpoint.
     """
 
-    def __init__(self, tenant: Tenant, http_client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        tenant: Tenant,
+        http_client: httpx.AsyncClient | None = None,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
         self._tenant = tenant
         self._client = http_client or httpx.AsyncClient(
             base_url=tenant.bims_base_url,
@@ -40,7 +53,7 @@ class BIMSClient:
                 # BIMS sits behind Cloudflare, which rejects generic HTTP-library user agents.
                 "User-Agent": USER_AGENT,
             },
-            timeout=30.0,
+            timeout=timeout,
         )
 
     async def aclose(self) -> None:
