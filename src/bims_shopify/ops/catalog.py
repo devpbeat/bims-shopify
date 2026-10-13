@@ -85,6 +85,7 @@ from typing import Any
 import httpx
 
 from bims_shopify.adapters.bims.client import BIMSAPIError, BIMSClient
+from bims_shopify.adapters.bims.stock import STOCK_BATCH_SIZE, fetch_stock_batches
 from bims_shopify.adapters.bims.paging import PagedPull, paginate_products
 from bims_shopify.adapters.bims.timezones import to_bims_local
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
@@ -102,7 +103,6 @@ from bims_shopify.domain.tenant import Tenant
 logger = logging.getLogger(__name__)
 
 BIMS_PAGE_LIMIT = 250
-STOCK_BATCH_SIZE = 200
 MAX_VARIANTS_PER_PRODUCT = 100
 WIPE_PROGRESS_EVERY = 50
 IMPORT_PROGRESS_EVERY = 25
@@ -497,7 +497,11 @@ async def fetch_bims_catalog_rows(
 
 
 async def fetch_stock_by_sku(
-    bims_client: BIMSClient, skus: list[str], warehouse_ids: list[int] | None
+    bims_client: BIMSClient,
+    skus: list[str],
+    warehouse_ids: list[int] | None,
+    *,
+    concurrency: int | None = None,
 ) -> dict[str, float]:
     """Fetch aggregated stock per SKU, batched, clamping negative totals to 0.
 
@@ -506,11 +510,17 @@ async def fetch_stock_by_sku(
     """
     result: dict[str, float] = {}
     unique_skus = list(dict.fromkeys(skus))
-    for i in range(0, len(unique_skus), STOCK_BATCH_SIZE):
-        batch = unique_skus[i : i + STOCK_BATCH_SIZE]
-        response = await bims_client.stock_fenicio(
-            skus=batch, warehouse_ids=warehouse_ids, request_id=f"catalog-import-{i}"
-        )
+    # Bounded concurrent, all-or-nothing (see ``fetch_stock_batches``); responses
+    # come back in batch order so the merge matches a sequential fetch.
+    responses = await fetch_stock_batches(
+        bims_client,
+        unique_skus,
+        warehouse_ids,
+        request_prefix="catalog-import-",
+        batch_size=STOCK_BATCH_SIZE,
+        concurrency=concurrency,
+    )
+    for response in responses:
         for row in (response.get("data") or {}).get("stockPorSku") or []:
             result[str(row["sku"])] = max(0.0, float(row.get("stock") or 0))
     return result

@@ -1,6 +1,7 @@
 """ERPPort implementation backed by BIMSClient."""
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from typing import Any
 
@@ -11,11 +12,10 @@ from bims_shopify.logging import get_logger
 
 from .client import BIMSClient
 from .paging import PagedPull, paginate_products
+from .stock import STOCK_BATCH_SIZE, fetch_stock_batches
 from .timezones import to_bims_local
 
 PAGE_LIMIT = 250
-STOCK_BATCH_SIZE = 200
-
 logger = get_logger(__name__)
 
 
@@ -42,10 +42,15 @@ class BIMSERPAdapter:
     """
 
     def __init__(
-        self, client: BIMSClient, *, page_concurrency: int | None = None
+        self, client: BIMSClient, *, page_concurrency: int | None = None,
+        stock_concurrency: int | None = None,
     ) -> None:
         self._client = client
         self._page_concurrency = page_concurrency
+        self._stock_concurrency = stock_concurrency
+        #: Wall-clock seconds of the most recent ``fetch_stock_levels`` (``None``
+        #: before the first one); persisted in the sync summary.
+        self.last_stock_fetch_seconds: float | None = None
         #: Completeness of the most recent ``list_products`` catalog pull
         #: (``None`` before the first one). A pull that fell short of the
         #: server-reported count is also logged by the pager.
@@ -114,7 +119,9 @@ class BIMSERPAdapter:
         self.last_catalog_pull = pull
         return pull.rows
 
-    async def fetch_stock_levels(self, tenant: Tenant, skus: list[str]) -> dict[str, float]:
+    async def fetch_stock_levels(
+        self, tenant: Tenant, skus: list[str], *, concurrency: int | None = None
+    ) -> dict[str, float]:
         """Fetch per-SKU stock aggregated across ``tenant.stock_warehouse_ids``, batched.
 
         BIMS's stock_fenicio endpoint aggregates stock across the given
@@ -127,15 +134,20 @@ class BIMSERPAdapter:
         unique_skus = list(dict.fromkeys(skus))
         warehouse_ids = tenant.stock_warehouse_ids
         clamped_count = 0
-        for i in range(0, len(unique_skus), STOCK_BATCH_SIZE):
-            batch = unique_skus[i : i + STOCK_BATCH_SIZE]
-            if not batch:
-                continue
-            response = await self._client.stock_fenicio(
-                skus=batch,
-                warehouse_ids=warehouse_ids,
-                request_id=f"bims-shopify-{i}",
-            )
+        started = time.perf_counter()
+        # Bounded concurrent, all-or-nothing (see ``fetch_stock_batches``);
+        # responses come back in batch order so the merge matches a
+        # sequential fetch.
+        responses = await fetch_stock_batches(
+            self._client,
+            unique_skus,
+            warehouse_ids,
+            request_prefix="bims-shopify-",
+            batch_size=STOCK_BATCH_SIZE,
+            concurrency=concurrency if concurrency is not None else self._stock_concurrency,
+        )
+        self.last_stock_fetch_seconds = time.perf_counter() - started
+        for response in responses:
             for row in (response.get("data") or {}).get("stockPorSku") or []:
                 stock = float(row.get("stock") or 0)
                 if stock < 0:
