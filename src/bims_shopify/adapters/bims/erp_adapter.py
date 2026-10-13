@@ -10,6 +10,7 @@ from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
 from .client import BIMSClient
+from .paging import PagedPull, paginate_products
 from .timezones import to_bims_local
 
 PAGE_LIMIT = 250
@@ -42,6 +43,10 @@ class BIMSERPAdapter:
 
     def __init__(self, client: BIMSClient) -> None:
         self._client = client
+        #: Completeness of the most recent ``list_products`` catalog pull
+        #: (``None`` before the first one). A pull that fell short of the
+        #: server-reported count is also logged by the pager.
+        self.last_catalog_pull: PagedPull | None = None
 
     async def list_products(
         self, tenant: Tenant, since: datetime | None = None
@@ -97,19 +102,12 @@ class BIMSERPAdapter:
         if since is not None:
             params["last_update"] = to_bims_local(since, tenant.bims_timezone)
 
-        products: list[dict[str, Any]] = []
-        offset = 0
-        while True:
-            response = await self._client.list_products(**params, offset=offset)
-            items = response.get("data") or []
-            if not items:
-                break
-            for entry in items:
-                products.append(entry.get("Product", entry))
-            if len(items) < PAGE_LIMIT:
-                break
-            offset += PAGE_LIMIT
-        return products
+        async def fetch_page(offset: int) -> dict[str, Any]:
+            return await self._client.list_products(**params, offset=offset)
+
+        pull = await paginate_products(fetch_page)
+        self.last_catalog_pull = pull
+        return pull.rows
 
     async def fetch_stock_levels(self, tenant: Tenant, skus: list[str]) -> dict[str, float]:
         """Fetch per-SKU stock aggregated across ``tenant.stock_warehouse_ids``, batched.

@@ -366,3 +366,60 @@ async def test_negative_aggregated_stock_is_clamped_to_zero_and_logged(bims_clie
     assert len(warnings) == 1
     assert warnings[0]["clamped_count"] == 1
     assert warnings[0]["tenant"] == "acme"
+
+
+def _stock_ok(tenant, count: int):
+    respx.post(f"{tenant.bims_base_url}/api/products_stocks/stock_fenicio.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "data": {"stockPorSku": [{"sku": f"SKU-{i}", "stock": 1} for i in range(count)]},
+            },
+        )
+    )
+
+
+@respx.mock
+async def test_short_page_mid_catalog_does_not_truncate_the_sync_pull(bims_client, tenant):
+    route = respx.get(f"{tenant.bims_base_url}/api/products/index.json")
+    route.side_effect = [
+        httpx.Response(
+            200,
+            json={"status": "ok", "count": 5, "data": [_product(id=i, code2=f"SKU-{i}") for i in (0, 1, 2)]},
+        ),
+        httpx.Response(
+            200,
+            json={"status": "ok", "count": 5, "data": [_product(id=i, code2=f"SKU-{i}") for i in (3, 4)]},
+        ),
+        httpx.Response(200, json={"status": "ok", "count": 5, "data": []}),
+    ]
+    _stock_ok(tenant, 5)
+
+    adapter = BIMSERPAdapter(bims_client)
+    snapshots = await adapter.list_products(tenant)
+
+    assert {s.sku for s in snapshots} == {f"SKU-{i}" for i in range(5)}
+    assert [c.request.url.params["offset"] for c in route.calls] == ["0", "3", "5"]
+    assert adapter.last_catalog_pull is not None
+    assert adapter.last_catalog_pull.complete is True
+
+
+@respx.mock
+async def test_truncated_sync_pull_is_flagged_incomplete(bims_client, tenant):
+    route = respx.get(f"{tenant.bims_base_url}/api/products/index.json")
+    route.side_effect = [
+        httpx.Response(
+            200, json={"status": "ok", "count": 9, "data": [_product(id=0, code2="SKU-0")]}
+        ),
+        httpx.Response(200, json={"status": "ok", "count": 9, "data": []}),
+    ]
+    _stock_ok(tenant, 1)
+
+    adapter = BIMSERPAdapter(bims_client)
+    await adapter.list_products(tenant)
+
+    pull = adapter.last_catalog_pull
+    assert pull is not None
+    assert pull.complete is False
+    assert (len(pull.rows), pull.reported_count) == (1, 9)
