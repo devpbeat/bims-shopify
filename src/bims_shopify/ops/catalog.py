@@ -75,7 +75,7 @@ from typing import Any
 
 import httpx
 
-from bims_shopify.adapters.bims.client import BIMSClient
+from bims_shopify.adapters.bims.client import BIMSAPIError, BIMSClient
 from bims_shopify.adapters.bims.paging import PagedPull, paginate_products
 from bims_shopify.adapters.bims.timezones import to_bims_local
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
@@ -1258,6 +1258,54 @@ class DiagnoseReport:
     notes: list[str] = field(default_factory=list)
     searched_all_companies: bool = False
     catalog_pull: dict[str, Any] | None = None
+    #: ``True``/``False`` once the single-product fallback ran and got a clear
+    #: answer; ``None`` when it was skipped or its outcome is unknown.
+    found_via_direct_lookup: bool | None = None
+    direct_lookup_row: dict[str, Any] | None = None
+
+
+async def lookup_single_product(
+    bims_client: BIMSClient, product_id: str
+) -> tuple[bool | None, dict[str, Any] | None, str]:
+    """Fetch one product straight from ``products/view.json``.
+
+    Returns ``(found, row, note)``. ``found`` is ``True`` with the raw row,
+    ``False`` when BIMS clearly has nothing for the id (HTTP 404 or a
+    ``not-found`` / empty envelope), or ``None`` when the lookup itself
+    failed. NEVER raises: it is a secondary lookup inside a read-only
+    diagnostic and must degrade to a note.
+    """
+    try:
+        response = await bims_client.get_product(product_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return False, None, _DIRECT_LOOKUP_NOT_FOUND_NOTE
+        return None, None, _direct_lookup_failed_note(exc)
+    except (BIMSAPIError, httpx.HTTPError, ValueError) as exc:
+        return None, None, _direct_lookup_failed_note(exc)
+    data = response.get("data") if isinstance(response, dict) else None
+    product = data.get("Product") if isinstance(data, dict) else None
+    if isinstance(product, dict) and product:
+        return True, product, _DIRECT_LOOKUP_FOUND_NOTE
+    return False, None, _DIRECT_LOOKUP_NOT_FOUND_NOTE
+
+
+_DIRECT_LOOKUP_FOUND_NOTE = (
+    "The product EXISTS in BIMS (direct lookup via products/view.json) but is "
+    "NOT returned by the catalog listing (products/index.json). This points at "
+    "an endpoint or visibility problem, not at bad product data."
+)
+_DIRECT_LOOKUP_NOT_FOUND_NOTE = (
+    "Direct lookup via products/view.json also found nothing: the BIMS API "
+    "cannot see this product with this API key."
+)
+
+
+def _direct_lookup_failed_note(exc: Exception) -> str:
+    return (
+        f"The direct product lookup could not be completed ({type(exc).__name__}); "
+        "whether the product exists in BIMS is unknown."
+    )
 
 
 def match_catalog_rows(raw_rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
@@ -1505,6 +1553,8 @@ def build_diagnose_report(report: DiagnoseReport) -> dict[str, Any]:
         "truncated": report.total_matches > len(report.diagnoses),
         "searched_all_companies": report.searched_all_companies,
         "catalog_pull": report.catalog_pull,
+        "found_via_direct_lookup": report.found_via_direct_lookup,
+        "direct_lookup_row": report.direct_lookup_row,
         "online_store_publication_id": report.online_store_publication_id,
         "notes": report.notes,
         "verdict_counts": verdict_counts,
@@ -1579,6 +1629,16 @@ async def _run_diagnose(
                 f"server reports {pull.reported_count}); a missing product is NOT "
                 "conclusive evidence that it does not exist in BIMS."
             )
+        found_via_direct_lookup: bool | None = None
+        direct_lookup_row: dict[str, Any] | None = None
+        if not all_matches and query.isascii() and query.isdigit():
+            # Only a BIMS product id can be fetched directly; anything else
+            # would be a guess.
+            await _emit_progress(progress, 0, None, "looking up product directly")
+            found_via_direct_lookup, direct_lookup_row, lookup_note = await lookup_single_product(
+                bims_client, query
+            )
+            notes.append(lookup_note)
         publication_id: str | None = None
         try:
             publication_id = await _resolve_online_store_publication_id(shopify_client)
@@ -1609,6 +1669,8 @@ async def _run_diagnose(
                 notes=notes,
                 searched_all_companies=searched_all_companies,
                 catalog_pull=pull.summary(),
+                found_via_direct_lookup=found_via_direct_lookup,
+                direct_lookup_row=direct_lookup_row,
             )
         )
     finally:

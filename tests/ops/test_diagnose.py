@@ -472,6 +472,7 @@ class _Recorder:
     def __init__(self) -> None:
         self.catalog_params: list[dict] = []
         self.stock_calls: list[dict] = []
+        self.view_calls: list[dict] = []
         self.progress: list[str] = []
 
 
@@ -483,6 +484,8 @@ def _install_fakes(
     products: list[dict],
     publications: list[dict] | None = None,
     publications_error: Exception | None = None,
+    view_response: dict | None = None,
+    view_error: Exception | None = None,
 ) -> _Recorder:
     from bims_shopify.ops import catalog as catalog_ops
 
@@ -496,6 +499,12 @@ def _install_fakes(
     class _FakeBims:
         def __init__(self, tenant, **kwargs):
             pass
+
+        async def get_product(self, product_id):
+            rec.view_calls.append({"id": product_id})
+            if view_error is not None:
+                raise view_error
+            return view_response if view_response is not None else {"status": "ok", "data": None}
 
         async def get(self, path, params=None):
             rec.catalog_params.append(dict(params or {}))
@@ -931,3 +940,122 @@ async def test_catalog_commands_build_the_bims_client_with_the_catalog_timeout(
     assert seen == [{"timeout": catalog_ops.CATALOG_PULL_TIMEOUT_SECONDS}]
     assert catalog_ops.CATALOG_PULL_TIMEOUT_SECONDS == 120.0
     assert rec.catalog_params
+
+
+# -- single-product fallback --------------------------------------------------
+
+
+def _http_404() -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", f"{BIMS_URL}/api/products/view.json")
+    return httpx.HTTPStatusError(
+        "404", request=request, response=httpx.Response(404, request=request)
+    )
+
+
+_VIEW_OK = {
+    "status": "ok",
+    "code": "200",
+    "data": {"Product": {"id": 1293603, "name": "Hidden", "code2": "123028"}},
+}
+
+
+async def test_fallback_found_reports_product_exists_but_is_not_listed(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    rec = _install_fakes(
+        monkeypatch, raw_rows=[_raw(1)], stock_by_wh={}, products=[], view_response=_VIEW_OK
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "1293603"})
+    assert rec.view_calls == [{"id": "1293603"}]
+    assert report["total_matches"] == 0
+    assert report["found_via_direct_lookup"] is True
+    assert report["direct_lookup_row"]["code2"] == "123028"
+    joined = " ".join(report["notes"])
+    assert "EXISTS in BIMS" in joined and "NOT returned by the catalog listing" in joined
+
+
+async def test_fallback_not_found_is_reported_distinctly(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    _install_fakes(
+        monkeypatch,
+        raw_rows=[_raw(1)],
+        stock_by_wh={},
+        products=[],
+        view_response={"status": "not-found", "code": "404", "data": None},
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "1293603"})
+    assert report["found_via_direct_lookup"] is False
+    assert report["direct_lookup_row"] is None
+    assert "cannot see" in " ".join(report["notes"])
+
+
+async def test_fallback_skipped_for_non_numeric_query(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    rec = _install_fakes(
+        monkeypatch, raw_rows=[_raw(1)], stock_by_wh={}, products=[], view_response=_VIEW_OK
+    )
+    for query in ("SKU-9", "12a", "1 2"):
+        report = await catalog_ops.run_diagnose(tenant, {"query": query})
+        assert report["found_via_direct_lookup"] is None
+    assert rec.view_calls == []
+
+
+async def test_fallback_not_triggered_by_a_catalog_match(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    rec = _install_fakes(
+        monkeypatch,
+        raw_rows=[_raw(77, code2="SKU-77")],
+        stock_by_wh={},
+        products=[],
+        view_response=_VIEW_OK,
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "77"})
+    assert report["total_matches"] == 1
+    assert report["found_via_direct_lookup"] is None
+    assert rec.view_calls == []
+
+
+async def test_fallback_degrades_gracefully_on_404(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    _install_fakes(
+        monkeypatch, raw_rows=[_raw(1)], stock_by_wh={}, products=[], view_error=_http_404()
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "1293603"})
+    assert report["found_via_direct_lookup"] is False
+    assert report["total_matches"] == 0
+
+
+async def test_fallback_degrades_gracefully_on_error_envelope(tenant, monkeypatch):
+    from bims_shopify.adapters.bims.client import BIMSAPIError
+    from bims_shopify.ops import catalog as catalog_ops
+
+    _install_fakes(
+        monkeypatch,
+        raw_rows=[_raw(1)],
+        stock_by_wh={},
+        products=[],
+        view_error=BIMSAPIError("403", "forbidden"),
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "1293603"})
+    assert report["found_via_direct_lookup"] is None
+    assert "could not be completed" in " ".join(report["notes"])
+    assert "BIMSAPIError" in " ".join(report["notes"])
+
+
+async def test_fallback_degrades_gracefully_on_network_error(tenant, monkeypatch):
+    from bims_shopify.ops import catalog as catalog_ops
+
+    _install_fakes(
+        monkeypatch,
+        raw_rows=[_raw(1)],
+        stock_by_wh={},
+        products=[],
+        view_error=httpx.ConnectError("boom"),
+    )
+    report = await catalog_ops.run_diagnose(tenant, {"query": "1293603"})
+    assert report["found_via_direct_lookup"] is None
+    assert "could not be completed" in " ".join(report["notes"])
