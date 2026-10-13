@@ -10,6 +10,7 @@ from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
 from .client import BIMSClient
+from .company import count_rows_by_company, is_other_company
 from .paging import PagedPull, paginate_products
 from .timezones import to_bims_local
 
@@ -47,13 +48,23 @@ class BIMSERPAdapter:
         #: (``None`` before the first one). A pull that fell short of the
         #: server-reported count is also logged by the pager.
         self.last_catalog_pull: PagedPull | None = None
+        #: Rows of the latest ``list_products`` pull dropped because they
+        #: belong to another company than the tenant's (BIMS ignores the
+        #: ``company_id`` query param), and the raw per-company row counts.
+        self.last_dropped_wrong_company: int = 0
+        self.last_rows_by_company: dict[str, int] = {}
 
     async def list_products(
         self, tenant: Tenant, since: datetime | None = None
     ) -> list[ProductSnapshot]:
         raw_products = await self._fetch_all_products(tenant, since)
+        self.last_rows_by_company = count_rows_by_company(raw_products)
+        self.last_dropped_wrong_company = 0
         candidates: list[tuple[str, dict[str, Any]]] = []
         for product in raw_products:
+            if is_other_company(product, tenant.bims_company_id):
+                self.last_dropped_wrong_company += 1
+                continue
             if not _is_truthy(product.get("enabled", True)):
                 continue
             if _is_truthy(product.get("exclude_ecommerce", False)):
@@ -62,6 +73,14 @@ class BIMSERPAdapter:
             if not sku:
                 continue
             candidates.append((str(sku), product))
+
+        if self.last_dropped_wrong_company:
+            logger.warning(
+                "bims_rows_dropped_wrong_company",
+                dropped=self.last_dropped_wrong_company,
+                tenant_company_id=tenant.bims_company_id,
+                rows_by_company=self.last_rows_by_company,
+            )
 
         stock_by_sku = await self.fetch_stock_levels(tenant, [sku for sku, _ in candidates])
 
