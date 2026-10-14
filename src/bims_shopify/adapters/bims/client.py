@@ -131,6 +131,16 @@ class BIMSClient:
             raise BIMSAPIError("stock_fenicio", body.get("mensaje") or "stock_fenicio request failed")
         return body
 
+    # -- Reference lists --------------------------------------------------
+    async def list_warehouses(self, limit: int = 500, offset: int = 0) -> dict[str, Any]:
+        """GET /api/warehouses/index.json (read-only reference list).
+
+        The spec documents ``limit``/``offset``/``plain`` but models neither the
+        entries nor the paging contract, so this returns the raw envelope for
+        one generous page and leaves parsing to the caller.
+        """
+        return await self.get("/api/warehouses/index.json", params={"limit": limit, "offset": offset})
+
     # -- Sales ------------------------------------------------------------
     async def add_sale(self, sale_payload: dict[str, Any], as_json: bool = True) -> dict[str, Any]:
         if as_json:

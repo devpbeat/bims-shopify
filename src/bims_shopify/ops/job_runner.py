@@ -46,6 +46,7 @@ _COMMAND_RUNNERS = {
     "cleanup_no_stock": catalog.run_cleanup_no_stock,
     "publish": catalog.run_publish,
     "diagnose": catalog.run_diagnose,
+    "warehouses": catalog.run_warehouses,
     "sync": sync_job.run_sync,
     "refresh": refresh_job.run_refresh,
 }

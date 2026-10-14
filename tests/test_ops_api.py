@@ -518,6 +518,33 @@ async def test_diagnose_query_is_stripped_and_extra_options_dropped(app_and_tena
     assert seen_options == [{"query": "TAG-77"}]
 
 
+async def test_warehouses_accepts_no_options_and_drops_extras(app_and_tenant, monkeypatch):
+    app, _tenant, session_factory = app_and_tenant
+    seen_options: list[dict] = []
+
+    async def _capture_runner(tenant, options, progress):
+        seen_options.append(options)
+        return {"warehouses": []}
+
+    monkeypatch.setitem(
+        __import__("bims_shopify.ops.job_runner", fromlist=["_COMMAND_RUNNERS"])._COMMAND_RUNNERS,
+        "warehouses",
+        _capture_runner,
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/ops/acme/run",
+            json={"command": "warehouses", "options": {"apply": True}},
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        assert response.status_code == 200
+        await _wait_for_status(session_factory, response.json()["job_id"], {"succeeded", "failed"})
+
+    assert seen_options == [{}]
+
+
 async def _post_refresh(app, options):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:

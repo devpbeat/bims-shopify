@@ -10,6 +10,7 @@ Usage::
     python -m bims_shopify.ops.catalog <tenant_slug> publish [--apply] [--limit N] \\
         [--no-require-images]
     python -m bims_shopify.ops.catalog <tenant_slug> diagnose <query>
+    python -m bims_shopify.ops.catalog <tenant_slug> warehouses
     python -m bims_shopify.ops.catalog <tenant_slug> refresh [--apply] [--only-with-stock] \\
         [--limit N] [--no-require-images]
 
@@ -61,6 +62,13 @@ every phase's own report nested under ``phases``. ``--apply`` is a dry-run
 switch for all three phases; ``--only-with-stock`` goes to import,
 ``--limit`` and ``--no-require-images`` to publish. It stops at the first
 failing phase.
+
+``warehouses`` is read-only and takes no options at all. It lists the
+tenant's BIMS warehouses (id, name, a few plainly-useful fields) and marks
+which ids the tenant currently syncs stock from (``synced``), so an operator
+can map a warehouse id to the name shown in the BIMS UI. It also reports
+``configured_ids_not_found``: ids in the tenant config that BIMS does not
+return (a stale-config signal). Writes no audit row.
 
 ``status`` pulls both sides (BIMS-eligible rows, Shopify's live catalog) and
 prints a reconciliation report: counts on each side, SKUs present in one but
@@ -2098,6 +2106,99 @@ async def _run_status(
         await shopify_client.aclose()
 
 
+#: Keys copied into ``extra`` when a warehouse row carries them.
+_WAREHOUSE_EXTRA_KEYS = ("enabled", "agency_id", "company_id", "code", "address", "description")
+
+#: Single-page size for ``warehouses``; the endpoint's paging contract is undocumented.
+WAREHOUSES_PAGE_LIMIT = 500
+
+
+def _lowered(row: dict[str, Any]) -> dict[str, Any]:
+    return {str(k).lower(): v for k, v in row.items()}
+
+
+def _coerce_id(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def normalize_warehouse_rows(data: Any) -> list[dict[str, Any]]:
+    """Defensively parse the untyped ``warehouses/index.json`` ``data`` payload.
+
+    Accepts ``{"Warehouse": {...}}`` wrappers and bare dicts, tolerates
+    differently-cased keys, and degrades (``None`` id/name) instead of raising.
+    Entries that are not dicts are dropped.
+    """
+    if not isinstance(data, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        inner = next((v for k, v in item.items() if str(k).lower() == "warehouse"), None)
+        raw = _lowered(inner if isinstance(inner, dict) else item)
+        name = raw.get("name")
+        rows.append(
+            {
+                "id": _coerce_id(raw.get("id")),
+                "name": name if isinstance(name, str) else None,
+                "extra": {k: raw[k] for k in _WAREHOUSE_EXTRA_KEYS if k in raw},
+            }
+        )
+    return rows
+
+
+async def _run_warehouses(
+    tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
+) -> dict[str, Any]:
+    """List the tenant's BIMS warehouses and mark which ones it syncs.
+
+    STRICTLY read-only: one GET, no audit row, no options. A BIMS error
+    envelope raises ``BIMSAPIError`` (job fails) instead of yielding an empty
+    list. Only one page is fetched because the endpoint's paging is unmodeled.
+    """
+    bims_client = _new_bims_client(tenant)
+    try:
+        await _emit_progress(progress, 0, None, "listing BIMS warehouses")
+        body = await bims_client.list_warehouses(limit=WAREHOUSES_PAGE_LIMIT)
+    finally:
+        await bims_client.aclose()
+
+    configured = list(tenant.stock_warehouse_ids)
+    rows = normalize_warehouse_rows(body.get("data"))
+    found_ids = {r["id"] for r in rows if r["id"] is not None}
+    not_found = [i for i in configured if i not in found_ids]
+
+    notes: list[str] = []
+    if not_found:
+        notes.append(
+            f"Configured warehouse ids not returned by BIMS: {not_found}. "
+            "The tenant config may be stale."
+        )
+    reported = body.get("count")
+    reported_count = int(reported) if isinstance(reported, str) and reported.isdigit() else reported
+    if isinstance(reported_count, int) and not isinstance(reported_count, bool) and reported_count > len(rows):
+        notes.append(
+            f"BIMS reports {reported_count} warehouses but only {len(rows)} were returned "
+            "(single page fetched); the list may be incomplete."
+        )
+    return {
+        "total": len(rows),
+        "configured_ids": configured,
+        "configured_ids_not_found": not_found,
+        "notes": notes,
+        "warehouses": [
+            {**r["extra"], "id": r["id"], "name": r["name"], "synced": r["id"] in configured}
+            for r in rows
+        ],
+    }
+
+
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     tenant = await _load_tenant_from_db(args.tenant_slug)
     if args.command == "wipe":
@@ -2114,6 +2215,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         return await _run_publish(tenant, args)
     if args.command == "diagnose":
         return await _run_diagnose(tenant, args)
+    if args.command == "warehouses":
+        return await _run_warehouses(tenant, args)
     if args.command == "refresh":
         # Local import: refresh_job imports this module.
         from bims_shopify.ops.refresh_job import run_refresh
@@ -2202,6 +2305,12 @@ async def run_publish(tenant: Tenant, options: dict[str, Any], progress: Progres
 async def run_diagnose(tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None) -> dict[str, Any]:
     args = argparse.Namespace(query=str(options.get("query", "")))
     return await _run_diagnose(tenant, args, progress=progress)
+
+
+async def run_warehouses(
+    tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None
+) -> dict[str, Any]:
+    return await _run_warehouses(tenant, argparse.Namespace(), progress=progress)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -2347,6 +2456,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     diagnose_parser.add_argument(
         "query",
         help="Matched case-insensitively against BIMS id, code, code2, or part of the name.",
+    )
+
+    subparsers.add_parser(
+        "warehouses",
+        help="Read-only: list the tenant's BIMS warehouses and which ones it syncs.",
     )
 
     refresh_parser = subparsers.add_parser(

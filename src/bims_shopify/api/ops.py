@@ -34,6 +34,7 @@ _VALID_COMMANDS = {
     "cleanup_no_stock",
     "publish",
     "diagnose",
+    "warehouses",
     "sync",
     "refresh",
 }
@@ -53,6 +54,7 @@ class RunJobRequest(BaseModel):
         "cleanup_no_stock",
         "publish",
         "diagnose",
+        "warehouses",
         "sync",
         "refresh",
     ]
