@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -30,10 +31,10 @@ from bims_shopify.api import (
     webhooks,
 )
 from bims_shopify.config import get_settings
-from bims_shopify.domain.tenant import SyncMode
 from bims_shopify.logging import configure_logging, get_logger
 from bims_shopify.ops.auto_import import AutoImportCoordinator
 from bims_shopify.ops.job_runner import JobRunner
+from bims_shopify.ops.sync_workers import do_pull, do_push, last_pull_at, record_skip
 from bims_shopify.scheduler import TenantSyncScheduler
 
 logger = get_logger(__name__)
@@ -79,42 +80,50 @@ def _run_migrations(database_url: str) -> None:
     logger.info("database_migrated")
 
 
-def _make_sync_tenant_fn(session_factory):
-    """Build the scheduler's per-tenant sync callback.
+def _make_pull_fn(session_factory):
+    """Build the scheduler's per-tenant PULL callback (BIMS -> snapshot).
 
-    Reuses the exact same `_do_run_sync` codepath as the manual
-    `/sync/{slug}/run` endpoint (state persistence, the tenant-level full/incremental `since`,
-    the per-run safety guard, deleted-products check, structured logging),
-    so the scheduled job and manual runs never diverge in behavior. This
-    matters in particular for `previous_stocks`/`last_run` bookkeeping:
-    without it, every scheduled tick would see an empty previous-stock map,
-    treat every SKU as "changed", and permanently trip the max-changed-
-    variants safety guard for any catalog larger than that threshold.
+    The same ``do_pull`` the manual one-shot runs, so a scheduled pull and a
+    manual one never diverge: the sanity guard, the atomic snapshot write, the
+    catalog stats and the outcome bookkeeping are all inside it.
     """
 
-    async def _sync_tenant(tenant) -> None:
-        from bims_shopify.api.sync import _do_run_sync
-
+    async def _pull_tenant(tenant) -> None:
         async with session_factory() as session:
             try:
-                # Tenant-level setting, FULL by default: BIMS's `last_update`
-                # filter is unreliable, so the watermark is recorded but not
-                # used to narrow the pull unless explicitly switched back.
-                await _do_run_sync(
-                    tenant,
-                    dry_run=False,
-                    session=session,
-                    full=tenant.sync_mode is SyncMode.FULL,
-                )
+                await do_pull(tenant, session, trigger="scheduled")
             except Exception as exc:  # one tenant's failure must not affect others
                 logger.error(
-                    "scheduled_sync_tenant_failed",
+                    "scheduled_pull_tenant_failed",
                     tenant_slug=tenant.slug,
                     tenant_id=tenant.id,
                     error=str(exc),
                 )
 
-    return _sync_tenant
+    return _pull_tenant
+
+
+def _make_push_fn(session_factory):
+    """Build the scheduler's per-tenant PUSH callback (snapshot -> Shopify).
+
+    The same ``do_push`` the manual one-shot runs. It never calls BIMS and
+    declines, with a recorded reason, when the snapshot is missing,
+    incomplete or older than the tenant's staleness limit.
+    """
+
+    async def _push_tenant(tenant) -> None:
+        async with session_factory() as session:
+            try:
+                await do_push(tenant, session, trigger="scheduled")
+            except Exception as exc:  # one tenant's failure must not affect others
+                logger.error(
+                    "scheduled_push_tenant_failed",
+                    tenant_slug=tenant.slug,
+                    tenant_id=tenant.id,
+                    error=str(exc),
+                )
+
+    return _push_tenant
 
 
 def create_app() -> FastAPI:
@@ -143,14 +152,17 @@ def create_app() -> FastAPI:
         async with tenant_repository_scope() as repo:
             scheduler = TenantSyncScheduler(
                 repo,
-                _make_sync_tenant_fn(session_factory),
+                _make_pull_fn(session_factory),
                 repository_scope=tenant_repository_scope,
+                push_fn=_make_push_fn(session_factory),
+                skip_fn=functools.partial(record_skip, session_factory),
+                last_pull_fn=functools.partial(last_pull_at, session_factory),
             )
         app.state.scheduler = scheduler
-        # Share this scheduler's per-tenant lock with the "sync" ops job
-        # (see JobRunner._run) so a background sync job, the scheduled
-        # tick, and a manual HTTP sync can never run concurrently for the
-        # same tenant.
+        # Share this scheduler's per-tenant locks with the "sync" ops job
+        # (see JobRunner._run): the combined pull+push lock, so a background
+        # sync job, the scheduled pull and push ticks, and a manual HTTP sync
+        # can never overlap for the same tenant.
         job_runner.set_sync_lock_provider(scheduler.lock_for_tenant)
         scheduler.start()
 

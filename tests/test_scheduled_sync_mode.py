@@ -29,7 +29,13 @@ from bims_shopify.adapters.persistence.sync_state_repository import (
 from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
 from bims_shopify.config import Settings
 from bims_shopify.domain.tenant import SyncMode, Tenant
-from bims_shopify.main import _make_sync_tenant_fn
+from bims_shopify.main import _make_pull_fn, _make_push_fn
+
+async def _scheduled_cycle(session_factory, tenant: Tenant) -> None:
+    """One pull tick followed by one push tick, as the scheduler runs them."""
+    await _make_pull_fn(session_factory)(tenant)
+    await _make_push_fn(session_factory)(tenant)
+
 
 GRAPHQL = "https://acme.myshopify.com/admin/api/2025-07/graphql.json/"
 BIMS_INDEX = "https://bims.example.com/api/products/index.json"
@@ -194,7 +200,7 @@ async def test_scheduled_sync_full_sends_no_last_update_but_records_watermark(en
     mock, _pushes = _mock_world({"SKU1": 5})
 
     with mock:
-        await _make_sync_tenant_fn(session_factory)(tenant)
+        await _scheduled_cycle(session_factory, tenant)
         requests = _index_requests(mock)
     assert requests, "BIMS catalog was never pulled"
     assert all("last_update" not in r.url.params for r in requests)
@@ -212,7 +218,7 @@ async def test_scheduled_sync_ignores_the_legacy_incremental_setting(env):
     mock, _pushes = _mock_world({"SKU1": 5})
 
     with mock:
-        await _make_sync_tenant_fn(session_factory)(tenant)
+        await _scheduled_cycle(session_factory, tenant)
         requests = _index_requests(mock)
     assert requests
     assert all("last_update" not in r.url.params for r in requests)  # still a full pull
@@ -233,7 +239,7 @@ async def test_scheduled_full_sync_guard_still_blocks_mass_zero(env):
     mock, pushes = _mock_world({sku: 0 for sku in skus})  # BIMS suddenly says 0 everywhere
 
     with mock:
-        await _make_sync_tenant_fn(session_factory)(tenant)
+        await _scheduled_cycle(session_factory, tenant)
 
     assert pushes == []  # nothing reached Shopify
     async with session_factory() as session:
@@ -291,7 +297,7 @@ async def test_completed_runs_record_pull_and_push_durations_separately(env):
     tenant = await make_tenant()
     mock, _pushes = _mock_world({"SKU1": 5})
     with mock:
-        await _make_sync_tenant_fn(session_factory)(tenant)  # full by default
+        await _scheduled_cycle(session_factory, tenant)  # full by default
     async with session_factory() as session:
         repo = SqlAlchemySyncStateRepository(session)
         pulls = await repo.get_recent_durations(tenant.id, "full")
@@ -300,3 +306,33 @@ async def test_completed_runs_record_pull_and_push_durations_separately(env):
     assert len(pulls) == 1 and pulls[0] > 0
     assert len(pushes) == 1 and pushes[0] > 0
     assert incremental == []
+
+
+async def test_scheduled_workers_swallow_a_tenant_failure_and_record_it(env):
+    """One tenant's BIMS outage must not break the scheduler loop, but must be visible."""
+    session_factory, make_tenant = env
+    tenant = await make_tenant()
+    with respx.mock(assert_all_called=False) as down:
+        down.get(BIMS_INDEX).mock(return_value=httpx.Response(500))
+        await _make_pull_fn(session_factory)(tenant)  # does not raise
+    async with session_factory() as session:
+        status = await SqlAlchemySyncStateRepository(session).get_status(tenant.id)
+    assert status["last_pull_outcome"]["status"] == "failed"
+    assert status["last_error"].startswith("pull: ")
+
+    # The push needs no BIMS at all: with no snapshot it declines, it does not crash.
+    await _make_push_fn(session_factory)(tenant)
+    async with session_factory() as session:
+        status = await SqlAlchemySyncStateRepository(session).get_status(tenant.id)
+    assert status["last_push_outcome"]["reason"] == "missing"
+
+
+async def test_scheduled_pull_then_push_chain_works_without_the_pull_waiting_on_the_push(env):
+    session_factory, make_tenant = env
+    tenant = await make_tenant()
+    mock, pushes = _mock_world({"SKU1": 5})
+    with mock:
+        await _make_pull_fn(session_factory)(tenant)
+        assert pushes == []  # the pull alone never writes to Shopify
+        await _make_push_fn(session_factory)(tenant)
+    assert len(pushes) == 1

@@ -138,6 +138,24 @@ async def record_skip(session_factory: async_sessionmaker, kind: str, tenant: Te
     )
 
 
+async def last_pull_at(session_factory: async_sessionmaker, tenant: Tenant) -> datetime | None:
+    """When this tenant's catalog was last pulled (accepted or rejected), for
+    the scheduler to time the first pull after a restart. ``None``: never."""
+    if tenant.id is None:
+        return None
+    async with session_factory() as session:
+        meta = await SqlAlchemySnapshotRepository(session).get_current_meta(tenant.id)
+        outcome = (await SqlAlchemySyncStateRepository(session).get_status(tenant.id))[
+            "last_pull_outcome"
+        ]
+    candidates: list[datetime] = []
+    if meta is not None and meta.finished_at is not None:
+        candidates.append(meta.finished_at)
+    if outcome and outcome.get("status") in ("ok", "rejected", "failed") and outcome.get("at"):
+        candidates.append(datetime.fromisoformat(outcome["at"]))
+    return max(candidates) if candidates else None
+
+
 async def do_pull(
     tenant: Tenant,
     session: AsyncSession,
