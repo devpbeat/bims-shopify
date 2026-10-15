@@ -17,7 +17,7 @@ from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
 from bims_shopify.api.portal_auth import hash_password
-from bims_shopify.domain.tenant import PaymentProvider, ReorderStrategy, Tenant
+from bims_shopify.domain.tenant import PaymentProvider, ReorderStrategy, SyncMode, Tenant
 
 from .deps import (
     get_audit_logger,
@@ -56,6 +56,7 @@ class TenantCreate(BaseModel):
     auto_import_publish: bool = False
     auto_import_interval_minutes: int = 360
     auto_import_only_with_stock: bool = True
+    sync_mode: SyncMode = SyncMode.FULL
 
     @field_validator("bims_timezone")
     @classmethod
@@ -98,6 +99,7 @@ class TenantPatch(BaseModel):
     auto_import_publish: bool | None = None
     auto_import_interval_minutes: int | None = None
     auto_import_only_with_stock: bool | None = None
+    sync_mode: SyncMode | None = None
 
     @field_validator("bims_api_key", "shopify_access_token", "shopify_webhook_secret")
     @classmethod
@@ -136,6 +138,7 @@ class TenantOut(BaseModel):
     auto_import_publish: bool
     auto_import_interval_minutes: int
     auto_import_only_with_stock: bool
+    sync_mode: SyncMode
 
     @classmethod
     def from_domain(cls, tenant: Tenant) -> TenantOut:
@@ -157,6 +160,7 @@ class TenantOut(BaseModel):
             auto_import_publish=tenant.auto_import_publish,
             auto_import_interval_minutes=tenant.auto_import_interval_minutes,
             auto_import_only_with_stock=tenant.auto_import_only_with_stock,
+            sync_mode=tenant.sync_mode,
         )
 
 

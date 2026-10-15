@@ -65,6 +65,7 @@ class TenantModel(Base):
     auto_import_publish: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_import_interval_minutes: Mapped[int] = mapped_column(Integer, default=360)
     auto_import_only_with_stock: Mapped[bool] = mapped_column(Boolean, default=True)
+    sync_mode: Mapped[str] = mapped_column(String(16), default="full", server_default="full")
 
 
 class SyncStateModel(Base):

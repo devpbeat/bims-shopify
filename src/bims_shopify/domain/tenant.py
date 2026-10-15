@@ -12,6 +12,18 @@ class ReorderStrategy(str, Enum):
     NONE = "none"
 
 
+class SyncMode(str, Enum):
+    """How the scheduled inventory sync pulls the BIMS catalog.
+
+    ``full`` compares the whole BIMS catalog every run (the default: BIMS's
+    ``last_update`` filter is unreliable). ``incremental`` asks BIMS only for
+    products modified since the stored watermark.
+    """
+
+    FULL = "full"
+    INCREMENTAL = "incremental"
+
+
 class PaymentProvider(str, Enum):
     PAGOPAR = "pagopar"
     BANCARD = "bancard"
@@ -52,6 +64,7 @@ class Tenant:
     auto_import_publish: bool = False
     auto_import_interval_minutes: int = 360
     auto_import_only_with_stock: bool = True
+    sync_mode: SyncMode = SyncMode.FULL
 
     @property
     def bims_auth_header(self) -> str:

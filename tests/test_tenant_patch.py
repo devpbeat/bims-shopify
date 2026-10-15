@@ -192,3 +192,23 @@ async def test_patch_rejects_empty_secret(app_ctx):
             json={"bims_api_key": ""},
         )
     assert response.status_code == 422
+
+
+async def test_patch_sync_mode_round_trips_and_defaults_to_full(app_ctx):
+    app, _settings, _acme = app_ctx
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.get("/tenants/acme", headers=headers)).json()["sync_mode"] == "full"
+
+        patch_response = await client.patch(
+            "/tenants/acme", headers=headers, json={"sync_mode": "incremental"}
+        )
+        assert patch_response.status_code == 200
+        assert patch_response.json()["sync_mode"] == "incremental"
+
+        bad = await client.patch("/tenants/acme", headers=headers, json={"sync_mode": "sometimes"})
+        assert bad.status_code == 422
+
+    model = await _get_model(app, "acme")
+    assert model.sync_mode == "incremental"

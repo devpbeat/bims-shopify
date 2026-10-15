@@ -1,0 +1,282 @@
+"""Scheduled sync mode: tenants default to a FULL BIMS comparison every run.
+
+The incremental `last_update` filter proved unreliable on the BIMS side, so
+the scheduler stops narrowing the pull by the stored watermark unless the
+tenant is explicitly switched back to `incremental`. The watermark itself is
+still recorded either way.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import tempfile
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import httpx
+import pytest
+import respx
+from cryptography.fernet import Fernet
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
+from bims_shopify.adapters.persistence.crypto import SecretBox
+from bims_shopify.adapters.persistence.sync_state_repository import (
+    SqlAlchemySyncStateRepository,
+)
+from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
+from bims_shopify.config import Settings
+from bims_shopify.domain.tenant import SyncMode, Tenant
+from bims_shopify.main import _make_sync_tenant_fn
+
+GRAPHQL = "https://acme.myshopify.com/admin/api/2025-07/graphql.json/"
+BIMS_INDEX = "https://bims.example.com/api/products/index.json"
+BIMS_STOCK = "https://bims.example.com/api/products_stocks/stock_fenicio.json"
+
+
+@pytest.fixture
+async def env():
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as db_file:
+        pass
+    settings = Settings(
+        admin_token="t",
+        fernet_key=Fernet.generate_key().decode("utf-8"),
+        database_url=f"sqlite+aiosqlite:///{db_file.name}",
+    )
+    engine = create_async_engine(settings.database_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    from alembic.config import Config
+
+    from alembic import command
+
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(repo_root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(repo_root / "alembic"))
+    os.environ["ALEMBIC_DATABASE_URL"] = settings.database_url
+    try:
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+    finally:
+        os.environ.pop("ALEMBIC_DATABASE_URL", None)
+
+    async def make_tenant(**overrides) -> Tenant:
+        async with session_factory() as session:
+            repo = SqlAlchemyTenantRepository(session, SecretBox(settings.fernet_key))
+            defaults = dict(
+                id=None,
+                slug="acme",
+                bims_base_url="https://bims.example.com",
+                bims_api_key="acme_secretkey",
+                shopify_shop_domain="acme.myshopify.com",
+                shopify_access_token="shpat_test",
+                shopify_webhook_secret="whsecret",
+                shopify_location_id="gid://shopify/Location/1",
+                bims_posale_id=1,
+                bims_warehouse_id=1,
+                bims_company_id=1,
+                bims_currency_id=1,
+                bims_payment_method_id=1,
+                default_customer_contact_id=1,
+            )
+            defaults.update(overrides)
+            return await repo.create(Tenant(**defaults))
+
+    yield session_factory, make_tenant
+    await engine.dispose()
+    os.unlink(db_file.name)
+
+
+def _variants(*skus: str) -> dict:
+    return {
+        "data": {
+            "productVariants": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [
+                    {
+                        "id": f"gid://shopify/ProductVariant/{i}",
+                        "sku": sku,
+                        "product": {"id": f"gid://shopify/Product/{i}", "title": sku},
+                        "inventoryItem": {"id": f"gid://shopify/InventoryItem/{i}", "tracked": True},
+                    }
+                    for i, sku in enumerate(skus, start=1)
+                ],
+            }
+        }
+    }
+
+
+def _bims_product(i: int, sku: str) -> dict:
+    return {
+        "Product": {
+            "id": i,
+            "name": sku,
+            "code2": sku,
+            "sell_price": "1000",
+            "enabled": True,
+            "exclude_ecommerce": False,
+        }
+    }
+
+
+def _mock_world(stocks: dict[str, float]):
+    """BIMS returns one product per SKU with the given stock; Shopify has a
+    variant for each. Returns (respx mock, list of inventorySetQuantities calls)."""
+    pushes: list[str] = []
+    skus = list(stocks)
+
+    def graphql(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "inventorySetQuantities" in body:
+            pushes.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "inventorySetQuantities": {
+                            "inventoryAdjustmentGroup": {"createdAt": "2026-01-01T00:00:00Z"},
+                            "userErrors": [],
+                        }
+                    }
+                },
+            )
+        return httpx.Response(200, json=_variants(*skus))
+
+    mock = respx.mock(assert_all_called=False)
+    mock.get(BIMS_INDEX).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "count": str(len(skus)),
+                "data": [_bims_product(i, s) for i, s in enumerate(skus, start=1)],
+            },
+        )
+    )
+    mock.get("https://bims.example.com/api/products/deleted.json").mock(
+        return_value=httpx.Response(200, json={"status": "ok", "data": []})
+    )
+    mock.post(BIMS_STOCK).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "data": {"stockPorSku": [{"sku": s, "stock": q} for s, q in stocks.items()]},
+            },
+        )
+    )
+    mock.post(GRAPHQL).mock(side_effect=graphql)
+    return mock, pushes
+
+
+def _index_requests(mock) -> list[httpx.Request]:
+    return [c.request for c in mock.calls if str(c.request.url).startswith(BIMS_INDEX)]
+
+
+async def _prime_watermark(session_factory, tenant: Tenant) -> datetime:
+    when = datetime.now(UTC) - timedelta(hours=2)
+    async with session_factory() as session:
+        await SqlAlchemySyncStateRepository(session).set_last_run(tenant.id, when)
+    return when
+
+
+async def test_new_tenant_defaults_to_full(env):
+    _session_factory, make_tenant = env
+    tenant = await make_tenant()
+    assert tenant.sync_mode is SyncMode.FULL
+
+
+async def test_scheduled_sync_full_sends_no_last_update_but_records_watermark(env):
+    session_factory, make_tenant = env
+    tenant = await make_tenant()
+    old = await _prime_watermark(session_factory, tenant)
+    mock, _pushes = _mock_world({"SKU1": 5})
+
+    with mock:
+        await _make_sync_tenant_fn(session_factory)(tenant)
+        requests = _index_requests(mock)
+    assert requests, "BIMS catalog was never pulled"
+    assert all("last_update" not in r.url.params for r in requests)
+
+    async with session_factory() as session:
+        status = await SqlAlchemySyncStateRepository(session).get_status(tenant.id)
+    assert datetime.fromisoformat(status["last_run_at"]) > old  # watermark still recorded
+    assert status["last_run_summary"]["mode"] == "full"
+
+
+async def test_scheduled_sync_incremental_still_narrows_by_watermark(env):
+    session_factory, make_tenant = env
+    tenant = await make_tenant(sync_mode=SyncMode.INCREMENTAL)
+    await _prime_watermark(session_factory, tenant)
+    mock, _pushes = _mock_world({"SKU1": 5})
+
+    with mock:
+        await _make_sync_tenant_fn(session_factory)(tenant)
+        requests = _index_requests(mock)
+    assert requests
+    assert all("last_update" in r.url.params for r in requests)
+
+    async with session_factory() as session:
+        status = await SqlAlchemySyncStateRepository(session).get_status(tenant.id)
+    assert status["last_run_summary"]["mode"] == "incremental"
+
+
+async def test_scheduled_full_sync_guard_still_blocks_mass_zero(env):
+    session_factory, make_tenant = env
+    tenant = await make_tenant()
+    skus = [f"SKU{i}" for i in range(10)]
+    async with session_factory() as session:
+        await SqlAlchemySyncStateRepository(session).set_product_hashes(
+            tenant.id, {sku: "5" for sku in skus}
+        )
+    mock, pushes = _mock_world({sku: 0 for sku in skus})  # BIMS suddenly says 0 everywhere
+
+    with mock:
+        await _make_sync_tenant_fn(session_factory)(tenant)
+
+    assert pushes == []  # nothing reached Shopify
+    async with session_factory() as session:
+        entry = await SqlAlchemyAuditLogger(session).get_latest(
+            action="sync.needs_confirmation", tenant_id=tenant.id
+        )
+    assert entry is not None
+    assert entry.payload["report"]["guard"]["fired"] is True
+    assert entry.payload["report"]["guard"]["zero_count"] == 10
+    assert entry.payload["report"]["mode"] == "full"
+
+
+async def test_needs_confirmation_result_reports_mode(env):
+    from bims_shopify.api.sync import _do_run_sync
+
+    session_factory, make_tenant = env
+    tenant = await make_tenant()
+    skus = [f"SKU{i}" for i in range(10)]
+    async with session_factory() as session:
+        await SqlAlchemySyncStateRepository(session).set_product_hashes(
+            tenant.id, {sku: "5" for sku in skus}
+        )
+    mock, _pushes = _mock_world({sku: 0 for sku in skus})
+    with mock:
+        async with session_factory() as session:
+            result = await _do_run_sync(tenant, False, session, full=True)
+    assert result["status"] == "needs_confirmation"
+    assert result["mode"] == "full"
+
+
+async def test_manual_run_result_states_full_or_incremental(env):
+    from bims_shopify.api.sync import _do_run_sync
+
+    session_factory, make_tenant = env
+    tenant = await make_tenant()
+    await _prime_watermark(session_factory, tenant)
+    mock, _pushes = _mock_world({"SKU1": 5})
+    with mock:
+        async with session_factory() as session:
+            incremental = await _do_run_sync(tenant, False, session, full=False)
+        async with session_factory() as session:
+            full = await _do_run_sync(tenant, False, session, full=True)
+        async with session_factory() as session:
+            dry = await _do_run_sync(tenant, True, session, full=True)
+    assert incremental["mode"] == "incremental"
+    assert incremental["scanned"] == {"bims": 1, "shopify": 1}
+    assert full["mode"] == "full"
+    assert dry["mode"] == "full"

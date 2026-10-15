@@ -30,6 +30,7 @@ from bims_shopify.api import (
     webhooks,
 )
 from bims_shopify.config import get_settings
+from bims_shopify.domain.tenant import SyncMode
 from bims_shopify.logging import configure_logging, get_logger
 from bims_shopify.ops.auto_import import AutoImportCoordinator
 from bims_shopify.ops.job_runner import JobRunner
@@ -82,7 +83,7 @@ def _make_sync_tenant_fn(session_factory):
     """Build the scheduler's per-tenant sync callback.
 
     Reuses the exact same `_do_run_sync` codepath as the manual
-    `/sync/{slug}/run` endpoint (state persistence, incremental `since`,
+    `/sync/{slug}/run` endpoint (state persistence, the tenant-level full/incremental `since`,
     the per-run safety guard, deleted-products check, structured logging),
     so the scheduled job and manual runs never diverge in behavior. This
     matters in particular for `previous_stocks`/`last_run` bookkeeping:
@@ -96,7 +97,15 @@ def _make_sync_tenant_fn(session_factory):
 
         async with session_factory() as session:
             try:
-                await _do_run_sync(tenant, dry_run=False, session=session)
+                # Tenant-level setting, FULL by default: BIMS's `last_update`
+                # filter is unreliable, so the watermark is recorded but not
+                # used to narrow the pull unless explicitly switched back.
+                await _do_run_sync(
+                    tenant,
+                    dry_run=False,
+                    session=session,
+                    full=tenant.sync_mode is SyncMode.FULL,
+                )
             except Exception as exc:  # one tenant's failure must not affect others
                 logger.error(
                     "scheduled_sync_tenant_failed",

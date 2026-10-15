@@ -129,6 +129,7 @@ def _build_report(
     return {
         "scanned": {"bims": len(products), "shopify": len(sku_map)},
         "full_scan": full_scan,
+        "mode": "full" if full_scan else "incremental",
         "updated": {"count": 0, "sample": []},
         "unchanged": unchanged.as_dict(),
         "not_in_shopify": not_in_shopify.as_dict(),

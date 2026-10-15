@@ -111,6 +111,10 @@ async def _do_run_sync(
         # matches what BIMS last saw).
         since = None if (full or force) else ((last_run - INCREMENTAL_OVERLAP) if last_run else None)
 
+        # What the run actually did, not what was requested: an incremental
+        # tenant with no watermark yet still performs a full pull.
+        mode = "full" if since is None else "incremental"
+
         if since is not None:
             try:
                 deleted_ids = await erp.list_deleted_product_ids(tenant, since)
@@ -198,9 +202,10 @@ async def _do_run_sync(
                     "would_update": report.would_update,
                     "skipped_unresolved_stock": report.skipped_unresolved_stock,
                     "scanned": report.detail.get("scanned"),
+                    "mode": mode,
                 },
             )
-            return {"dry_run": True, "report": asdict(report)}
+            return {"dry_run": True, "mode": mode, "report": asdict(report)}
 
         if isinstance(result, NeedsConfirmation):
             logger.warning(
@@ -228,6 +233,7 @@ async def _do_run_sync(
             )
             # last_sync must NOT advance: nothing was pushed.
             return {
+                "mode": mode,
                 "scanned": use_case.last_report["scanned"],
                 "report": use_case.last_report,
                 "status": "needs_confirmation",
@@ -259,6 +265,7 @@ async def _do_run_sync(
             "updated": len(deltas),
             "duration_seconds": duration,
             "ran_at": run_started_at.isoformat(),
+            "mode": mode,
             "timings": timings,
             "catalog_pull": erp.last_catalog_pull.summary() if erp.last_catalog_pull else None,
             "scanned": use_case.last_report["scanned"],
@@ -282,10 +289,12 @@ async def _do_run_sync(
                 "matched": len(deltas),
                 "updated": len(deltas),
                 "scanned": use_case.last_report["scanned"],
+                "mode": mode,
             },
         )
         return {
             "status": "ok",
+            "mode": mode,
             "synced_deltas": len(deltas),
             "timings": timings,
             "scanned": use_case.last_report["scanned"],
