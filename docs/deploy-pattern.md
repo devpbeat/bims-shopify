@@ -109,6 +109,13 @@ After a successful build, a third job (`deploy`, `environment: production`) look
 the repo id in Woodpecker and POSTs to `/api/repos/{id}/pipelines` with
 `{"branch":"main"}` to fire the Woodpecker deploy pipeline (curl, no dedicated action).
 
+Verification: the `deploy` job going green only means the Woodpecker POST was
+accepted, NOT that the new container is live (a full VPS disk can make the image
+pull fail silently). Build the image with `build-args: GIT_SHA=${{ github.sha }}`
+(the Dockerfile bakes it into `ENV GIT_SHA`), expose it on a public `GET /version`,
+and poll it after deploy until the SHA matches the pushed commit. Treat the deploy
+as incomplete until it does. See `docs/deployment.md`.
+
 ## 3. Woodpecker (deploy)
 
 File: `.woodpecker.yml` at repo root. **Trigger is manual/API only, never on push**

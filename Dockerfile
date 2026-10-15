@@ -40,7 +40,12 @@ COPY --from=builder /app/alembic.ini ./
 COPY --from=builder /app/alembic ./alembic
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
-ENV PYTHONUNBUFFERED=1
+# Baked in at build time so GET /version can report what is actually running.
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=unknown
+ENV PYTHONUNBUFFERED=1 \
+    GIT_SHA=${GIT_SHA} \
+    BUILD_TIME=${BUILD_TIME}
 
 USER appuser
 
