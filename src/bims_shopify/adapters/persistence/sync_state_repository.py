@@ -8,9 +8,14 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bims_shopify.application.sync_interval import RECENT_RUNS_WINDOW
 from bims_shopify.datetime_utils import ensure_aware_utc
 
 from .models import ProcessedEventModel, SyncStateModel
+
+
+#: Entries kept in ``sync_duration_history`` (across both modes).
+DURATION_HISTORY_CAP = 40
 
 
 class SqlAlchemySyncStateRepository:
@@ -56,6 +61,30 @@ class SqlAlchemySyncStateRepository:
         model = await self._get_or_create_state(tenant_id)
         model.last_run_summary = summary
         await self._session.commit()
+
+    async def record_run_duration(
+        self, tenant_id: int, seconds: float, mode: str, when: datetime | None = None
+    ) -> None:
+        """Append a completed run's duration (used to derive the minimum safe
+        scheduler interval). Assigns a new list so the JSON column is flagged
+        dirty; trims to the most recent ``DURATION_HISTORY_CAP`` entries."""
+        model = await self._get_or_create_state(tenant_id)
+        entry = {
+            "at": (when or datetime.now(UTC)).isoformat(),
+            "seconds": float(seconds),
+            "mode": mode,
+        }
+        model.sync_duration_history = [*(model.sync_duration_history or []), entry][
+            -DURATION_HISTORY_CAP:
+        ]
+        await self._session.commit()
+
+    async def get_recent_durations(
+        self, tenant_id: int, mode: str, limit: int = RECENT_RUNS_WINDOW
+    ) -> list[float]:
+        model = await self._get_or_create_state(tenant_id)
+        runs = [e["seconds"] for e in (model.sync_duration_history or []) if e.get("mode") == mode]
+        return runs[-limit:]
 
     async def get_status(self, tenant_id: int) -> dict:
         model = await self._get_or_create_state(tenant_id)

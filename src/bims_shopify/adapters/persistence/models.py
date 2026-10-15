@@ -79,6 +79,8 @@ class SyncStateModel(Base):
     last_error: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_run_summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    #: Recent completed-run durations: [{"at", "seconds", "mode"}, ...], oldest first.
+    sync_duration_history: Mapped[list] = mapped_column(JSON, default=list, server_default="[]")
 
 
 class OAuthStateModel(Base):

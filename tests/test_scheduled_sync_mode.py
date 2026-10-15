@@ -280,3 +280,17 @@ async def test_manual_run_result_states_full_or_incremental(env):
     assert incremental["scanned"] == {"bims": 1, "shopify": 1}
     assert full["mode"] == "full"
     assert dry["mode"] == "full"
+
+
+async def test_completed_runs_record_their_duration_by_mode(env):
+    session_factory, make_tenant = env
+    tenant = await make_tenant()
+    mock, _pushes = _mock_world({"SKU1": 5})
+    with mock:
+        await _make_sync_tenant_fn(session_factory)(tenant)  # full by default
+    async with session_factory() as session:
+        repo = SqlAlchemySyncStateRepository(session)
+        full = await repo.get_recent_durations(tenant.id, "full")
+        incremental = await repo.get_recent_durations(tenant.id, "incremental")
+    assert len(full) == 1 and full[0] > 0
+    assert incremental == []

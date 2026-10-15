@@ -25,6 +25,7 @@ from bims_shopify.application.sync_inventory import (
     ProgressFn,
     SyncInventoryToShopify,
 )
+from bims_shopify.application.sync_interval import interval_floor_for
 from bims_shopify.logging import get_logger
 
 from .deps import get_db_session, get_tenant_repository, require_admin
@@ -272,6 +273,7 @@ async def _do_run_sync(
             "report": use_case.last_report,
         }
         await sync_state_repo.set_last_run_summary(tenant.id, summary)
+        await sync_state_repo.record_run_duration(tenant.id, duration, mode)
         logger.info(
             "sync_run_completed",
             tenant_slug=tenant.slug,
@@ -315,7 +317,17 @@ async def get_sync_status(
         raise HTTPException(status_code=404, detail="Unknown tenant")
 
     sync_state_repo = SqlAlchemySyncStateRepository(session)
-    return await sync_state_repo.get_status(tenant.id)
+    status = await sync_state_repo.get_status(tenant.id)
+    floor = await interval_floor_for(sync_state_repo, tenant.id, tenant.sync_mode.value)
+    status["sync_interval"] = {
+        "configured_minutes": tenant.sync_interval_minutes,
+        "min_safe_minutes": floor.minutes,
+        "basis": floor.basis,
+        "slowest_recent_seconds": floor.slowest_seconds,
+        "runs_considered": floor.runs_considered,
+        "sync_mode": tenant.sync_mode.value,
+    }
+    return status
 
 
 @router.get("/{tenant_slug}/reconciliation")

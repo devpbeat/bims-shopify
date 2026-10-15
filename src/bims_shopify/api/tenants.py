@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.portal_user_repository import (
@@ -16,11 +17,16 @@ from bims_shopify.adapters.persistence.portal_user_repository import (
 from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
+from bims_shopify.adapters.persistence.sync_state_repository import (
+    SqlAlchemySyncStateRepository,
+)
 from bims_shopify.api.portal_auth import hash_password
+from bims_shopify.application.sync_interval import interval_floor_for, rejection_detail
 from bims_shopify.domain.tenant import PaymentProvider, ReorderStrategy, SyncMode, Tenant
 
 from .deps import (
     get_audit_logger,
+    get_db_session,
     get_portal_user_repository,
     get_tenant_repository,
     require_admin,
@@ -30,6 +36,30 @@ from .deps import (
 MAX_SYNC_INTERVAL_MINUTES = 1440
 
 router = APIRouter(prefix="/tenants", tags=["tenants"], dependencies=[Depends(require_admin)])
+
+
+async def _enforce_interval_floor(session: AsyncSession, tenant: Tenant) -> None:
+    """Reject (422) an interval below the measured minimum safe interval.
+
+    The floor comes from recent completed syncs in the tenant's resulting
+    sync mode; with no history it is the documented conservative default.
+    """
+    floor = await interval_floor_for(
+        SqlAlchemySyncStateRepository(session), tenant.id, tenant.sync_mode.value
+    )
+    if tenant.sync_interval_minutes < floor.minutes:
+        raise HTTPException(
+            status_code=422, detail=rejection_detail(floor, tenant.sync_interval_minutes)
+        )
+
+
+def _schedule_changed(before: Tenant, after: Tenant) -> bool:
+    """Only changes to the schedule are checked against the floor, so an
+    unrelated edit is never blocked by a pre-existing low interval."""
+    return (
+        before.sync_interval_minutes != after.sync_interval_minutes
+        or before.sync_mode != after.sync_mode
+    )
 
 
 def _reschedule_live(request: Request, tenant: Tenant) -> None:
@@ -191,8 +221,10 @@ async def create_tenant(
     body: TenantCreate,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
+    session: AsyncSession = Depends(get_db_session),
 ):
     tenant = Tenant(id=None, **body.model_dump())
+    await _enforce_interval_floor(session, tenant)
     created = await repo.create(tenant)
     await audit.log(
         actor="admin",
@@ -221,11 +253,14 @@ async def update_tenant(
     body: TenantCreate,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
+    session: AsyncSession = Depends(get_db_session),
 ):
     existing = await repo.get_by_slug(slug)
     if existing is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
     updated = Tenant(id=existing.id, **body.model_dump())
+    if _schedule_changed(existing, updated):
+        await _enforce_interval_floor(session, updated)
     saved = await repo.update(updated)
     await audit.log(
         actor="admin",
@@ -246,6 +281,7 @@ async def patch_tenant(
     body: TenantPatch,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
+    session: AsyncSession = Depends(get_db_session),
 ):
     """Partially update a tenant: only fields present in the payload are
     changed. Omitted fields — especially secrets (bims_api_key,
@@ -258,6 +294,8 @@ async def patch_tenant(
 
     changes = body.model_dump(exclude_unset=True)
     updated = replace(existing, **changes)
+    if _schedule_changed(existing, updated):
+        await _enforce_interval_floor(session, updated)
     saved = await repo.update(updated)
     await audit.log(
         actor="admin",
