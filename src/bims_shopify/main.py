@@ -132,10 +132,19 @@ def create_app() -> FastAPI:
         job_runner = JobRunner(session_factory, settings)
         app.state.job_runner = job_runner
 
-        async with session_factory() as session:
-            repo = SqlAlchemyTenantRepository(session, SecretBox(settings.fernet_key))
+        # A fresh session per scheduler lookup (never one long-lived session):
+        # the scheduler must see interval/mode/active changes made through the
+        # API, which a session-scoped identity map would hide forever.
+        @asynccontextmanager
+        async def tenant_repository_scope():
+            async with session_factory() as session:
+                yield SqlAlchemyTenantRepository(session, SecretBox(settings.fernet_key))
+
+        async with tenant_repository_scope() as repo:
             scheduler = TenantSyncScheduler(
-                repo, _make_sync_tenant_fn(session_factory), settings.sync_interval_minutes
+                repo,
+                _make_sync_tenant_fn(session_factory),
+                repository_scope=tenant_repository_scope,
             )
         app.state.scheduler = scheduler
         # Share this scheduler's per-tenant lock with the "sync" ops job

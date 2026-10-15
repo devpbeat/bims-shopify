@@ -65,6 +65,7 @@ class Tenant:
     auto_import_interval_minutes: int = 360
     auto_import_only_with_stock: bool = True
     sync_mode: SyncMode = SyncMode.FULL
+    sync_interval_minutes: int = 30
 
     @property
     def bims_auth_header(self) -> str:

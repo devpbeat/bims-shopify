@@ -212,3 +212,49 @@ async def test_patch_sync_mode_round_trips_and_defaults_to_full(app_ctx):
 
     model = await _get_model(app, "acme")
     assert model.sync_mode == "incremental"
+
+
+async def test_patch_sync_interval_round_trips_and_defaults_to_30(app_ctx):
+    app, _settings, _acme = app_ctx
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        got = await client.get("/tenants/acme", headers=headers)
+        assert got.json()["sync_interval_minutes"] == 30
+
+        patched = await client.patch("/tenants/acme", headers=headers, json={"sync_interval_minutes": 45})
+        assert patched.status_code == 200
+        assert patched.json()["sync_interval_minutes"] == 45
+
+        for bad in (0, -5, 100000):
+            rejected = await client.patch(
+                "/tenants/acme", headers=headers, json={"sync_interval_minutes": bad}
+            )
+            assert rejected.status_code == 422
+
+    assert (await _get_model(app, "acme")).sync_interval_minutes == 45
+
+
+class _RecordingScheduler:
+    def __init__(self) -> None:
+        self.rescheduled: list[tuple[str, int]] = []
+        self.removed: list[int] = []
+
+    def reschedule_tenant(self, tenant) -> None:
+        self.rescheduled.append((tenant.slug, tenant.sync_interval_minutes))
+
+    def remove_tenant(self, tenant_id: int) -> None:
+        self.removed.append(tenant_id)
+
+
+async def test_patch_reschedules_the_live_scheduler(app_ctx):
+    app, _settings, acme = app_ctx
+    scheduler = _RecordingScheduler()
+    app.state.scheduler = scheduler
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.patch("/tenants/acme", headers=headers, json={"sync_interval_minutes": 60})
+        await client.delete("/tenants/acme", headers=headers)
+    assert scheduler.rescheduled == [("acme", 60)]
+    assert scheduler.removed == [acme.id]

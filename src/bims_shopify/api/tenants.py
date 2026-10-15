@@ -6,8 +6,8 @@ import secrets
 from dataclasses import replace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, field_validator
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field, field_validator
 
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.portal_user_repository import (
@@ -26,7 +26,18 @@ from .deps import (
     require_admin,
 )
 
+#: Upper bound for the per-tenant sync interval (one day).
+MAX_SYNC_INTERVAL_MINUTES = 1440
+
 router = APIRouter(prefix="/tenants", tags=["tenants"], dependencies=[Depends(require_admin)])
+
+
+def _reschedule_live(request: Request, tenant: Tenant) -> None:
+    """Apply the saved tenant's interval to the running scheduler, so a
+    change takes effect immediately instead of at the next restart."""
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is not None:
+        scheduler.reschedule_tenant(tenant)
 
 
 class TenantCreate(BaseModel):
@@ -57,6 +68,7 @@ class TenantCreate(BaseModel):
     auto_import_interval_minutes: int = 360
     auto_import_only_with_stock: bool = True
     sync_mode: SyncMode = SyncMode.FULL
+    sync_interval_minutes: int = Field(default=30, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
 
     @field_validator("bims_timezone")
     @classmethod
@@ -100,6 +112,7 @@ class TenantPatch(BaseModel):
     auto_import_interval_minutes: int | None = None
     auto_import_only_with_stock: bool | None = None
     sync_mode: SyncMode | None = None
+    sync_interval_minutes: int | None = Field(default=None, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
 
     @field_validator("bims_api_key", "shopify_access_token", "shopify_webhook_secret")
     @classmethod
@@ -139,6 +152,7 @@ class TenantOut(BaseModel):
     auto_import_interval_minutes: int
     auto_import_only_with_stock: bool
     sync_mode: SyncMode
+    sync_interval_minutes: int
 
     @classmethod
     def from_domain(cls, tenant: Tenant) -> TenantOut:
@@ -161,6 +175,7 @@ class TenantOut(BaseModel):
             auto_import_interval_minutes=tenant.auto_import_interval_minutes,
             auto_import_only_with_stock=tenant.auto_import_only_with_stock,
             sync_mode=tenant.sync_mode,
+            sync_interval_minutes=tenant.sync_interval_minutes,
         )
 
 
@@ -172,6 +187,7 @@ async def list_tenants(repo: SqlAlchemyTenantRepository = Depends(get_tenant_rep
 
 @router.post("", response_model=TenantOut, status_code=201)
 async def create_tenant(
+    request: Request,
     body: TenantCreate,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
@@ -186,6 +202,7 @@ async def create_tenant(
         entity_id=created.slug,
         payload={"slug": created.slug},
     )
+    _reschedule_live(request, created)
     return TenantOut.from_domain(created)
 
 
@@ -199,6 +216,7 @@ async def get_tenant(slug: str, repo: SqlAlchemyTenantRepository = Depends(get_t
 
 @router.put("/{slug}", response_model=TenantOut)
 async def update_tenant(
+    request: Request,
     slug: str,
     body: TenantCreate,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
@@ -217,11 +235,13 @@ async def update_tenant(
         entity_id=saved.slug,
         payload={"slug": saved.slug},
     )
+    _reschedule_live(request, saved)
     return TenantOut.from_domain(saved)
 
 
 @router.patch("/{slug}", response_model=TenantOut)
 async def patch_tenant(
+    request: Request,
     slug: str,
     body: TenantPatch,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
@@ -248,11 +268,13 @@ async def patch_tenant(
         # Field NAMES only, never values, so secrets never land in the audit log.
         payload={"fields": sorted(changes.keys())},
     )
+    _reschedule_live(request, saved)
     return TenantOut.from_domain(saved)
 
 
 @router.delete("/{slug}", status_code=204)
 async def delete_tenant(
+    request: Request,
     slug: str,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
@@ -271,6 +293,9 @@ async def delete_tenant(
         payload={"slug": existing.slug},
     )
     await repo.delete(existing.id)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is not None:
+        scheduler.remove_tenant(existing.id)
 
 
 class PortalTokenOut(BaseModel):

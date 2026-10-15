@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./bims_shopify.db"
     admin_token: str = "change-me"
     fernet_key: str = ""
+    # Deprecated and no longer read: the sync interval is a per-tenant setting
+    # (tenants.sync_interval_minutes, editable via the tenant API).
     sync_interval_minutes: int = 30
     auto_import_tick_minutes: int = 15
     log_level: str = "INFO"
