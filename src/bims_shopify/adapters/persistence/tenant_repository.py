@@ -48,7 +48,7 @@ class SqlAlchemyTenantRepository:
             sync_interval_minutes=model.sync_interval_minutes,
             push_interval_minutes=model.push_interval_minutes,
             snapshot_max_age_minutes=model.snapshot_max_age_minutes,
-            pull_min_ratio=model.pull_min_ratio,
+            pull_max_drop_ratio=model.pull_max_drop_ratio,
         )
 
     def _apply_domain(self, model: TenantModel, tenant: Tenant) -> None:
@@ -82,7 +82,7 @@ class SqlAlchemyTenantRepository:
         model.sync_interval_minutes = tenant.sync_interval_minutes
         model.push_interval_minutes = tenant.push_interval_minutes
         model.snapshot_max_age_minutes = tenant.snapshot_max_age_minutes
-        model.pull_min_ratio = tenant.pull_min_ratio
+        model.pull_max_drop_ratio = tenant.pull_max_drop_ratio
 
     async def get_by_slug(self, slug: str) -> Tenant | None:
         result = await self._session.execute(select(TenantModel).where(TenantModel.slug == slug))

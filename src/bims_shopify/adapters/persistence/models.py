@@ -75,8 +75,8 @@ class TenantModel(Base):
     snapshot_max_age_minutes: Mapped[int] = mapped_column(
         Integer, default=120, server_default="120"
     )
-    #: A pull returning fewer rows than this fraction of the previous snapshot is rejected.
-    pull_min_ratio: Mapped[float] = mapped_column(Float, default=0.30, server_default="0.3")
+    #: A pull with MORE than this fraction fewer rows than the previous snapshot is rejected.
+    pull_max_drop_ratio: Mapped[float] = mapped_column(Float, default=0.30, server_default="0.3")
 
 
 class SyncStateModel(Base):

@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 from bims_shopify.domain.product import ProductSnapshot
 from bims_shopify.domain.sale import SaleOrder, SaleResult
+from bims_shopify.domain.snapshot import CatalogPull
 from bims_shopify.domain.tenant import Tenant
 
 
@@ -18,6 +19,17 @@ class ERPPort(Protocol):
         When ``since`` is given, only products modified after that timestamp
         are returned (incremental pull); stock is still resolved for all of
         them via a separate warehouse-scoped stock lookup.
+        """
+        ...
+
+    async def pull_catalog(
+        self, tenant: Tenant, since: datetime | None = None, *, warehouse_detail: bool = True
+    ) -> CatalogPull:
+        """Pull every product row plus aggregated and per-warehouse stock.
+
+        What the PULL worker persists as the catalog snapshot. Unlike
+        ``list_products`` it keeps rows that are not eligible and does not
+        resolve absent stock; that is done when the snapshot is read.
         """
         ...
 

@@ -51,10 +51,17 @@ class SqlAlchemySyncStateRepository:
         model.last_error_at = datetime.now(UTC)
         await self._session.commit()
 
-    async def clear_last_error(self, tenant_id: int) -> None:
+    async def clear_last_error(self, tenant_id: int, only_prefix: str | None = None) -> None:
         """Clear a stale error after a successful sync so sync-status stops
-        surfacing errors from runs that have since succeeded."""
+        surfacing errors from runs that have since succeeded.
+
+        With ``only_prefix`` (``"pull: "`` / ``"push: "``) the error is cleared
+        only if it came from that worker: the pull and push share one error
+        slot, and a healthy push must not hide a pull that is still failing.
+        """
         model = await self._get_or_create_state(tenant_id)
+        if only_prefix is not None and not (model.last_error or "").startswith(only_prefix):
+            return
         model.last_error = None
         model.last_error_at = None
         await self._session.commit()

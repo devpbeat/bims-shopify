@@ -272,17 +272,17 @@ async def test_new_worker_settings_default_and_round_trip(ctx):
         defaults = (await client.get("/tenants/acme", headers=HEADERS)).json()
         assert defaults["push_interval_minutes"] == 5
         assert defaults["snapshot_max_age_minutes"] == 120
-        assert defaults["pull_min_ratio"] == 0.30
+        assert defaults["pull_max_drop_ratio"] == 0.30
 
         patched = await client.patch(
             "/tenants/acme",
             headers=HEADERS,
-            json={"push_interval_minutes": 2, "snapshot_max_age_minutes": 90, "pull_min_ratio": 0.5},
+            json={"push_interval_minutes": 2, "snapshot_max_age_minutes": 90, "pull_max_drop_ratio": 0.5},
         )
         assert patched.status_code == 200
         body = patched.json()
         assert (body["push_interval_minutes"], body["snapshot_max_age_minutes"]) == (2, 90)
-        assert body["pull_min_ratio"] == 0.5
+        assert body["pull_max_drop_ratio"] == 0.5
 
 
 @pytest.mark.parametrize(
@@ -290,8 +290,8 @@ async def test_new_worker_settings_default_and_round_trip(ctx):
     [
         {"push_interval_minutes": 0},
         {"snapshot_max_age_minutes": 0},
-        {"pull_min_ratio": 0},
-        {"pull_min_ratio": 1.5},
+        {"pull_max_drop_ratio": 0},
+        {"pull_max_drop_ratio": 1.5},
     ],
 )
 async def test_worker_settings_are_range_checked(ctx, payload):

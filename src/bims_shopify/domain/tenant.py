@@ -77,8 +77,9 @@ class Tenant:
     push_interval_minutes: int = 5
     #: The push worker declines to push from a snapshot older than this.
     snapshot_max_age_minutes: int = 120
-    #: A pull returning fewer rows than this fraction of the previous snapshot is rejected.
-    pull_min_ratio: float = 0.30
+    #: A pull with MORE than this fraction fewer rows than the previous snapshot is rejected
+    #: (0.30: a 33,705 -> 11,355 row pull is a 66% drop and is refused; 1.0 disables it).
+    pull_max_drop_ratio: float = 0.30
 
     @property
     def bims_auth_header(self) -> str:

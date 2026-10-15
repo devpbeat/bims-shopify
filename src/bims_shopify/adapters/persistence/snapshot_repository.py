@@ -151,14 +151,20 @@ class SqlAlchemySnapshotRepository:
         await self._session.commit()
 
     async def promote(
-        self, snapshot_id: int, finished_at: datetime, stats: dict[str, Any] | None = None
+        self,
+        snapshot_id: int,
+        finished_at: datetime,
+        stats: dict[str, Any] | None = None,
+        extra_timings: dict[str, Any] | None = None,
     ) -> SnapshotMeta:
         """Make a staged generation the tenant's current snapshot (atomically)."""
-        tenant_id = (
+        tenant_id, timings = (
             await self._session.execute(
-                select(CatalogSnapshotModel.tenant_id).where(CatalogSnapshotModel.id == snapshot_id)
+                select(CatalogSnapshotModel.tenant_id, CatalogSnapshotModel.timings).where(
+                    CatalogSnapshotModel.id == snapshot_id
+                )
             )
-        ).scalar_one()
+        ).one()
         # One transaction: demote the old current, promote the new one. The
         # partial unique index makes a second current impossible.
         await self._session.execute(
@@ -169,11 +175,23 @@ class SqlAlchemySnapshotRepository:
         await self._session.execute(
             update(CatalogSnapshotModel)
             .where(CatalogSnapshotModel.id == snapshot_id)
-            .values(status=STATUS_CURRENT, is_current=True, finished_at=finished_at, stats=stats)
+            .values(
+                status=STATUS_CURRENT,
+                is_current=True,
+                finished_at=finished_at,
+                stats=stats,
+                timings={**(timings or {}), **(extra_timings or {})},
+            )
         )
         await self._session.commit()
         await self._purge(tenant_id)
         return await self._meta_by_id(snapshot_id)
+
+    async def set_stats(self, snapshot_id: int, stats: dict[str, Any]) -> None:
+        await self._session.execute(
+            update(CatalogSnapshotModel).where(CatalogSnapshotModel.id == snapshot_id).values(stats=stats)
+        )
+        await self._session.commit()
 
     async def record_rejected(
         self,

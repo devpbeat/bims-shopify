@@ -6,9 +6,10 @@ Create Date: 2026-10-15 01:10:00.000000
 
 With the sync split into a PULL worker (`sync_interval_minutes`, unchanged) and
 a PUSH worker, the push needs its own cadence, a staleness limit beyond which
-it refuses to push from the snapshot, and the pull needs the row-count ratio
-below which a new pull is rejected as implausible. All per tenant, all editable
-through the tenant API and applied without a restart.
+it refuses to push from the snapshot, and the pull needs the largest row-count
+drop (default 30%) it will accept before rejecting a new pull as implausible.
+All per tenant, all editable through the tenant API and applied without a
+restart.
 """
 from collections.abc import Sequence
 
@@ -36,14 +37,14 @@ def upgrade() -> None:
             "tenants",
             sa.Column("snapshot_max_age_minutes", sa.Integer(), nullable=False, server_default="120"),
         )
-    if "pull_min_ratio" not in existing_columns:
+    if "pull_max_drop_ratio" not in existing_columns:
         op.add_column(
             "tenants",
-            sa.Column("pull_min_ratio", sa.Float(), nullable=False, server_default="0.3"),
+            sa.Column("pull_max_drop_ratio", sa.Float(), nullable=False, server_default="0.3"),
         )
 
 
 def downgrade() -> None:
-    op.drop_column("tenants", "pull_min_ratio")
+    op.drop_column("tenants", "pull_max_drop_ratio")
     op.drop_column("tenants", "snapshot_max_age_minutes")
     op.drop_column("tenants", "push_interval_minutes")

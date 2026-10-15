@@ -107,6 +107,7 @@ from bims_shopify.adapters.persistence.sync_state_repository import (
 from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
 from bims_shopify.adapters.shopify.client import ShopifyClient, ShopifyGraphQLError
 from bims_shopify.config import get_settings
+from bims_shopify.domain.snapshot import CatalogRow
 from bims_shopify.domain.tenant import Tenant
 
 logger = logging.getLogger(__name__)
@@ -547,6 +548,63 @@ async def fetch_existing_skus(shopify_client: ShopifyClient) -> set[str]:
 
 def group_skus(group: ProductGroup) -> set[str]:
     return {v.sku for v in group.variants}
+
+
+def catalog_row_to_raw(row: CatalogRow) -> dict[str, Any]:
+    """A snapshot row as the raw BIMS dict the import/status helpers consume."""
+    return {
+        "id": row.bims_id,
+        "name": row.name,
+        "code2": row.code2,
+        "sell_price": row.sell_price,
+        "enabled": row.enabled,
+        "exclude_ecommerce": row.exclude_ecommerce,
+        "company_id": row.company_id,
+    }
+
+
+def bims_catalog_stats(
+    raw_rows: list[dict[str, Any]], stock_by_sku: dict[str, float]
+) -> tuple[dict[str, Any], set[str]]:
+    """The BIMS half of the status/dashboard numbers, plus the eligible SKU set.
+
+    Single source for ``status`` (live or from the snapshot) and for the pull
+    worker, so the dashboard can never disagree with ``status``.
+    """
+    rows, duplicates = filter_and_dedupe_rows(raw_rows)
+    grouping = group_rows(rows)
+    bims_skus = {v.sku for g in grouping.groups for v in g.variants}
+    with_stock = sum(
+        1 for g in grouping.groups if any(stock_by_sku.get(v.sku, 0.0) > 0 for v in g.variants)
+    )
+    return (
+        {
+            "eligible_products": len(grouping.groups),
+            "eligible_variants": len(rows),
+            "duplicate_code2": len(duplicates),
+            "with_stock": with_stock,
+        },
+        bims_skus,
+    )
+
+
+def reconciliation_audit_payload(
+    bims: dict[str, Any], shopify: dict[str, Any], reconciliation: dict[str, Any]
+) -> dict[str, Any]:
+    """Counts only (not the SKU samples) so audit_logs stays small.
+
+    This is the ``catalog.reconciliation`` entry the portal dashboard and
+    ``GET /sync/{slug}/reconciliation`` read.
+    """
+    return {
+        "bims": bims,
+        "shopify": shopify,
+        "reconciliation": {
+            "skus_in_bims_not_in_shopify": reconciliation["skus_in_bims_not_in_shopify"]["count"],
+            "skus_in_shopify_not_in_bims": reconciliation["skus_in_shopify_not_in_bims"]["count"],
+            "matched_skus": reconciliation["matched_skus"],
+        },
+    }
 
 
 def reconciliation_diff(bims_skus: set[str], shopify_skus: set[str]) -> dict[str, Any]:
@@ -2027,19 +2085,14 @@ async def _run_status(
     try:
         await _emit_progress(progress, 0, None, "pulling BIMS catalog")
         pull = await fetch_bims_catalog_pull(bims_client, tenant.bims_company_id)
-        rows, duplicates = filter_and_dedupe_rows(pull.rows)
-        grouping = group_rows(rows)
-        bims_skus = {v.sku for g in grouping.groups for v in g.variants}
+        # Eligible SKUs first (stock is only fetched for those), then the stats.
+        _, bims_skus = bims_catalog_stats(pull.rows, {})
 
         all_skus = list(bims_skus)
         stock_started = time.perf_counter()
         stock_by_sku = await fetch_stock_by_sku(bims_client, all_skus, tenant.stock_warehouse_ids)
         stock_fetch_seconds = time.perf_counter() - stock_started
-        bims_with_stock = sum(
-            1
-            for g in grouping.groups
-            if any(stock_by_sku.get(v.sku, 0.0) > 0 for v in g.variants)
-        )
+        bims_stats, bims_skus = bims_catalog_stats(pull.rows, stock_by_sku)
 
         await _emit_progress(progress, 1, 2, "bims pull done, pulling Shopify catalog")
 
@@ -2061,12 +2114,7 @@ async def _run_status(
         reconciliation = reconciliation_diff(bims_skus, shopify_skus)
 
         report: dict[str, Any] = {
-            "bims": {
-                "eligible_products": len(grouping.groups),
-                "eligible_variants": len(rows),
-                "duplicate_code2": len(duplicates),
-                "with_stock": bims_with_stock,
-            },
+            "bims": bims_stats,
             "shopify": {
                 "products": shopify_products,
                 "variants": shopify_variants,
@@ -2085,19 +2133,7 @@ async def _run_status(
         await _audit(
             tenant.id,
             "catalog.reconciliation",
-            {
-                "bims": report["bims"],
-                "shopify": report["shopify"],
-                "reconciliation": {
-                    "skus_in_bims_not_in_shopify": reconciliation["skus_in_bims_not_in_shopify"][
-                        "count"
-                    ],
-                    "skus_in_shopify_not_in_bims": reconciliation["skus_in_shopify_not_in_bims"][
-                        "count"
-                    ],
-                    "matched_skus": reconciliation["matched_skus"],
-                },
-            },
+            reconciliation_audit_payload(report["bims"], report["shopify"], reconciliation),
         )
 
         return report
