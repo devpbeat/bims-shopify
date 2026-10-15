@@ -69,6 +69,14 @@ class TenantModel(Base):
     auto_import_only_with_stock: Mapped[bool] = mapped_column(Boolean, default=True)
     sync_mode: Mapped[str] = mapped_column(String(16), default="full", server_default="full")
     sync_interval_minutes: Mapped[int] = mapped_column(Integer, default=30, server_default="30")
+    #: Push worker cadence (the PULL cadence is ``sync_interval_minutes``).
+    push_interval_minutes: Mapped[int] = mapped_column(Integer, default=5, server_default="5")
+    #: The push worker declines to push from a snapshot older than this.
+    snapshot_max_age_minutes: Mapped[int] = mapped_column(
+        Integer, default=120, server_default="120"
+    )
+    #: A pull returning fewer rows than this fraction of the previous snapshot is rejected.
+    pull_min_ratio: Mapped[float] = mapped_column(Float, default=0.30, server_default="0.3")
 
 
 class SyncStateModel(Base):
@@ -83,6 +91,10 @@ class SyncStateModel(Base):
     last_run_summary: Mapped[dict] = mapped_column(JSON, default=dict)
     #: Recent completed-run durations: [{"at", "seconds", "mode"}, ...], oldest first.
     sync_duration_history: Mapped[list] = mapped_column(JSON, default=list, server_default="[]")
+    #: Outcome of the latest pull tick (ok | rejected | skipped | failed) with its numbers.
+    last_pull_outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: Outcome of the latest push tick (ok | unchanged | declined | needs_confirmation | failed).
+    last_push_outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class OAuthStateModel(Base):

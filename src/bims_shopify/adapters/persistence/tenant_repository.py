@@ -46,6 +46,9 @@ class SqlAlchemyTenantRepository:
             auto_import_only_with_stock=model.auto_import_only_with_stock,
             sync_mode=SyncMode(model.sync_mode),
             sync_interval_minutes=model.sync_interval_minutes,
+            push_interval_minutes=model.push_interval_minutes,
+            snapshot_max_age_minutes=model.snapshot_max_age_minutes,
+            pull_min_ratio=model.pull_min_ratio,
         )
 
     def _apply_domain(self, model: TenantModel, tenant: Tenant) -> None:
@@ -77,6 +80,9 @@ class SqlAlchemyTenantRepository:
         model.auto_import_only_with_stock = tenant.auto_import_only_with_stock
         model.sync_mode = tenant.sync_mode.value
         model.sync_interval_minutes = tenant.sync_interval_minutes
+        model.push_interval_minutes = tenant.push_interval_minutes
+        model.snapshot_max_age_minutes = tenant.snapshot_max_age_minutes
+        model.pull_min_ratio = tenant.pull_min_ratio
 
     async def get_by_slug(self, slug: str) -> Tenant | None:
         result = await self._session.execute(select(TenantModel).where(TenantModel.slug == slug))

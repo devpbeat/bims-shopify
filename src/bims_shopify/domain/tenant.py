@@ -18,6 +18,12 @@ class SyncMode(str, Enum):
     ``full`` compares the whole BIMS catalog every run (the default: BIMS's
     ``last_update`` filter is unreliable). ``incremental`` asks BIMS only for
     products modified since the stored watermark.
+
+    DEPRECATED since the pull/push split: the pull worker always pulls the
+    whole catalog (a partial pull cannot replace a snapshot, and stock changes
+    do not touch a product's ``last_update``), so this no longer changes what
+    the workers do. The setting is kept so stored values and API clients keep
+    working.
     """
 
     FULL = "full"
@@ -65,7 +71,14 @@ class Tenant:
     auto_import_interval_minutes: int = 360
     auto_import_only_with_stock: bool = True
     sync_mode: SyncMode = SyncMode.FULL
+    #: PULL worker cadence (BIMS -> snapshot). The name predates the split.
     sync_interval_minutes: int = 30
+    #: PUSH worker cadence (snapshot -> Shopify).
+    push_interval_minutes: int = 5
+    #: The push worker declines to push from a snapshot older than this.
+    snapshot_max_age_minutes: int = 120
+    #: A pull returning fewer rows than this fraction of the previous snapshot is rejected.
+    pull_min_ratio: float = 0.30
 
     @property
     def bims_auth_header(self) -> str:

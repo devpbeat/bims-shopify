@@ -21,7 +21,12 @@ from bims_shopify.adapters.persistence.sync_state_repository import (
     SqlAlchemySyncStateRepository,
 )
 from bims_shopify.api.portal_auth import hash_password
-from bims_shopify.application.sync_interval import interval_floor_for, rejection_detail
+from bims_shopify.application.sync_interval import (
+    PULL_MODE,
+    PUSH_MODE,
+    interval_floor_for,
+    rejection_detail,
+)
 from bims_shopify.domain.tenant import PaymentProvider, ReorderStrategy, SyncMode, Tenant
 
 from .deps import (
@@ -34,32 +39,78 @@ from .deps import (
 
 #: Upper bound for the per-tenant sync interval (one day).
 MAX_SYNC_INTERVAL_MINUTES = 1440
+#: Upper bound for the snapshot staleness limit (one week).
+MAX_SNAPSHOT_MAX_AGE_MINUTES = 10080
 
 router = APIRouter(prefix="/tenants", tags=["tenants"], dependencies=[Depends(require_admin)])
 
 
-async def _enforce_interval_floor(session: AsyncSession, tenant: Tenant) -> None:
-    """Reject (422) an interval below the measured minimum safe interval.
+async def _enforce_interval_floor(
+    session: AsyncSession, tenant: Tenant, before: Tenant | None = None
+) -> None:
+    """Reject (422) a worker interval below its measured minimum safe interval.
 
-    The floor comes from recent completed syncs in the tenant's resulting
-    sync mode; with no history it is the documented conservative default.
+    * PULL (``sync_interval_minutes``): floor from recent completed pulls. Every
+      pull is a full pull, so the floor never depends on ``sync_mode``.
+    * PUSH (``push_interval_minutes``): floor from recent completed pushes.
+
+    With no history the pull gets the documented conservative default and the
+    push the 1-minute minimum. Each is checked only when it is being changed
+    (``before`` given), so an unrelated edit is never blocked by a
+    pre-existing low value.
     """
-    floor = await interval_floor_for(
-        SqlAlchemySyncStateRepository(session), tenant.id, tenant.sync_mode.value
-    )
-    if tenant.sync_interval_minutes < floor.minutes:
+    repo = SqlAlchemySyncStateRepository(session)
+    if before is None or tenant.sync_interval_minutes != before.sync_interval_minutes:
+        floor = await interval_floor_for(repo, tenant.id, PULL_MODE)
+        if tenant.sync_interval_minutes < floor.minutes:
+            raise HTTPException(
+                status_code=422, detail=rejection_detail(floor, tenant.sync_interval_minutes)
+            )
+    if before is None or tenant.push_interval_minutes != before.push_interval_minutes:
+        floor = await interval_floor_for(repo, tenant.id, PUSH_MODE)
+        if tenant.push_interval_minutes < floor.minutes:
+            raise HTTPException(
+                status_code=422,
+                detail=rejection_detail(floor, tenant.push_interval_minutes, "push_interval_minutes"),
+            )
+
+
+#: The snapshot may be this many pull intervals old before the push declines:
+#: two means exactly one pull can fail, be rejected or be skipped without the
+#: push going dark; a third consecutive miss does stop it.
+STALENESS_PULL_INTERVALS = 2
+
+
+def _enforce_staleness_limit(before: Tenant | None, tenant: Tenant) -> None:
+    """Reject (422) a staleness limit the pull cadence can never satisfy.
+
+    Checked only when the pull interval or the limit changes. With a limit
+    shorter than the pull cadence the snapshot is "stale" for part of every
+    cycle and the push would decline for no reason.
+    """
+    if (
+        before is not None
+        and before.sync_interval_minutes == tenant.sync_interval_minutes
+        and before.snapshot_max_age_minutes == tenant.snapshot_max_age_minutes
+    ):
+        return
+    needed = STALENESS_PULL_INTERVALS * tenant.sync_interval_minutes
+    if tenant.snapshot_max_age_minutes < needed:
         raise HTTPException(
-            status_code=422, detail=rejection_detail(floor, tenant.sync_interval_minutes)
+            status_code=422,
+            detail={
+                "message": (
+                    f"snapshot_max_age_minutes={tenant.snapshot_max_age_minutes} is too small for "
+                    f"sync_interval_minutes={tenant.sync_interval_minutes}: the push would decline "
+                    f"as stale during part of every cycle. It must be at least "
+                    f"{STALENESS_PULL_INTERVALS} x the pull interval = {needed} minutes, so one "
+                    "failed or rejected pull does not stop the push."
+                ),
+                "field": "snapshot_max_age_minutes",
+                "min_minutes": needed,
+                "requested_minutes": tenant.snapshot_max_age_minutes,
+            },
         )
-
-
-def _schedule_changed(before: Tenant, after: Tenant) -> bool:
-    """Only changes to the schedule are checked against the floor, so an
-    unrelated edit is never blocked by a pre-existing low interval."""
-    return (
-        before.sync_interval_minutes != after.sync_interval_minutes
-        or before.sync_mode != after.sync_mode
-    )
 
 
 def _reschedule_live(request: Request, tenant: Tenant) -> None:
@@ -99,6 +150,9 @@ class TenantCreate(BaseModel):
     auto_import_only_with_stock: bool = True
     sync_mode: SyncMode = SyncMode.FULL
     sync_interval_minutes: int = Field(default=30, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
+    push_interval_minutes: int = Field(default=5, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
+    snapshot_max_age_minutes: int = Field(default=120, ge=1, le=MAX_SNAPSHOT_MAX_AGE_MINUTES)
+    pull_min_ratio: float = Field(default=0.30, gt=0, le=1)
 
     @field_validator("bims_timezone")
     @classmethod
@@ -143,6 +197,11 @@ class TenantPatch(BaseModel):
     auto_import_only_with_stock: bool | None = None
     sync_mode: SyncMode | None = None
     sync_interval_minutes: int | None = Field(default=None, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
+    push_interval_minutes: int | None = Field(default=None, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
+    snapshot_max_age_minutes: int | None = Field(
+        default=None, ge=1, le=MAX_SNAPSHOT_MAX_AGE_MINUTES
+    )
+    pull_min_ratio: float | None = Field(default=None, gt=0, le=1)
 
     @field_validator("bims_api_key", "shopify_access_token", "shopify_webhook_secret")
     @classmethod
@@ -183,6 +242,9 @@ class TenantOut(BaseModel):
     auto_import_only_with_stock: bool
     sync_mode: SyncMode
     sync_interval_minutes: int
+    push_interval_minutes: int
+    snapshot_max_age_minutes: int
+    pull_min_ratio: float
 
     @classmethod
     def from_domain(cls, tenant: Tenant) -> TenantOut:
@@ -206,6 +268,9 @@ class TenantOut(BaseModel):
             auto_import_only_with_stock=tenant.auto_import_only_with_stock,
             sync_mode=tenant.sync_mode,
             sync_interval_minutes=tenant.sync_interval_minutes,
+            push_interval_minutes=tenant.push_interval_minutes,
+            snapshot_max_age_minutes=tenant.snapshot_max_age_minutes,
+            pull_min_ratio=tenant.pull_min_ratio,
         )
 
 
@@ -225,6 +290,7 @@ async def create_tenant(
 ):
     tenant = Tenant(id=None, **body.model_dump())
     await _enforce_interval_floor(session, tenant)
+    _enforce_staleness_limit(None, tenant)
     created = await repo.create(tenant)
     await audit.log(
         actor="admin",
@@ -259,8 +325,8 @@ async def update_tenant(
     if existing is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
     updated = Tenant(id=existing.id, **body.model_dump())
-    if _schedule_changed(existing, updated):
-        await _enforce_interval_floor(session, updated)
+    await _enforce_interval_floor(session, updated, existing)
+    _enforce_staleness_limit(existing, updated)
     saved = await repo.update(updated)
     await audit.log(
         actor="admin",
@@ -294,8 +360,8 @@ async def patch_tenant(
 
     changes = body.model_dump(exclude_unset=True)
     updated = replace(existing, **changes)
-    if _schedule_changed(existing, updated):
-        await _enforce_interval_floor(session, updated)
+    await _enforce_interval_floor(session, updated, existing)
+    _enforce_staleness_limit(existing, updated)
     saved = await repo.update(updated)
     await audit.log(
         actor="admin",

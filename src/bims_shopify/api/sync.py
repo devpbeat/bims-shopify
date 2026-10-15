@@ -25,7 +25,7 @@ from bims_shopify.application.sync_inventory import (
     ProgressFn,
     SyncInventoryToShopify,
 )
-from bims_shopify.application.sync_interval import interval_floor_for
+from bims_shopify.application.sync_interval import PULL_MODE, PUSH_MODE, interval_floor_for
 from bims_shopify.logging import get_logger
 
 from .deps import get_db_session, get_tenant_repository, require_admin
@@ -318,15 +318,26 @@ async def get_sync_status(
 
     sync_state_repo = SqlAlchemySyncStateRepository(session)
     status = await sync_state_repo.get_status(tenant.id)
-    floor = await interval_floor_for(sync_state_repo, tenant.id, tenant.sync_mode.value)
+    floor = await interval_floor_for(sync_state_repo, tenant.id, PULL_MODE)
     status["sync_interval"] = {
         "configured_minutes": tenant.sync_interval_minutes,
         "min_safe_minutes": floor.minutes,
         "basis": floor.basis,
         "slowest_recent_seconds": floor.slowest_seconds,
         "runs_considered": floor.runs_considered,
-        "sync_mode": tenant.sync_mode.value,
+        # Every pull is a full pull; the setting below no longer changes that.
+        "sync_mode": floor.sync_mode,
+        "sync_mode_setting": tenant.sync_mode.value,
     }
+    push_floor = await interval_floor_for(sync_state_repo, tenant.id, PUSH_MODE)
+    status["push_interval"] = {
+        "configured_minutes": tenant.push_interval_minutes,
+        "min_safe_minutes": push_floor.minutes,
+        "basis": push_floor.basis,
+        "slowest_recent_seconds": push_floor.slowest_seconds,
+        "runs_considered": push_floor.runs_considered,
+    }
+    status["snapshot_max_age_minutes"] = tenant.snapshot_max_age_minutes
     return status
 
 

@@ -14,7 +14,9 @@ from bims_shopify.datetime_utils import ensure_aware_utc
 from .models import ProcessedEventModel, SyncStateModel
 
 
-#: Entries kept in ``sync_duration_history`` (across both modes).
+#: Entries kept in ``sync_duration_history`` PER MODE. Per mode, not overall:
+#: the push worker records far more often than the pull and would otherwise
+#: evict every pull measurement the pull interval floor is derived from.
 DURATION_HISTORY_CAP = 40
 
 
@@ -74,9 +76,15 @@ class SqlAlchemySyncStateRepository:
             "seconds": float(seconds),
             "mode": mode,
         }
-        model.sync_duration_history = [*(model.sync_duration_history or []), entry][
-            -DURATION_HISTORY_CAP:
-        ]
+        history = [*(model.sync_duration_history or []), entry]
+        kept: list[dict] = []
+        per_mode: dict[str, int] = {}
+        for item in reversed(history):  # newest first, so the newest survive
+            seen = per_mode.get(item.get("mode"), 0)
+            if seen < DURATION_HISTORY_CAP:
+                per_mode[item.get("mode")] = seen + 1
+                kept.append(item)
+        model.sync_duration_history = list(reversed(kept))
         await self._session.commit()
 
     async def get_recent_durations(
@@ -95,7 +103,25 @@ class SqlAlchemySyncStateRepository:
             "last_error": model.last_error,
             "last_error_at": last_error_at.isoformat() if last_error_at else None,
             "last_run_summary": dict(model.last_run_summary or {}),
+            "last_pull_outcome": dict(model.last_pull_outcome) if model.last_pull_outcome else None,
+            "last_push_outcome": dict(model.last_push_outcome) if model.last_push_outcome else None,
         }
+
+    async def set_last_pull_outcome(self, tenant_id: int, outcome: dict) -> None:
+        """What the most recent pull TICK did: ok / rejected / skipped / failed."""
+        model = await self._get_or_create_state(tenant_id)
+        model.last_pull_outcome = outcome
+        await self._session.commit()
+
+    async def set_last_push_outcome(self, tenant_id: int, outcome: dict) -> None:
+        """What the most recent push TICK did: ok / unchanged / declined / ..."""
+        model = await self._get_or_create_state(tenant_id)
+        model.last_push_outcome = outcome
+        await self._session.commit()
+
+    async def get_last_push_outcome(self, tenant_id: int) -> dict | None:
+        model = await self._get_or_create_state(tenant_id)
+        return dict(model.last_push_outcome) if model.last_push_outcome else None
 
     async def get_product_hashes(self, tenant_id: int) -> dict[str, str]:
         model = await self._get_or_create_state(tenant_id)

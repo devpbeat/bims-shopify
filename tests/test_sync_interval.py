@@ -187,22 +187,25 @@ async def test_interval_below_measured_floor_is_rejected_with_the_numbers(ctx):
         assert at_floor.json()["sync_interval_minutes"] == 11
 
 
-async def test_floor_follows_the_resulting_sync_mode(ctx):
-    """History of cheap incremental runs must not license a full-sync interval."""
+async def test_pull_floor_ignores_sync_mode_because_every_pull_is_full(ctx):
+    """The pull worker always pulls the whole catalog (a partial pull cannot
+    replace a snapshot), so history of other modes must not license a tighter
+    interval, and switching the legacy ``sync_mode`` setting must not either."""
     app, session_factory, acme = ctx
     await _record(session_factory, acme.id, 20.0, "incremental")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         rejected = await client.patch(
             "/tenants/acme", headers=HEADERS, json={"sync_interval_minutes": 6}
-        )  # tenant is full: no full history -> default floor
+        )  # no full history -> default floor
         assert rejected.status_code == 422
 
-        accepted = await client.patch(
+        still_rejected = await client.patch(
             "/tenants/acme",
             headers=HEADERS,
             json={"sync_mode": "incremental", "sync_interval_minutes": 6},
         )
-        assert accepted.status_code == 200  # ceil(20 * 3 / 60) = 1 -> absolute min 5
+        assert still_rejected.status_code == 422
+        assert still_rejected.json()["detail"]["sync_mode"] == "full"
 
 
 async def test_unrelated_patches_are_not_blocked_by_a_legacy_low_interval(ctx):
@@ -248,3 +251,131 @@ async def test_sync_status_exposes_the_recommended_minimum(ctx):
     assert interval["min_safe_minutes"] == 11
     assert interval["slowest_recent_seconds"] == 204.0
     assert interval["sync_mode"] == SyncMode.FULL.value
+    assert interval["sync_mode_setting"] == SyncMode.FULL.value
+
+
+# -- push worker floor and the new worker settings ------------------------------
+
+
+def test_push_floor_allows_frequent_ticks_but_follows_measured_runs():
+    from bims_shopify.application.sync_interval import PUSH_MODE, compute_interval_floor_for
+
+    assert compute_interval_floor_for([], PUSH_MODE).minutes == 1  # no history: a push is seconds
+    assert compute_interval_floor_for([8.0, 12.0], PUSH_MODE).minutes == 1
+    # A push that took 130 s needs 3x that between ticks: ceil(390 / 60) = 7.
+    assert compute_interval_floor_for([130.0], PUSH_MODE).minutes == 7
+
+
+async def test_new_worker_settings_default_and_round_trip(ctx):
+    app, _sf, _acme = ctx
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        defaults = (await client.get("/tenants/acme", headers=HEADERS)).json()
+        assert defaults["push_interval_minutes"] == 5
+        assert defaults["snapshot_max_age_minutes"] == 120
+        assert defaults["pull_min_ratio"] == 0.30
+
+        patched = await client.patch(
+            "/tenants/acme",
+            headers=HEADERS,
+            json={"push_interval_minutes": 2, "snapshot_max_age_minutes": 90, "pull_min_ratio": 0.5},
+        )
+        assert patched.status_code == 200
+        body = patched.json()
+        assert (body["push_interval_minutes"], body["snapshot_max_age_minutes"]) == (2, 90)
+        assert body["pull_min_ratio"] == 0.5
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"push_interval_minutes": 0},
+        {"snapshot_max_age_minutes": 0},
+        {"pull_min_ratio": 0},
+        {"pull_min_ratio": 1.5},
+    ],
+)
+async def test_worker_settings_are_range_checked(ctx, payload):
+    app, _sf, _acme = ctx
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch("/tenants/acme", headers=HEADERS, json=payload)
+    assert response.status_code == 422
+
+
+async def test_push_interval_below_measured_push_floor_is_rejected(ctx):
+    app, session_factory, acme = ctx
+    await _record(session_factory, acme.id, 130.0, "push")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        rejected = await client.patch(
+            "/tenants/acme", headers=HEADERS, json={"push_interval_minutes": 6}
+        )
+        assert rejected.status_code == 422
+        detail = rejected.json()["detail"]
+        assert detail["min_safe_minutes"] == 7
+        assert "push_interval_minutes=6" in detail["message"]
+        accepted = await client.patch(
+            "/tenants/acme", headers=HEADERS, json={"push_interval_minutes": 7}
+        )
+        assert accepted.status_code == 200
+
+
+async def test_pull_floor_is_not_lowered_by_fast_push_durations(ctx):
+    """Push runs take seconds; recording them under the pull's history would
+    unlock a pull interval far below what BIMS can sustain."""
+    app, session_factory, acme = ctx
+    for _ in range(5):
+        await _record(session_factory, acme.id, 4.0, "push")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        rejected = await client.patch(
+            "/tenants/acme", headers=HEADERS, json={"sync_interval_minutes": 6}
+        )
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"]["basis"] == "default"
+
+
+async def test_snapshot_staleness_limit_must_tolerate_one_missed_pull(ctx):
+    app, _sf, _acme = ctx
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        rejected = await client.patch(
+            "/tenants/acme", headers=HEADERS, json={"snapshot_max_age_minutes": 45}
+        )  # pull every 30: 45 < 2 x 30
+        assert rejected.status_code == 422
+        assert "snapshot_max_age_minutes" in str(rejected.json()["detail"])
+
+        accepted = await client.patch(
+            "/tenants/acme", headers=HEADERS, json={"snapshot_max_age_minutes": 60}
+        )
+        assert accepted.status_code == 200
+
+        # Raising the pull interval alone would leave 60 < 2 x 45: also refused.
+        too_slow = await client.patch(
+            "/tenants/acme", headers=HEADERS, json={"sync_interval_minutes": 45}
+        )
+        assert too_slow.status_code == 422
+        both = await client.patch(
+            "/tenants/acme",
+            headers=HEADERS,
+            json={"sync_interval_minutes": 45, "snapshot_max_age_minutes": 90},
+        )
+        assert both.status_code == 200
+
+
+async def test_status_exposes_the_push_interval_recommendation(ctx):
+    app, session_factory, acme = ctx
+    await _record(session_factory, acme.id, 130.0, "push")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        status = (await client.get("/sync/acme/status", headers=HEADERS)).json()
+    push = status["push_interval"]
+    assert push["configured_minutes"] == 5
+    assert push["min_safe_minutes"] == 7
+    assert push["slowest_recent_seconds"] == 130.0
+
+
+async def test_frequent_push_records_never_evict_the_pull_measurements(ctx):
+    _app, session_factory, acme = ctx
+    await _record(session_factory, acme.id, 204.0, "full")
+    for _ in range(100):  # a push every few minutes floods the history
+        await _record(session_factory, acme.id, 3.0, "push")
+    async with session_factory() as session:
+        repo = SqlAlchemySyncStateRepository(session)
+        assert await repo.get_recent_durations(acme.id, "full") == [204.0]
+        assert len(await repo.get_recent_durations(acme.id, "push")) == 10
