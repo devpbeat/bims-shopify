@@ -44,7 +44,7 @@ has no framework or IO dependency; everything else plugs in through `ports`.
 - `application/` — `SyncInventoryToShopify`, `SyncProductsToShopify`, `ProcessShopifyOrder`,
   `MaybeCreatePurchaseOrder`, `CreatePaymentLink`, `HandlePaymentCallback`.
 - `api/` — FastAPI routers for health, tenants, webhooks, payments, manual sync.
-- `scheduler.py` — `AsyncIOScheduler` running every `SYNC_INTERVAL_MINUTES`, per-tenant locked.
+- `scheduler.py` — `AsyncIOScheduler` with one job per active tenant, on that tenant's own `sync_interval_minutes`, per-tenant locked. See `docs/inventory-sync.md`.
 
 ## Quickstart
 

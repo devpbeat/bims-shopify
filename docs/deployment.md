@@ -133,7 +133,7 @@ driver on the host.
 - `DATABASE_URL`
 - `ADMIN_TOKEN`
 - `FERNET_KEY`
-- `SYNC_INTERVAL_MINUTES`
+- `SYNC_INTERVAL_MINUTES` (deprecated, no longer read: the interval is now per tenant, see `docs/inventory-sync.md`)
 - `LOG_LEVEL`
 - `ENVIRONMENT`
 - `SHOPIFY_API_KEY`
