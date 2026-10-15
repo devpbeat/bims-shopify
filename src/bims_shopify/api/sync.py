@@ -167,7 +167,11 @@ async def _do_run_sync(
                 action="sync.error",
                 entity="sync_run",
                 tenant_id=tenant.id,
-                payload={"dry_run": dry_run, "error": str(exc)},
+                payload={
+                    "dry_run": dry_run,
+                    "error": str(exc),
+                    "report": use_case.last_report,
+                },
             )
             raise
 
@@ -193,6 +197,7 @@ async def _do_run_sync(
                     "total_products": report.total_products,
                     "would_update": report.would_update,
                     "skipped_unresolved_stock": report.skipped_unresolved_stock,
+                    "scanned": report.detail.get("scanned"),
                 },
             )
             return {"dry_run": True, "report": asdict(report)}
@@ -218,10 +223,13 @@ async def _do_run_sync(
                     "zero_count": result.zero_count,
                     "matched_count": result.matched_count,
                     "threshold": result.threshold,
+                    "report": use_case.last_report,
                 },
             )
             # last_sync must NOT advance: nothing was pushed.
             return {
+                "scanned": use_case.last_report["scanned"],
+                "report": use_case.last_report,
                 "status": "needs_confirmation",
                 "reason": result.reason,
                 "zero_count": result.zero_count,
@@ -253,6 +261,8 @@ async def _do_run_sync(
             "ran_at": run_started_at.isoformat(),
             "timings": timings,
             "catalog_pull": erp.last_catalog_pull.summary() if erp.last_catalog_pull else None,
+            "scanned": use_case.last_report["scanned"],
+            "report": use_case.last_report,
         }
         await sync_state_repo.set_last_run_summary(tenant.id, summary)
         logger.info(
@@ -268,9 +278,19 @@ async def _do_run_sync(
             action="sync.completed",
             entity="sync_run",
             tenant_id=tenant.id,
-            payload={"matched": len(deltas), "updated": len(deltas)},
+            payload={
+                "matched": len(deltas),
+                "updated": len(deltas),
+                "scanned": use_case.last_report["scanned"],
+            },
         )
-        return {"status": "ok", "synced_deltas": len(deltas), "timings": timings}
+        return {
+            "status": "ok",
+            "synced_deltas": len(deltas),
+            "timings": timings,
+            "scanned": use_case.last_report["scanned"],
+            "report": use_case.last_report,
+        }
     finally:
         await client.aclose()
 

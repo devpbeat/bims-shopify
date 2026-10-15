@@ -274,7 +274,13 @@ async def test_force_true_re_pushes_even_when_hashes_already_match(
             headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
         )
         assert non_force_response.status_code == 200
-        assert non_force_response.json()["synced_deltas"] == 0
+        non_force_body = non_force_response.json()
+        assert non_force_body["synced_deltas"] == 0
+        # The no-op is explained: the SKU was examined on both sides and
+        # found unchanged, so matched=0 cannot be mistaken for "looked at nothing".
+        assert non_force_body["scanned"] == {"bims": 1, "shopify": 1}
+        assert non_force_body["report"]["unchanged"]["count"] == 1
+        assert non_force_body["report"]["updated"]["count"] == 0
 
         force_response = await client.post(
             "/sync/acme/run",
@@ -285,6 +291,8 @@ async def test_force_true_re_pushes_even_when_hashes_already_match(
     body = force_response.json()
     assert body["status"] == "ok"
     assert body["synced_deltas"] == 1
+    assert body["report"]["updated"]["count"] == 1
+    assert body["report"]["guard"]["forced"] is True
 
 
 async def test_get_reconciliation_404s_when_none_persisted(app_and_tenant):

@@ -58,7 +58,7 @@ async def test_each_bucket_is_populated(tenant):
     sku_map = _map("UPD", "SAME", "ZERO", "ZSAME", "UNKNOWN", "ONLYSHOP")
     previous = {"UPD": 2.0, "SAME": 3.0, "ZERO": 9.0, "ZSAME": 0.0}
     tenant.field_mappings = {**tenant.field_mappings, "max_zero_ratio": 1.0}
-    uc, sf, result = await _run(tenant, products, sku_map, previous)
+    uc, _, result = await _run(tenant, products, sku_map, previous)
     r = uc.last_report
     assert r["scanned"] == {"bims": 6, "shopify": 6}
     assert r["updated"]["count"] == 2
