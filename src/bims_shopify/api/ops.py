@@ -151,7 +151,12 @@ def _validate_options(command: str, options: dict[str, Any]) -> dict[str, Any]:
             )
         return {"query": query}
 
-    # status
+    if command == "status":
+        live = options.get("live", False)
+        if not isinstance(live, bool):
+            raise HTTPException(status_code=422, detail="options.live must be a boolean")
+        return {"live": live}
+
     return {}
 
 

@@ -88,7 +88,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -101,13 +101,14 @@ from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLo
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.adapters.persistence.database import create_engine_and_sessionmaker
 from bims_shopify.adapters.persistence.models import AuditLogModel
+from bims_shopify.adapters.persistence.snapshot_repository import SqlAlchemySnapshotRepository
 from bims_shopify.adapters.persistence.sync_state_repository import (
     SqlAlchemySyncStateRepository,
 )
 from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
 from bims_shopify.adapters.shopify.client import ShopifyClient, ShopifyGraphQLError
 from bims_shopify.config import get_settings
-from bims_shopify.domain.snapshot import CatalogRow
+from bims_shopify.domain.snapshot import CatalogRow, CatalogSnapshot
 from bims_shopify.domain.tenant import Tenant
 
 logger = logging.getLogger(__name__)
@@ -2077,24 +2078,80 @@ async def _fetch_last_activity(tenant_id: int) -> dict[str, Any]:
         await engine.dispose()
 
 
+async def _load_status_snapshot(tenant_id: int) -> CatalogSnapshot | None:
+    """The tenant's current catalog snapshot, or ``None`` when there is none
+    (or it cannot be read: ``status`` then simply pulls live, as it always did)."""
+    settings = get_settings()
+    engine, session_factory = create_engine_and_sessionmaker(settings)
+    try:
+        async with session_factory() as session:
+            return await SqlAlchemySnapshotRepository(session).load_current(tenant_id)
+    except Exception as exc:
+        logger.warning("status_snapshot_unreadable tenant_id=%s error=%s", tenant_id, exc)
+        return None
+    finally:
+        await engine.dispose()
+
+
 async def _run_status(
     tenant: Tenant, args: argparse.Namespace, progress: ProgressFn | None = None
 ) -> dict[str, Any]:
-    bims_client = _new_bims_client(tenant)
+    """Reconciliation report: BIMS-eligible catalog vs. what is in Shopify.
+
+    The BIMS half comes from the persisted snapshot (``source: "snapshot"``,
+    with its age) when one exists, so a report does not make BIMS pull the
+    whole catalog again; ``live`` (CLI ``--live``) or no snapshot pulls BIMS as
+    before (``source: "live"``). The Shopify half is always read live.
+    """
+    live = bool(getattr(args, "live", False))
+    snapshot = None if live else await _load_status_snapshot(tenant.id)
+    bims_client: BIMSClient | None = None
     shopify_client = ShopifyClient(tenant)
     try:
-        await _emit_progress(progress, 0, None, "pulling BIMS catalog")
-        pull = await fetch_bims_catalog_pull(bims_client, tenant.bims_company_id)
-        # Eligible SKUs first (stock is only fetched for those), then the stats.
-        _, bims_skus = bims_catalog_stats(pull.rows, {})
+        report_extra: dict[str, Any] = {}
+        if snapshot is not None:
+            meta = snapshot.meta
+            raw_rows = [catalog_row_to_raw(r) for r in snapshot.rows]
+            stock_by_sku = {sku: rec.quantity for sku, rec in snapshot.stock.items()}
+            finished = meta.finished_at or meta.started_at
+            catalog_pull: dict[str, Any] = {
+                "rows": meta.rows_pulled,
+                "reported_count": meta.reported_count,
+                "complete": meta.complete,
+                "pages": meta.pages,
+                "stop_reason": meta.stop_reason,
+                "warnings": meta.warnings,
+                "duration_seconds": meta.timings.get("catalog_pull_seconds"),
+            }
+            timings = {
+                "catalog_pull_seconds": meta.timings.get("catalog_pull_seconds"),
+                "stock_fetch_seconds": meta.timings.get("stock_fetch_seconds"),
+            }
+            report_extra["snapshot"] = {
+                "id": meta.id,
+                "finished_at": finished.isoformat(),
+                "age_minutes": round((datetime.now(UTC) - finished).total_seconds() / 60, 1),
+            }
+            bims_stats, bims_skus = bims_catalog_stats(raw_rows, stock_by_sku)
+            await _emit_progress(progress, 1, 2, "using the catalog snapshot, pulling Shopify catalog")
+        else:
+            bims_client = _new_bims_client(tenant)
+            await _emit_progress(progress, 0, None, "pulling BIMS catalog")
+            pull = await fetch_bims_catalog_pull(bims_client, tenant.bims_company_id)
+            # Eligible SKUs first (stock is only fetched for those), then the stats.
+            _, bims_skus = bims_catalog_stats(pull.rows, {})
 
-        all_skus = list(bims_skus)
-        stock_started = time.perf_counter()
-        stock_by_sku = await fetch_stock_by_sku(bims_client, all_skus, tenant.stock_warehouse_ids)
-        stock_fetch_seconds = time.perf_counter() - stock_started
-        bims_stats, bims_skus = bims_catalog_stats(pull.rows, stock_by_sku)
-
-        await _emit_progress(progress, 1, 2, "bims pull done, pulling Shopify catalog")
+            all_skus = list(bims_skus)
+            stock_started = time.perf_counter()
+            stock_by_sku = await fetch_stock_by_sku(bims_client, all_skus, tenant.stock_warehouse_ids)
+            stock_fetch_seconds = time.perf_counter() - stock_started
+            bims_stats, bims_skus = bims_catalog_stats(pull.rows, stock_by_sku)
+            catalog_pull = pull.summary()
+            timings = {
+                "catalog_pull_seconds": pull.duration_seconds,
+                "stock_fetch_seconds": stock_fetch_seconds,
+            }
+            await _emit_progress(progress, 1, 2, "bims pull done, pulling Shopify catalog")
 
         shopify_products = 0
         async for _product in shopify_client.iter_all_products():
@@ -2114,6 +2171,8 @@ async def _run_status(
         reconciliation = reconciliation_diff(bims_skus, shopify_skus)
 
         report: dict[str, Any] = {
+            "source": "snapshot" if snapshot is not None else "live",
+            **report_extra,
             "bims": bims_stats,
             "shopify": {
                 "products": shopify_products,
@@ -2121,11 +2180,8 @@ async def _run_status(
                 "variants_with_sku": shopify_variants_with_sku,
             },
             "reconciliation": reconciliation,
-            "catalog_pull": pull.summary(),
-            "timings": {
-                "catalog_pull_seconds": pull.duration_seconds,
-                "stock_fetch_seconds": stock_fetch_seconds,
-            },
+            "catalog_pull": catalog_pull,
+            "timings": timings,
             "last_activity": await _fetch_last_activity(tenant.id),
         }
 
@@ -2133,12 +2189,16 @@ async def _run_status(
         await _audit(
             tenant.id,
             "catalog.reconciliation",
-            reconciliation_audit_payload(report["bims"], report["shopify"], reconciliation),
+            {
+                **reconciliation_audit_payload(report["bims"], report["shopify"], reconciliation),
+                "source": report["source"],
+            },
         )
 
         return report
     finally:
-        await bims_client.aclose()
+        if bims_client is not None:
+            await bims_client.aclose()
         await shopify_client.aclose()
 
 
@@ -2397,9 +2457,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    subparsers.add_parser(
+    status_parser = subparsers.add_parser(
         "status",
         help="Reconciliation report: BIMS-eligible catalog vs. what's actually in Shopify.",
+    )
+    status_parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Pull the BIMS catalog now instead of reading the latest persisted "
+            "snapshot (the default whenever a snapshot exists)."
+        ),
     )
 
     dedupe_parser = subparsers.add_parser(

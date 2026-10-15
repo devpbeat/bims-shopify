@@ -1,34 +1,36 @@
-"""Manual sync trigger endpoint."""
+"""Manual sync trigger endpoint, sync status and the catalog snapshot metadata."""
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi import Depends as _Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
+from bims_shopify.adapters.persistence.snapshot_repository import SqlAlchemySnapshotRepository
 from bims_shopify.adapters.persistence.sync_state_repository import (
     SqlAlchemySyncStateRepository,
 )
 from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
-from bims_shopify.application.sync_inventory import (
-    ProgressFn,
-)
+from bims_shopify.application.push_snapshot import snapshot_decline
 from bims_shopify.application.sync_interval import PULL_MODE, PUSH_MODE, interval_floor_for
+from bims_shopify.application.sync_inventory import ProgressFn
 from bims_shopify.logging import get_logger
+from bims_shopify.sync_locks import CombinedLock
 
 from .deps import get_db_session, get_tenant_repository, require_admin
 
 router = APIRouter(prefix="/sync", tags=["sync"], dependencies=[Depends(require_admin)])
 logger = get_logger(__name__)
 
-def _lock_for_tenant(request: Request, tenant_id: int) -> asyncio.Lock:
-    """Reuse the scheduler's per-tenant lock so a manual run can never
-    execute concurrently with the scheduled job (or another manual run)
-    for the same tenant."""
+def _lock_for_tenant(request: Request, tenant_id: int) -> asyncio.Lock | CombinedLock:
+    """Reuse the scheduler's per-tenant locks (pull and push together) so a
+    manual run can never execute concurrently with a scheduled pull or push
+    (or another manual run) for the same tenant."""
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is not None:
         return scheduler.lock_for_tenant(tenant_id)
@@ -119,6 +121,55 @@ async def get_sync_status(
     }
     status["snapshot_max_age_minutes"] = tenant.snapshot_max_age_minutes
     return status
+
+
+def _meta_view(meta, now: datetime) -> dict:
+    """Snapshot metadata plus its age, for operators."""
+    view = meta.as_dict()
+    finished = meta.finished_at or meta.started_at
+    view["age_minutes"] = round((now - finished).total_seconds() / 60, 1)
+    return view
+
+
+@router.get("/{tenant_slug}/snapshot")
+async def get_snapshot(
+    tenant_slug: str,
+    repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    session: AsyncSession = _Depends(get_db_session),
+):
+    """The catalog snapshot the push worker reads, and what both workers last did.
+
+    ``current`` is the snapshot a push would use (``null`` before the first
+    pull lands); ``history`` lists the last pulls newest first, including
+    rejected ones (``status: rejected`` with its ``rejection`` reason).
+    ``usable_for_push`` / ``decline`` say whether the push worker would use the
+    current snapshot right now and, if not, why. Cheap: metadata only.
+    """
+    tenant = await repo.get_by_slug(tenant_slug)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Unknown tenant")
+
+    snapshots = SqlAlchemySnapshotRepository(session)
+    now = datetime.now(UTC)
+    current = await snapshots.get_current_meta(tenant.id)
+    history = await snapshots.list_recent_meta(tenant.id, limit=10)
+    status = await SqlAlchemySyncStateRepository(session).get_status(tenant.id)
+    verdict = snapshot_decline(current, tenant, now)
+    return {
+        "current": _meta_view(current, now) if current else None,
+        "history": [_meta_view(meta, now) for meta in history],
+        "last_pull": status["last_pull_outcome"],
+        "last_push": status["last_push_outcome"],
+        "max_age_minutes": tenant.snapshot_max_age_minutes,
+        "usable_for_push": verdict is None,
+        "decline": {"reason": verdict[0], **verdict[1]} if verdict else None,
+        "settings": {
+            "pull_interval_minutes": tenant.sync_interval_minutes,
+            "push_interval_minutes": tenant.push_interval_minutes,
+            "snapshot_max_age_minutes": tenant.snapshot_max_age_minutes,
+            "pull_max_drop_ratio": tenant.pull_max_drop_ratio,
+        },
+    }
 
 
 @router.get("/{tenant_slug}/reconciliation")

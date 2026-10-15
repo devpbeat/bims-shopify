@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import httpx
@@ -29,6 +29,7 @@ from bims_shopify.adapters.persistence.portal_user_repository import (
     SqlAlchemyPortalUserRepository,
 )
 from bims_shopify.adapters.persistence.rekey_repository import SqlAlchemyRekeyRepository
+from bims_shopify.adapters.persistence.snapshot_repository import SqlAlchemySnapshotRepository
 from bims_shopify.adapters.persistence.sync_state_repository import (
     SqlAlchemySyncStateRepository,
 )
@@ -498,7 +499,7 @@ async def get_portal_dashboard(
             "matched_skus": None,
             "bims_not_in_shopify": None,
             "checked_at": None,
-            "hint": "No reconciliation report yet. Run Status to generate one.",
+            "hint": "No catalog stats yet. They are recomputed by every catalog pull.",
         }
 
     last_push_entries = await audit_repo.list_recent_by_action(
@@ -515,10 +516,26 @@ async def get_portal_dashboard(
             }
             break
 
+    snapshot_meta = await SqlAlchemySnapshotRepository(session).get_current_meta(tenant.id)
+    snapshot = None
+    if snapshot_meta is not None:
+        finished = snapshot_meta.finished_at or snapshot_meta.started_at
+        snapshot = {
+            "finished_at": finished.isoformat(),
+            "age_minutes": round((datetime.now(UTC) - finished).total_seconds() / 60, 1),
+            "rows": snapshot_meta.rows_pulled,
+            "complete": snapshot_meta.complete,
+        }
+
     return {
         "slug": tenant.slug,
         "last_sync": last_sync,
         "last_push": last_push,
+        "snapshot": snapshot,
+        "workers": {
+            "pull": status.get("last_pull_outcome"),
+            "push": status.get("last_push_outcome"),
+        },
         "last_error": status.get("last_error"),
         "last_error_at": status.get("last_error_at"),
         "auto_import": {

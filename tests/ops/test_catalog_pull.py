@@ -152,8 +152,12 @@ async def test_status_reports_catalog_pull(tenant, monkeypatch):
     async def _no_audit(*args, **kwargs):
         return None
 
+    async def _no_snapshot(tenant_id):
+        return None  # this test is about the LIVE pull's completeness report
+
     monkeypatch.setattr(catalog_ops, "_fetch_last_activity", _no_activity)
     monkeypatch.setattr(catalog_ops, "_audit", _no_audit)
+    monkeypatch.setattr(catalog_ops, "_load_status_snapshot", _no_snapshot)
     args = catalog_ops._build_arg_parser().parse_args(["acme", "status"])
     report = await catalog_ops._run_status(tenant, args)
 
