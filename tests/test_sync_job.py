@@ -211,12 +211,15 @@ def mock_bims_one_product_and_shopify_variant():
                 json={"status": "OK", "data": {"stockPorSku": [{"sku": "SKU1", "stock": 5}]}},
             )
         )
-        mock.post(_graphql_url()).mock(
-            side_effect=[
-                httpx.Response(200, json=list_all_variants_response),
-                httpx.Response(200, json=set_quantities_response),
-            ]
-        )
+        # Answer by operation, not by call order: a sync lists Shopify variants
+        # more than once (the pull's catalog stats, the push's SKU map) and
+        # writes only when something changed.
+        def graphql(request: httpx.Request) -> httpx.Response:
+            if b"inventorySetQuantities" in request.content:
+                return httpx.Response(200, json=set_quantities_response)
+            return httpx.Response(200, json=list_all_variants_response)
+
+        mock.post(_graphql_url()).mock(side_effect=graphql)
         yield mock
 
 

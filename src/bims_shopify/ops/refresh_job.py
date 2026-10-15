@@ -8,7 +8,7 @@ publish evaluates its stock gate -- and returns one combined report with each
 phase's own report nested verbatim under ``phases``.
 
 Failure policy: if a phase raises (or ``sync`` reports ``needs_confirmation``,
-meaning nothing was pushed), the chain stops and :class:`RefreshFailed` is
+``pull_rejected`` or ``push_declined``, meaning nothing was pushed), the chain stops and :class:`RefreshFailed` is
 raised carrying the partial report (``failed_phase``, ``error`` and the phases
 that did complete). Raising -- instead of returning -- makes the job end as
 ``failed``, so a partial result can never look like a success.
@@ -27,6 +27,9 @@ from bims_shopify.ops import catalog, sync_job
 from bims_shopify.ops.catalog import ProgressFn, _emit_progress
 
 PHASES = ("import", "sync", "publish")
+
+#: Statuses of a ``sync`` result that mean stock was NOT refreshed in Shopify.
+SYNC_NOTHING_PUSHED = ("needs_confirmation", "pull_rejected", "push_declined")
 
 
 class RefreshFailed(Exception):
@@ -117,8 +120,10 @@ async def run_refresh(
         except (Exception, SystemExit) as exc:
             raise fail(name, f"{type(exc).__name__}: {exc}") from exc
         phases[name] = result
-        if name == "sync" and result.get("status") == "needs_confirmation":
-            # Nothing was pushed; publishing now would act on stale stock.
-            raise fail(name, f"needs_confirmation: {result.get('reason')}")
+        if name == "sync" and result.get("status") in SYNC_NOTHING_PUSHED:
+            # Nothing was pushed (guard fired, the pull was rejected, or the
+            # push declined an unusable snapshot); publishing now would act on
+            # stale stock.
+            raise fail(name, f"{result['status']}: {result.get('reason')}")
 
     return {"phases": phases, "summary": _summarize(phases, dry_run=not apply)}

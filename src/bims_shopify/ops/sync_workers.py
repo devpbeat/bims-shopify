@@ -623,3 +623,60 @@ async def do_push(
         }
     finally:
         await storefront.aclose()
+
+
+# -- ONE-SHOT -----------------------------------------------------------------
+
+
+def _staged(progress: ProgressFn | None, stage: str) -> ProgressFn | None:
+    """Prefix progress messages with the worker that emitted them."""
+    if progress is None:
+        return None
+
+    async def forward(done: int, total: int | None, message: str) -> None:
+        outcome = progress(done, total, f"[{stage}] {message}")
+        if hasattr(outcome, "__await__"):
+            await outcome
+
+    return forward
+
+
+async def do_run_sync(
+    tenant: Tenant,
+    dry_run: bool,
+    session: AsyncSession,
+    *,
+    force: bool = False,
+    progress: ProgressFn | None = None,
+) -> dict[str, Any]:
+    """Pull now, then push now: the operator's one-shot sync.
+
+    The very same ``do_pull`` and ``do_push`` the scheduler ticks run, in
+    sequence; the only differences are the trigger label and that the push
+    always compares (``skip_unchanged=False``). A pull the sanity guard
+    rejected stops here: pushing the older snapshot is not what a one-shot
+    asked for, and the reason is returned instead.
+
+    The caller holds the tenant's locks (see ``bims_shopify.sync_locks``).
+    A dry run still refreshes the snapshot: that is a read of BIMS into our own
+    database, not a write to Shopify.
+    """
+    pull = await do_pull(tenant, session, progress=_staged(progress, "pull"), trigger="manual")
+    if pull["status"] != "ok":
+        return {
+            "status": "pull_rejected",
+            "mode": "full",
+            "reason": pull.get("reason"),
+            "detail": pull.get("detail"),
+            "pull": pull,
+        }
+    push = await do_push(
+        tenant,
+        session,
+        dry_run=dry_run,
+        force=force,
+        progress=_staged(progress, "push"),
+        trigger="manual",
+        skip_unchanged=False,
+    )
+    return {**push, "pull": {"status": "ok", "snapshot": pull["snapshot"], "stats_error": pull.get("stats_error")}}

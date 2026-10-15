@@ -10,9 +10,9 @@ returns immediately with a job_id, and progress/result/error are polled via
 `GET /ops/{slug}/jobs/{job_id}`, exactly like `import`/`wipe`/`dedupe`.
 
 This module wraps `bims_shopify.api.sync._do_run_sync` -- the exact same
-coroutine used by the manual HTTP endpoint (kept for the APScheduler tick /
-back-compat) -- so sync behavior never diverges between the two entry
-points.
+coroutine used by the manual HTTP endpoint, and itself just "pull now, then
+push now" over the two scheduled workers (`ops.sync_workers`) -- so sync
+behavior never diverges between the entry points.
 """
 from __future__ import annotations
 
@@ -30,11 +30,12 @@ async def run_sync(
 ) -> dict[str, Any]:
     """Run inventory sync in-process, for the JobRunner.
 
-    Options: ``dry_run`` (default False), ``full`` (default False), ``force``
-    (default False) -- same semantics as the HTTP endpoint's query params.
+    Options: ``dry_run`` (default False), ``full`` (default False, accepted
+    but without effect: every pull is a full pull), ``force`` (default False)
+    -- same semantics as the HTTP endpoint's query params.
 
     Concurrency: the caller (JobRunner._run) is responsible for acquiring the
-    tenant's shared sync lock (the same `asyncio.Lock` object returned by
+    tenant's shared sync lock (the combined pull+push lock returned by
     `TenantSyncScheduler.lock_for_tenant`, also used by the manual HTTP
     endpoint) before invoking this function, so a sync job can never overlap
     the scheduled sync or a concurrent manual HTTP run for the same tenant.

@@ -44,7 +44,7 @@ _RECENT_IMPORT_JOBS_LOOKBACK = 20
 
 #: Re-pull products modified within this window before the last successful
 #: scheduled import, to tolerate clock skew / near-miss writes on the BIMS
-#: side. Mirrors INCREMENTAL_OVERLAP in api/sync.py.
+#: side.
 INCREMENTAL_OVERLAP = timedelta(minutes=15)
 
 

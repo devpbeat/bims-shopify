@@ -1,9 +1,11 @@
-"""Scheduled sync mode: tenants default to a FULL BIMS comparison every run.
+"""Scheduled sync mode: every pull is a FULL BIMS comparison.
 
-The incremental `last_update` filter proved unreliable on the BIMS side, so
-the scheduler stops narrowing the pull by the stored watermark unless the
-tenant is explicitly switched back to `incremental`. The watermark itself is
-still recorded either way.
+The incremental `last_update` filter proved unreliable on the BIMS side, and
+since the pull/push split a partial pull cannot replace the persisted snapshot
+(stock changes do not touch a product's `last_update`, so the unchanged rows
+would keep stale stock). The pull therefore ignores `sync_mode`: a tenant
+stored as `incremental` still pulls everything. The watermark itself is still
+recorded after every successful push.
 """
 from __future__ import annotations
 
@@ -203,7 +205,7 @@ async def test_scheduled_sync_full_sends_no_last_update_but_records_watermark(en
     assert status["last_run_summary"]["mode"] == "full"
 
 
-async def test_scheduled_sync_incremental_still_narrows_by_watermark(env):
+async def test_scheduled_sync_ignores_the_legacy_incremental_setting(env):
     session_factory, make_tenant = env
     tenant = await make_tenant(sync_mode=SyncMode.INCREMENTAL)
     await _prime_watermark(session_factory, tenant)
@@ -213,11 +215,11 @@ async def test_scheduled_sync_incremental_still_narrows_by_watermark(env):
         await _make_sync_tenant_fn(session_factory)(tenant)
         requests = _index_requests(mock)
     assert requests
-    assert all("last_update" in r.url.params for r in requests)
+    assert all("last_update" not in r.url.params for r in requests)  # still a full pull
 
     async with session_factory() as session:
         status = await SqlAlchemySyncStateRepository(session).get_status(tenant.id)
-    assert status["last_run_summary"]["mode"] == "incremental"
+    assert status["last_run_summary"]["mode"] == "full"
 
 
 async def test_scheduled_full_sync_guard_still_blocks_mass_zero(env):
@@ -262,7 +264,7 @@ async def test_needs_confirmation_result_reports_mode(env):
     assert result["mode"] == "full"
 
 
-async def test_manual_run_result_states_full_or_incremental(env):
+async def test_manual_run_result_is_always_a_full_comparison(env):
     from bims_shopify.api.sync import _do_run_sync
 
     session_factory, make_tenant = env
@@ -276,13 +278,15 @@ async def test_manual_run_result_states_full_or_incremental(env):
             full = await _do_run_sync(tenant, False, session, full=True)
         async with session_factory() as session:
             dry = await _do_run_sync(tenant, True, session, full=True)
-    assert incremental["mode"] == "incremental"
+    # `full=False` used to narrow the pull by the watermark; the flag is now
+    # accepted but every run compares the whole catalog.
+    assert incremental["mode"] == "full"
     assert incremental["scanned"] == {"bims": 1, "shopify": 1}
     assert full["mode"] == "full"
     assert dry["mode"] == "full"
 
 
-async def test_completed_runs_record_their_duration_by_mode(env):
+async def test_completed_runs_record_pull_and_push_durations_separately(env):
     session_factory, make_tenant = env
     tenant = await make_tenant()
     mock, _pushes = _mock_world({"SKU1": 5})
@@ -290,7 +294,9 @@ async def test_completed_runs_record_their_duration_by_mode(env):
         await _make_sync_tenant_fn(session_factory)(tenant)  # full by default
     async with session_factory() as session:
         repo = SqlAlchemySyncStateRepository(session)
-        full = await repo.get_recent_durations(tenant.id, "full")
+        pulls = await repo.get_recent_durations(tenant.id, "full")
+        pushes = await repo.get_recent_durations(tenant.id, "push")
         incremental = await repo.get_recent_durations(tenant.id, "incremental")
-    assert len(full) == 1 and full[0] > 0
+    assert len(pulls) == 1 and pulls[0] > 0
+    assert len(pushes) == 1 and pushes[0] > 0
     assert incremental == []

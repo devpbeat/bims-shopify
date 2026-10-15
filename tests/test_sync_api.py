@@ -230,13 +230,15 @@ def mock_bims_one_product_and_shopify_variant():
                 json={"status": "OK", "data": {"stockPorSku": [{"sku": "SKU1", "stock": 5}]}},
             )
         )
-        mock.post(_graphql_url()).mock(
-            side_effect=[
-                httpx.Response(200, json=list_all_variants_response),
-                httpx.Response(200, json=list_all_variants_response),
-                httpx.Response(200, json=set_quantities_response),
-            ]
-        )
+        # Answer by operation, not by call order: a sync lists Shopify variants
+        # more than once (the pull's catalog stats, the push's SKU map) and
+        # writes only when something changed.
+        def graphql(request: httpx.Request) -> httpx.Response:
+            if b"inventorySetQuantities" in request.content:
+                return httpx.Response(200, json=set_quantities_response)
+            return httpx.Response(200, json=list_all_variants_response)
+
+        mock.post(_graphql_url()).mock(side_effect=graphql)
         yield mock
 
 
@@ -361,7 +363,9 @@ async def test_sync_summary_persists_real_phase_timings(
         )
     summary = status.json()["last_run_summary"]
     for timings in (run.json()["timings"], summary["timings"]):
-        assert 0 < timings["catalog_pull_seconds"] <= summary["duration_seconds"]
-        assert 0 < timings["stock_fetch_seconds"] <= summary["duration_seconds"]
+        # The pull's phase durations travel with the snapshot the push read.
+        assert timings["catalog_pull_seconds"] > 0
+        assert timings["stock_fetch_seconds"] > 0
+        assert 0 < timings["push_seconds"] <= summary["duration_seconds"]
     assert summary["catalog_pull"]["rows"] == 1
     assert summary["catalog_pull"]["complete"] is True

@@ -138,6 +138,26 @@ async def test_sync_needing_confirmation_stops_before_publish(tenant, monkeypatc
     assert report["phases"]["sync"]["status"] == "needs_confirmation"
 
 
+@pytest.mark.parametrize("status", ["pull_rejected", "push_declined"])
+async def test_a_sync_that_pulled_or_pushed_nothing_stops_before_publish(
+    tenant, monkeypatch, calls, status
+):
+    """publish gates on stock: if the sync could not refresh it (the pull was
+    rejected, or the push declined a stale snapshot), publishing acts on old stock."""
+
+    async def nothing_pushed(tenant, options, progress=None):
+        return {"status": status, "reason": "too_few_rows"}
+
+    monkeypatch.setattr(sync_job, "run_sync", nothing_pushed)
+
+    with pytest.raises(RefreshFailed) as excinfo:
+        await run_refresh(tenant, {"apply": True})
+
+    assert [name for name, _ in calls] == ["import"]
+    assert excinfo.value.report["failed_phase"] == "sync"
+    assert status in excinfo.value.report["error"]
+
+
 async def test_progress_messages_carry_phase_prefix(tenant, calls):
     seen: list[tuple[int, int | None, str]] = []
 

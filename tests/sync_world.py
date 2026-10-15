@@ -50,11 +50,49 @@ class ShopifyWorld:
         self.write_calls = 0
         self.listing_calls = 0
         self.pushed: dict[str, int] = {}
+        #: SKU -> stock BIMS serves, or None while BIMS is "down" (HTTP 500).
+        self.bims_stock_by_sku: dict[str, float] | None = None
         self.mock = respx.mock(assert_all_called=False)
-        self.bims_index = self.mock.get(BIMS_INDEX).mock(return_value=httpx.Response(500))
-        self.bims_stock = self.mock.post(BIMS_STOCK).mock(return_value=httpx.Response(500))
-        self.bims_deleted = self.mock.get(BIMS_DELETED).mock(return_value=httpx.Response(500))
+        #: Every request that reached a BIMS route, counted by OUR handlers:
+        #: respx wipes its own call counters when the context exits.
+        self.bims_requests: list[str] = []
+        self.mock.get(BIMS_INDEX).mock(side_effect=self._bims_index)
+        self.mock.post(BIMS_STOCK).mock(side_effect=self._bims_stock)
+        self.mock.get(BIMS_DELETED).mock(side_effect=self._bims_deleted)
         self.mock.post(GRAPHQL).mock(side_effect=self._graphql)
+
+    def serve_bims(self, stock: dict[str, float] | None) -> None:
+        """Make BIMS answer with one product per SKU and this stock (None: down)."""
+        self.bims_stock_by_sku = stock
+
+    def _bims_deleted(self, request: httpx.Request) -> httpx.Response:
+        self.bims_requests.append("deleted")
+        return httpx.Response(500)
+
+    def _bims_index(self, request: httpx.Request) -> httpx.Response:
+        self.bims_requests.append("index")
+        if self.bims_stock_by_sku is None:
+            return httpx.Response(500)
+        skus = list(self.bims_stock_by_sku)
+        offset = int(request.url.params.get("offset", 0))
+        data = (
+            [
+                {"Product": {"id": i, "name": s, "code2": s, "sell_price": "1000",
+                             "enabled": True, "exclude_ecommerce": False}}
+                for i, s in enumerate(skus, start=1)
+            ]
+            if offset == 0
+            else []
+        )
+        return httpx.Response(200, json={"status": "ok", "count": str(len(skus)), "data": data})
+
+    def _bims_stock(self, request: httpx.Request) -> httpx.Response:
+        self.bims_requests.append("stock")
+        if self.bims_stock_by_sku is None:
+            return httpx.Response(500)
+        wanted = set(json.loads(request.content)["skus"])
+        rows = [{"sku": s, "stock": q} for s, q in self.bims_stock_by_sku.items() if s in wanted]
+        return httpx.Response(200, json={"status": "OK", "data": {"stockPorSku": rows}})
 
     def _graphql(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -73,7 +111,7 @@ class ShopifyWorld:
 
     @property
     def bims_calls(self) -> int:
-        return self.bims_index.call_count + self.bims_stock.call_count + self.bims_deleted.call_count
+        return len(self.bims_requests)
 
     def __enter__(self):
         self.mock.start()
