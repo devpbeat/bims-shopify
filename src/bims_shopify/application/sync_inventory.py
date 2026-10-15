@@ -8,7 +8,7 @@ from datetime import datetime
 
 from bims_shopify.domain.product import InventoryDelta, ProductSnapshot
 from bims_shopify.domain.tenant import Tenant
-from bims_shopify.ports.erp import ERPPort
+from bims_shopify.ports.erp import ProductLister
 from bims_shopify.ports.storefront import StorefrontPort
 
 #: Progress callback signature shared by the CLI/job runner (see
@@ -199,7 +199,7 @@ def diff_inventory(
 
 
 class SyncInventoryToShopify:
-    def __init__(self, erp: ERPPort, storefront: StorefrontPort) -> None:
+    def __init__(self, erp: ProductLister, storefront: StorefrontPort) -> None:
         self._erp = erp
         self._storefront = storefront
         #: Per-SKU detail of the most recent run (bounded samples, full

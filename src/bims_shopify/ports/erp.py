@@ -10,6 +10,16 @@ from bims_shopify.domain.snapshot import CatalogPull
 from bims_shopify.domain.tenant import Tenant
 
 
+class ProductLister(Protocol):
+    """The only thing the inventory push needs from an ERP: eligible products
+    with their stock. Satisfied by the live BIMS adapter and by the reader of
+    the persisted snapshot."""
+
+    async def list_products(
+        self, tenant: Tenant, since: datetime | None = None
+    ) -> list[ProductSnapshot]: ...
+
+
 class ERPPort(Protocol):
     async def list_products(
         self, tenant: Tenant, since: datetime | None = None

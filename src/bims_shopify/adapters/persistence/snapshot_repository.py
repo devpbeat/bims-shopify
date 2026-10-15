@@ -328,8 +328,15 @@ class SqlAlchemySnapshotRepository:
     async def load_current(self, tenant_id: int) -> CatalogSnapshot | None:
         """The current snapshot with all its rows, read by a single snapshot id."""
         meta = await self.get_current_meta(tenant_id)
-        if meta is None:
-            return None
+        return None if meta is None else await self.load(meta)
+
+    async def load(self, meta: SnapshotMeta) -> CatalogSnapshot:
+        """Rows of the snapshot ``meta`` describes.
+
+        Callers pick the id first (``get_current_meta``) and read by it, so a
+        flip to a newer snapshot in between cannot mix two generations; the
+        previous generation keeps its rows until the next promote.
+        """
         product_rows = (
             await self._session.execute(
                 select(
