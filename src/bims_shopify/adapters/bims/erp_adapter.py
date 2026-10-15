@@ -7,6 +7,7 @@ from typing import Any
 
 from bims_shopify.domain.product import ProductSnapshot
 from bims_shopify.domain.sale import SaleOrder, SaleResult, SaleResultKind
+from bims_shopify.domain.snapshot import CatalogPull, CatalogRow, resolve_product_snapshots
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
@@ -17,17 +18,6 @@ from .timezones import to_bims_local
 
 PAGE_LIMIT = 250
 logger = get_logger(__name__)
-
-
-def _extract_sku(product: dict[str, Any], field_mappings: dict[str, Any]) -> str | None:
-    sku_field = field_mappings.get("product_sku_field", "code2")
-    return product.get(sku_field)
-
-
-def _is_truthy(value: Any) -> bool:
-    if isinstance(value, str):
-        return value.lower() in ("1", "true", "t", "yes")
-    return bool(value)
 
 
 class BIMSERPAdapter:
@@ -59,45 +49,76 @@ class BIMSERPAdapter:
     async def list_products(
         self, tenant: Tenant, since: datetime | None = None
     ) -> list[ProductSnapshot]:
+        """Live eligible products with their stock, straight from BIMS.
+
+        Built on ``pull_catalog`` and the same ``resolve_product_snapshots``
+        rule the snapshot reader uses (including: a SKU absent from the stock
+        response has UNKNOWN stock, ``None``, never zero).
+        """
+        pull = await self.pull_catalog(tenant, since, warehouse_detail=False)
+        return resolve_product_snapshots(pull.rows, pull.stock, tenant.field_mappings)
+
+    async def pull_catalog(
+        self, tenant: Tenant, since: datetime | None = None, *, warehouse_detail: bool = True
+    ) -> CatalogPull:
+        """Pull the catalog and its stock from BIMS, keeping everything needed
+        to persist a snapshot.
+
+        Every row is kept (eligible or not, so the snapshot can explain why a
+        product is or is not live); stock is requested only for eligible SKUs,
+        exactly as the live sync always did. The aggregate stock comes from one
+        ``stock_fenicio`` pass over the tenant's warehouses together. With
+        ``warehouse_detail`` and more than one warehouse, each warehouse is
+        then asked on its own as well: BIMS cannot break the aggregate down, and
+        that detail is what diagnoses "BIMS shows 10 in one warehouse, we show
+        0". With a single warehouse the aggregate IS the per-warehouse figure,
+        so no extra request is made.
+
+        All-or-nothing: any failing request fails the pull, so a snapshot never
+        mixes complete and missing stock.
+        """
         raw_products = await self._fetch_all_products(tenant, since)
-        candidates: list[tuple[str, dict[str, Any]]] = []
-        for product in raw_products:
-            if not _is_truthy(product.get("enabled", True)):
-                continue
-            if _is_truthy(product.get("exclude_ecommerce", False)):
-                continue
-            sku = _extract_sku(product, tenant.field_mappings)
-            if not sku:
-                continue
-            candidates.append((str(sku), product))
+        paged = self.last_catalog_pull
+        rows = [CatalogRow.from_raw(product, tenant.field_mappings) for product in raw_products]
+        skus = [row.sku for row in rows if row.eligible and row.sku]
 
-        stock_by_sku = await self.fetch_stock_levels(tenant, [sku for sku, _ in candidates])
+        stock = await self.fetch_stock_levels(tenant, skus)
+        timings: dict[str, float | None] = {
+            "catalog_pull_seconds": paged.duration_seconds if paged else None,
+            "stock_fetch_seconds": self.last_stock_fetch_seconds,
+            "warehouse_stock_seconds": None,
+        }
 
-        # Safe-by-default: a SKU absent from stock_fenicio's response has an
-        # UNKNOWN stock level, not a zero one. Treating "absent" as "zero"
-        # would zero out inventory for every SKU the stock endpoint didn't
-        # return (observed to be ~99% of the catalog in one dry run). Only
-        # push an explicit zero for absent SKUs when the tenant opts in.
-        absent_means_zero = _is_truthy(tenant.field_mappings.get("absent_stock_means_zero", False))
-
-        snapshots: list[ProductSnapshot] = []
-        for sku, product in candidates:
-            if sku in stock_by_sku:
-                stock: float | None = stock_by_sku[sku]
-            elif absent_means_zero:
-                stock = 0.0
+        by_warehouse: dict[str, dict[int, float]] = {}
+        warehouse_ids = tenant.stock_warehouse_ids
+        if warehouse_detail:
+            if len(warehouse_ids) == 1:
+                for sku, quantity in stock.items():
+                    by_warehouse[sku] = {warehouse_ids[0]: quantity}
             else:
-                stock = None
-            snapshots.append(
-                ProductSnapshot(
-                    sku=sku,
-                    name=product.get("name", ""),
-                    price=float(product.get("sell_price") or 0),
-                    stock=stock,
-                    enabled=True,
-                )
-            )
-        return snapshots
+                started = time.perf_counter()
+                for warehouse_id in warehouse_ids:
+                    per_sku, _ = await self._fetch_stock(
+                        tenant,
+                        skus,
+                        [warehouse_id],
+                        request_prefix=f"bims-shopify-wh{warehouse_id}-",
+                    )
+                    for sku, quantity in per_sku.items():
+                        by_warehouse.setdefault(sku, {})[warehouse_id] = quantity
+                timings["warehouse_stock_seconds"] = time.perf_counter() - started
+
+        return CatalogPull(
+            rows=rows,
+            stock=stock,
+            stock_by_warehouse=by_warehouse,
+            reported_count=paged.reported_count if paged else None,
+            complete=paged.complete if paged else None,
+            pages=paged.pages if paged else 0,
+            stop_reason=paged.stop_reason if paged else "empty_page",
+            warnings=list(paged.warnings) if paged else [],
+            timings=timings,
+        )
 
     async def _fetch_all_products(
         self, tenant: Tenant, since: datetime | None
@@ -130,9 +151,23 @@ class BIMSERPAdapter:
         here so merchants never see negative Shopify availability; the
         count of clamped SKUs is logged per run for observability.
         """
+        result, seconds = await self._fetch_stock(
+            tenant, skus, tenant.stock_warehouse_ids, concurrency=concurrency
+        )
+        self.last_stock_fetch_seconds = seconds
+        return result
+
+    async def _fetch_stock(
+        self,
+        tenant: Tenant,
+        skus: list[str],
+        warehouse_ids: list[int],
+        *,
+        concurrency: int | None = None,
+        request_prefix: str = "bims-shopify-",
+    ) -> tuple[dict[str, float], float]:
         result: dict[str, float] = {}
         unique_skus = list(dict.fromkeys(skus))
-        warehouse_ids = tenant.stock_warehouse_ids
         clamped_count = 0
         started = time.perf_counter()
         # Bounded concurrent, all-or-nothing (see ``fetch_stock_batches``);
@@ -142,11 +177,11 @@ class BIMSERPAdapter:
             self._client,
             unique_skus,
             warehouse_ids,
-            request_prefix="bims-shopify-",
+            request_prefix=request_prefix,
             batch_size=STOCK_BATCH_SIZE,
             concurrency=concurrency if concurrency is not None else self._stock_concurrency,
         )
-        self.last_stock_fetch_seconds = time.perf_counter() - started
+        seconds = time.perf_counter() - started
         for response in responses:
             for row in (response.get("data") or {}).get("stockPorSku") or []:
                 stock = float(row.get("stock") or 0)
@@ -161,7 +196,7 @@ class BIMSERPAdapter:
                 clamped_count=clamped_count,
                 warehouse_ids=warehouse_ids,
             )
-        return result
+        return result, seconds
 
     async def create_or_update_sale(self, tenant: Tenant, sale: SaleOrder) -> SaleResult:
         payload = _build_sale_payload(sale)
