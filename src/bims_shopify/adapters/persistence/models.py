@@ -13,6 +13,8 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    false,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -228,3 +230,78 @@ class OpsJobModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CatalogSnapshotModel(Base):
+    """Metadata of one BIMS pull. See alembic/versions/0018_catalog_snapshot.py.
+
+    A pull is written as a ``building`` generation that readers cannot see;
+    ``promote`` flips ``is_current`` in one short transaction. At most one row
+    per tenant is current (partial unique index).
+    """
+
+    __tablename__ = "catalog_snapshots"
+    __table_args__ = (
+        Index(
+            "uq_catalog_snapshots_current",
+            "tenant_id",
+            unique=True,
+            sqlite_where=text("is_current"),
+            postgresql_where=text("is_current"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(16))
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rows_pulled: Mapped[int] = mapped_column(Integer, default=0)
+    stock_rows: Mapped[int] = mapped_column(Integer, default=0)
+    pages: Mapped[int] = mapped_column(Integer, default=0)
+    reported_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    complete: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    stop_reason: Mapped[str] = mapped_column(String(32), default="")
+    warnings: Mapped[list] = mapped_column(JSON, default=list)
+    #: Per-phase durations in seconds.
+    timings: Mapped[dict] = mapped_column(JSON, default=dict)
+    #: Catalog stats computed by the pull (BIMS eligible, with stock, ...).
+    stats: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: Why a pull was rejected or failed.
+    rejection: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class CatalogSnapshotProductModel(Base):
+    __tablename__ = "catalog_snapshot_products"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("catalog_snapshots.id", ondelete="CASCADE"), index=True
+    )
+    bims_id: Mapped[str] = mapped_column(String(64))
+    #: SKU matched against Shopify (``code2`` unless the tenant maps another field).
+    sku: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    code2: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    name: Mapped[str] = mapped_column(String(500), default="")
+    sell_price: Mapped[float] = mapped_column(Float, default=0.0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    exclude_ecommerce: Mapped[bool] = mapped_column(Boolean, default=False)
+    company_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class CatalogSnapshotStockModel(Base):
+    __tablename__ = "catalog_snapshot_stock"
+    __table_args__ = (UniqueConstraint("snapshot_id", "sku"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("catalog_snapshots.id", ondelete="CASCADE"), index=True
+    )
+    sku: Mapped[str] = mapped_column(String(255))
+    #: Aggregated across the tenant's warehouses (what is pushed).
+    quantity: Mapped[float] = mapped_column(Float)
+    #: {"<warehouse_id>": quantity}; the diagnostic detail behind ``quantity``.
+    by_warehouse: Mapped[dict] = mapped_column(JSON, default=dict)
