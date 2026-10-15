@@ -115,6 +115,13 @@ async def record_skip(session_factory: async_sessionmaker, kind: str, tenant: Te
     async with session_factory() as session:
         state = SqlAlchemySyncStateRepository(session)
         if kind == "pull":
+            prior = (await state.get_status(tenant.id))["last_pull_outcome"]
+            if prior and prior.get("status") == "skipped":
+                outcome["previous"] = prior.get("previous")
+                outcome["consecutive_skips"] = int(prior.get("consecutive_skips", 1)) + 1
+            else:
+                outcome["previous"] = prior
+                outcome["consecutive_skips"] = 1
             await state.set_last_pull_outcome(tenant.id, outcome)
             await SqlAlchemyAuditLogger(session).log(
                 actor="system",
@@ -410,7 +417,8 @@ async def do_push(
             "detail": detail,
             "snapshot": meta.as_dict() if meta else None,
         }
-    assert meta is not None  # a missing snapshot is a decline
+    if meta is None:  # unreachable: snapshot_decline reports a missing snapshot
+        raise RuntimeError("push reached the snapshot read without a snapshot")
 
     if (
         skip_unchanged

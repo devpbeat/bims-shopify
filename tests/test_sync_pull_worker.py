@@ -235,3 +235,37 @@ async def test_record_skip_is_visible(migrated_db):
     assert "still running" in outcome["reason"]
     skipped = await _audit(session_factory, tenant.id, "snapshot.pull_skipped")
     assert skipped is not None
+
+
+async def test_a_skipped_pull_keeps_the_last_real_outcome_and_counts_consecutive_skips(migrated_db):
+    """`skipped` is the headline, but the operator must still see the last pull
+    that really ran, and how long the pull has been failing to get a turn."""
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant()
+    async with session_factory() as session:
+        await SqlAlchemySyncStateRepository(session).set_last_pull_outcome(
+            tenant.id, {"status": "ok", "at": "2026-10-15T10:00:00+00:00", "snapshot_id": 7}
+        )
+    await record_skip(session_factory, "pull", tenant)
+    await record_skip(session_factory, "pull", tenant)
+
+    outcome = await _outcome(session_factory, tenant.id)
+    assert outcome["status"] == "skipped"
+    assert outcome["consecutive_skips"] == 2
+    assert outcome["previous"]["status"] == "ok" and outcome["previous"]["snapshot_id"] == 7
+
+
+async def test_a_skipped_push_tick_does_not_overwrite_the_last_push_outcome(migrated_db):
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant()
+    async with session_factory() as session:
+        await SqlAlchemySyncStateRepository(session).set_last_push_outcome(
+            tenant.id, {"status": "declined", "reason": "stale", "at": "2026-10-15T10:00:00+00:00"}
+        )
+    await record_skip(session_factory, "push", tenant)
+    async with session_factory() as session:
+        outcome = (await SqlAlchemySyncStateRepository(session).get_status(tenant.id))[
+            "last_push_outcome"
+        ]
+    assert outcome["status"] == "declined" and outcome["reason"] == "stale"
+    assert outcome["last_skip"]["status"] == "skipped"
