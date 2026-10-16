@@ -8,6 +8,7 @@ from typing import Any
 from bims_shopify.domain.product import ProductSnapshot
 from bims_shopify.domain.sale import SaleOrder, SaleResult, SaleResultKind
 from bims_shopify.domain.snapshot import CatalogPull, CatalogRow, resolve_product_snapshots
+from bims_shopify.domain.stock_consolidation import consolidate_sellable_stock
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
@@ -103,10 +104,23 @@ class BIMSERPAdapter:
                         skus,
                         [warehouse_id],
                         request_prefix=f"bims-shopify-wh{warehouse_id}-",
+                        clamp=False,
                     )
                     for sku, quantity in per_sku.items():
                         by_warehouse.setdefault(sku, {})[warehouse_id] = quantity
                 timings["warehouse_stock_seconds"] = time.perf_counter() - started
+
+                # BIMS's own aggregate lets a negative warehouse cancel a
+                # positive one, which hides merchandise the store can ship
+                # (see ``consolidate_sellable_stock`` for why those negatives
+                # exist). Recompute the sellable figure from the per-warehouse
+                # detail we just fetched, under the tenant's rule.
+                stock = {
+                    sku: consolidate_sellable_stock(
+                        warehouses, mode=tenant.stock_consolidation
+                    )
+                    for sku, warehouses in by_warehouse.items()
+                }
 
         return CatalogPull(
             rows=rows,
@@ -165,7 +179,16 @@ class BIMSERPAdapter:
         *,
         concurrency: int | None = None,
         request_prefix: str = "bims-shopify-",
+        clamp: bool = True,
     ) -> tuple[dict[str, float], float]:
+        """Fetch stock for ``skus`` scoped to ``warehouse_ids``.
+
+        ``clamp`` turns a negative quantity into 0. That is right for a figure
+        headed to Shopify, but WRONG for the per-warehouse detail: a negative
+        warehouse is the signal that a transfer was never registered as
+        received, and clamping it to 0 hides exactly what ``diagnose`` exists
+        to show. Per-warehouse pulls pass ``clamp=False``.
+        """
         result: dict[str, float] = {}
         unique_skus = list(dict.fromkeys(skus))
         clamped_count = 0
@@ -185,7 +208,7 @@ class BIMSERPAdapter:
         for response in responses:
             for row in (response.get("data") or {}).get("stockPorSku") or []:
                 stock = float(row.get("stock") or 0)
-                if stock < 0:
+                if stock < 0 and clamp:
                     clamped_count += 1
                     stock = 0.0
                 result[str(row["sku"])] = stock

@@ -5,6 +5,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from bims_shopify.domain.stock_consolidation import (
+    DEFAULT_STOCK_CONSOLIDATION,
+    StockConsolidation,
+)
+
 
 class ReorderStrategy(str, Enum):
     PURCHASE_ORDER = "purchase_order"
@@ -71,6 +76,10 @@ class Tenant:
     auto_import_interval_minutes: int = 360
     auto_import_only_with_stock: bool = True
     sync_mode: SyncMode = SyncMode.FULL
+    #: How per-warehouse quantities collapse into the figure published to
+    #: Shopify. Defaults to summing only the positive warehouses -- see
+    #: ``domain/stock_consolidation.py`` for why negatives must not subtract.
+    stock_consolidation: StockConsolidation = DEFAULT_STOCK_CONSOLIDATION
     #: PULL worker cadence (BIMS -> snapshot). The name predates the split.
     sync_interval_minutes: int = 30
     #: PUSH worker cadence (snapshot -> Shopify).
