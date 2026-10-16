@@ -94,10 +94,12 @@ async def test_adapter_stock_never_exceeds_concurrency():
 
 
 async def test_default_concurrency_is_conservative():
-    assert stock_module.DEFAULT_STOCK_CONCURRENCY == 4
+    # Lowered from 4 to 2 once per-warehouse detail multiplied the passes
+    # over every SKU: BIMS is the client's live billing ERP and timed out.
+    assert stock_module.DEFAULT_STOCK_CONCURRENCY == 2
     client = FakeStockClient()
     await fetch_stock_by_sku(client, _skus(400), [1])
-    assert 1 < client.max_in_flight <= 4
+    assert 1 < client.max_in_flight <= 2
 
 
 async def test_request_ids_unique_per_batch():

@@ -83,7 +83,16 @@ class BIMSERPAdapter:
         rows = [CatalogRow.from_raw(product, tenant.field_mappings) for product in raw_products]
         skus = [row.sku for row in rows if row.eligible and row.sku]
 
-        stock = await self.fetch_stock_levels(tenant, skus)
+        warehouse_ids_for_pull = tenant.stock_warehouse_ids
+        # With per-warehouse detail over several warehouses the aggregate pass
+        # is pure waste: the sellable figure is recomputed from the detail
+        # below, so asking BIMS for its own (wrong-for-us) aggregate costs a
+        # full extra pass over every SKU for a number we discard. BIMS is the
+        # client's live billing ERP and already timed out under that load.
+        skip_aggregate = warehouse_detail and len(warehouse_ids_for_pull) > 1
+        stock: dict[str, float] = {}
+        if not skip_aggregate:
+            stock = await self.fetch_stock_levels(tenant, skus)
         timings: dict[str, float | None] = {
             "catalog_pull_seconds": paged.duration_seconds if paged else None,
             "stock_fetch_seconds": self.last_stock_fetch_seconds,

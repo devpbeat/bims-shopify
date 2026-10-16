@@ -14,7 +14,7 @@ from typing import Any
 STOCK_BATCH_SIZE = 200
 
 #: Batches in flight at once. Tunable per call without a redeploy of callers.
-DEFAULT_STOCK_CONCURRENCY = 4
+DEFAULT_STOCK_CONCURRENCY = 2
 
 
 async def fetch_stock_batches(

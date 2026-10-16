@@ -136,11 +136,14 @@ async def test_multi_warehouse_keeps_the_per_warehouse_quantities(adapter, tenan
 
     pull = await adapter.pull_catalog(tenant)
 
-    assert pull.stock == {"A": 10.0, "B": 0.0}  # the aggregate is what gets pushed
+    # The sellable figure is recomputed from the per-warehouse detail (sum of
+    # the positive warehouses), so BIMS's own aggregate is never requested:
+    # it would cost a full extra pass over every SKU for a number we discard.
+    assert pull.stock == {"A": 10.0, "B": 0.0}
     assert pull.stock_by_warehouse["A"] == {10: 0.0, 20: 10.0, 30: 0.0}
     assert pull.stock_by_warehouse["B"] == {10: 0.0, 30: 0.0}  # absent in 20: not invented
     scopes = sorted(tuple(r["warehouse_ids"]) for r in requests)
-    assert scopes == [(10,), (10, 20, 30), (20,), (30,)]
+    assert scopes == [(10,), (20,), (30,)]
     request_ids = [r["_idSolicitud"] for r in requests]
     assert len(set(request_ids)) == len(request_ids)  # unique per request
     assert pull.timings["warehouse_stock_seconds"] >= 0
