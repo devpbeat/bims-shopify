@@ -121,6 +121,9 @@ async def test_snapshot_endpoint_exposes_metadata_age_history_and_worker_outcome
         repo = SqlAlchemySyncStateRepository(session)
         await repo.set_last_pull_outcome(acme.id, {"status": "ok", "at": "2026-10-15T10:00:00+00:00"})
         await repo.set_last_push_outcome(acme.id, {"status": "declined", "reason": "stale"})
+        await repo.set_last_reconcile_outcome(
+            acme.id, {"status": "ok", "drift": {"count": 4, "total_abs_delta": 9, "sample": []}}
+        )
 
     body = (await _get(app, "/sync/acme/snapshot")).json()
 
@@ -136,9 +139,12 @@ async def test_snapshot_endpoint_exposes_metadata_age_history_and_worker_outcome
     assert [h["status"] for h in body["history"]] == ["current", "superseded"]
     assert body["last_pull"]["status"] == "ok"
     assert body["last_push"]["reason"] == "stale"
+    assert body["last_reconcile"]["status"] == "ok"
+    assert body["last_reconcile"]["drift"]["count"] == 4
     assert body["settings"] == {
         "pull_interval_minutes": 30,
         "push_interval_minutes": 5,
+        "reconcile_interval_minutes": 480,
         "snapshot_max_age_minutes": 120,
         "pull_max_drop_ratio": 0.3,
     }
@@ -200,3 +206,22 @@ async def _post_token(app) -> str:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/tenants/acme/portal-token", headers=HEADERS)
     return response.json()["portal_token"]
+
+
+async def test_snapshot_endpoint_has_no_reconcile_outcome_before_the_first_one(ctx):
+    app, _session_factory, _acme = ctx
+    body = (await _get(app, "/sync/acme/snapshot")).json()
+    assert body["last_reconcile"] is None
+    assert body["last_push"] is None  # the two outcomes never share a slot
+
+
+async def test_sync_status_carries_the_reconcile_outcome_and_interval(ctx):
+    app, session_factory, acme = ctx
+    async with session_factory() as session:
+        await SqlAlchemySyncStateRepository(session).set_last_reconcile_outcome(
+            acme.id, {"status": "needs_confirmation", "drift": {"count": 800}}
+        )
+    body = (await _get(app, "/sync/acme/status")).json()
+    assert body["last_reconcile_outcome"]["drift"]["count"] == 800
+    interval = body["reconcile_interval"]
+    assert interval["configured_minutes"] == 480 and interval["min_safe_minutes"] == 60

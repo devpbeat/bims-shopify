@@ -17,7 +17,12 @@ from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
 from bims_shopify.application.push_snapshot import snapshot_decline
-from bims_shopify.application.sync_interval import PULL_MODE, PUSH_MODE, interval_floor_for
+from bims_shopify.application.sync_interval import (
+    PULL_MODE,
+    PUSH_MODE,
+    RECONCILE_MODE,
+    interval_floor_for,
+)
 from bims_shopify.application.sync_inventory import ProgressFn
 from bims_shopify.logging import get_logger
 from bims_shopify.sync_locks import CombinedLock
@@ -119,6 +124,14 @@ async def get_sync_status(
         "slowest_recent_seconds": push_floor.slowest_seconds,
         "runs_considered": push_floor.runs_considered,
     }
+    reconcile_floor = await interval_floor_for(sync_state_repo, tenant.id, RECONCILE_MODE)
+    status["reconcile_interval"] = {
+        "configured_minutes": tenant.reconcile_interval_minutes,
+        "min_safe_minutes": reconcile_floor.minutes,
+        "basis": reconcile_floor.basis,
+        "slowest_recent_seconds": reconcile_floor.slowest_seconds,
+        "runs_considered": reconcile_floor.runs_considered,
+    }
     status["snapshot_max_age_minutes"] = tenant.snapshot_max_age_minutes
     return status
 
@@ -137,13 +150,15 @@ async def get_snapshot(
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     session: AsyncSession = _Depends(get_db_session),
 ):
-    """The catalog snapshot the push worker reads, and what both workers last did.
+    """The catalog snapshot the push worker reads, and what the workers last did.
 
     ``current`` is the snapshot a push would use (``null`` before the first
     pull lands); ``history`` lists the last pulls newest first, including
     rejected ones (``status: rejected`` with its ``rejection`` reason).
     ``usable_for_push`` / ``decline`` say whether the push worker would use the
-    current snapshot right now and, if not, why. Cheap: metadata only.
+    current snapshot right now and, if not, why. ``last_reconcile`` is the last
+    reconciliation against Shopify's real quantities, with its ``drift`` count
+    (a healthy system sits near zero). Cheap: metadata only.
     """
     tenant = await repo.get_by_slug(tenant_slug)
     if tenant is None:
@@ -160,12 +175,16 @@ async def get_snapshot(
         "history": [_meta_view(meta, now) for meta in history],
         "last_pull": status["last_pull_outcome"],
         "last_push": status["last_push_outcome"],
+        # Apart from the push on purpose: "the push had nothing to do" and
+        # "the reconcile found N silently wrong SKUs" must never look alike.
+        "last_reconcile": status["last_reconcile_outcome"],
         "max_age_minutes": tenant.snapshot_max_age_minutes,
         "usable_for_push": verdict is None,
         "decline": {"reason": verdict[0], **verdict[1]} if verdict else None,
         "settings": {
             "pull_interval_minutes": tenant.sync_interval_minutes,
             "push_interval_minutes": tenant.push_interval_minutes,
+            "reconcile_interval_minutes": tenant.reconcile_interval_minutes,
             "snapshot_max_age_minutes": tenant.snapshot_max_age_minutes,
             "pull_max_drop_ratio": tenant.pull_max_drop_ratio,
         },
