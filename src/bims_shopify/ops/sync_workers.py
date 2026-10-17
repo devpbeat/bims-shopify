@@ -29,7 +29,8 @@ from bims_shopify.adapters.shopify.client import ShopifyClient
 from bims_shopify.adapters.snapshot_erp import SnapshotERPAdapter
 from bims_shopify.application.pull_snapshot import PullCatalogSnapshot
 from bims_shopify.application.push_snapshot import snapshot_decline
-from bims_shopify.application.sync_interval import PULL_MODE, PUSH_MODE
+from bims_shopify.application.reconcile_inventory import ReconcileInventory
+from bims_shopify.application.sync_interval import PULL_MODE, PUSH_MODE, RECONCILE_MODE
 from bims_shopify.application.sync_inventory import (
     DryRunReport,
     NeedsConfirmation,
@@ -50,6 +51,7 @@ logger = get_logger(__name__)
 
 PULL_ERROR_PREFIX = "pull: "
 PUSH_ERROR_PREFIX = "push: "
+RECONCILE_ERROR_PREFIX = "reconcile: "
 
 SKIP_REASON = "previous run still running; this tick was skipped, not queued"
 
@@ -102,7 +104,7 @@ async def compute_catalog_stats(tenant: Tenant, pull: CatalogPull) -> dict[str, 
 
 
 async def record_skip(session_factory: async_sessionmaker, kind: str, tenant: Tenant) -> None:
-    """Record that a scheduled ``kind`` ("pull" | "push") tick found the
+    """Record that a scheduled ``kind`` ("pull" | "push" | "reconcile") tick found the
     previous run of the same worker still going and did nothing.
 
     A skipped tick is not queued: the next interval simply tries again. It is
@@ -114,7 +116,14 @@ async def record_skip(session_factory: async_sessionmaker, kind: str, tenant: Te
     outcome = {"status": "skipped", "at": _now().isoformat(), "reason": SKIP_REASON, "trigger": "scheduled"}
     async with session_factory() as session:
         state = SqlAlchemySyncStateRepository(session)
-        if kind == "pull":
+        if kind == "reconcile":
+            previous = await state.get_last_reconcile_outcome(tenant.id)
+            # Keep the last real outcome (and its drift numbers) readable; the
+            # overlapping tick is only noted alongside it.
+            await state.set_last_reconcile_outcome(
+                tenant.id, {**(previous or {}), "last_skip": outcome}
+            )
+        elif kind == "pull":
             prior = (await state.get_status(tenant.id))["last_pull_outcome"]
             if prior and prior.get("status") == "skipped":
                 outcome["previous"] = prior.get("previous")
@@ -647,6 +656,266 @@ async def do_push(
             "report": report,
             "snapshot": info,
         }
+    finally:
+        await storefront.aclose()
+
+
+# -- RECONCILE ----------------------------------------------------------------
+
+
+def _drift_summary(report: dict[str, Any]) -> dict[str, Any]:
+    """The drift numbers, as stored in the outcome and the audit log."""
+    return dict(report["drift"])
+
+
+async def do_reconcile(
+    tenant: Tenant,
+    session: AsyncSession,
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+    progress: ProgressFn | None = None,
+    trigger: str = "scheduled",
+) -> dict[str, Any]:
+    """Compare Shopify's REAL quantities with the current snapshot and push
+    every SKU that differs, ignoring the stored baseline. Never calls BIMS.
+
+    * ``reconcile_declined``: no usable snapshot (missing, incomplete, stale),
+      judged before Shopify is read and again right before anything is written
+      (reading a whole catalog takes a while). Shopify is not touched.
+    * ``needs_confirmation``: the same mass-zero / max-changed guard as the
+      push fired; nothing was written, the drift is still reported.
+    * ``ok``: ``drift`` says how many SKUs had drifted, by how much, with a
+      bounded sample. The baseline is then refreshed from what Shopify now
+      holds, so the cheap incremental pushes that follow work from truth.
+
+    ``force`` is the operator override of the guard, as for the push. The
+    caller holds the tenant's push lock (see ``bims_shopify.sync_locks``).
+    """
+    if tenant.id is None:
+        raise ValueError("tenant must be persisted before reconciling")
+    state = SqlAlchemySyncStateRepository(session)
+    audit = SqlAlchemyAuditLogger(session)
+    snapshots = SqlAlchemySnapshotRepository(session)
+    now = _now()
+    meta = await snapshots.get_current_meta(tenant.id)
+
+    async def decline(at_meta: SnapshotMeta | None, verdict: tuple[str, dict[str, Any]]) -> dict:
+        reason, detail = verdict
+        await state.set_last_reconcile_outcome(
+            tenant.id,
+            {
+                "status": "declined",
+                "reason": reason,
+                "detail": detail,
+                "snapshot_id": at_meta.id if at_meta else None,
+                "at": _now().isoformat(),
+                "trigger": trigger,
+            },
+        )
+        logger.warning(
+            "sync_reconcile_declined", tenant_slug=tenant.slug, tenant_id=tenant.id, reason=reason, **detail
+        )
+        await audit.log(
+            actor="system",
+            action="sync.reconcile_declined",
+            entity="sync_run",
+            tenant_id=tenant.id,
+            payload={"reason": reason, "detail": detail, "trigger": trigger},
+        )
+        return {
+            "status": "reconcile_declined",
+            "reason": reason,
+            "detail": detail,
+            "snapshot": at_meta.as_dict() if at_meta else None,
+        }
+
+    verdict = snapshot_decline(meta, tenant, now)
+    if verdict is not None:
+        return await decline(meta, verdict)
+    if meta is None:  # unreachable: snapshot_decline reports a missing snapshot
+        raise RuntimeError("reconcile reached the snapshot read without a snapshot")
+
+    snapshot = await snapshots.load(meta)
+    storefront = ShopifyClient(tenant)
+    try:
+        use_case = ReconcileInventory(SnapshotERPAdapter(snapshot), storefront)
+        info = _snapshot_info(meta, now)
+        run_started_at = _now()
+        clock = time.perf_counter()
+        report: dict[str, Any] = {}
+
+        async def failed(exc: Exception) -> None:
+            error = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "sync_reconcile_failed",
+                tenant_slug=tenant.slug,
+                tenant_id=tenant.id,
+                duration_seconds=time.perf_counter() - clock,
+                error=error,
+            )
+            await state.set_last_error(tenant.id, f"{RECONCILE_ERROR_PREFIX}{error}")
+            await state.set_last_reconcile_outcome(
+                tenant.id,
+                {
+                    "status": "failed",
+                    "error": error,
+                    "snapshot_id": meta.id,
+                    "drift": report.get("drift"),
+                    "at": _now().isoformat(),
+                    "trigger": trigger,
+                },
+            )
+            await audit.log(
+                actor="system",
+                action="sync.reconcile_error",
+                entity="sync_run",
+                tenant_id=tenant.id,
+                payload={"error": error, "snapshot_id": meta.id, "trigger": trigger},
+            )
+
+        try:
+            plan = await use_case.plan(tenant, _staged(progress, "reconcile"))
+        except Exception as exc:
+            await failed(exc)
+            raise
+        report = plan.report
+
+        # The scan takes a while: judge the snapshot again before writing.
+        verdict = snapshot_decline(meta, tenant, _now())
+        if verdict is not None:
+            return await decline(meta, verdict)
+
+        try:
+            result = await use_case.apply(
+                plan, tenant, dry_run=dry_run, force=force, progress=_staged(progress, "reconcile")
+            )
+        except Exception as exc:
+            await failed(exc)
+            raise
+
+        duration = time.perf_counter() - clock
+        drift = _drift_summary(report)
+        base = {"drift": drift, "report": report, "snapshot": info, "scanned": report["scanned"]}
+
+        if dry_run:
+            # The guard is evaluated in a dry run too: its numbers are in the report.
+            return {
+                "dry_run": True,
+                "mode": "reconcile",
+                "would_update": len(plan.to_push),
+                "guard_fired": isinstance(result, NeedsConfirmation),
+                **base,
+            }
+
+        if isinstance(result, NeedsConfirmation):
+            await state.set_last_reconcile_outcome(
+                tenant.id,
+                {
+                    "status": "needs_confirmation",
+                    "reason": result.reason,
+                    "snapshot_id": meta.id,
+                    "zero_count": result.zero_count,
+                    "matched_count": result.matched_count,
+                    "threshold": result.threshold,
+                    "drift": drift,
+                    "duration_seconds": duration,
+                    "at": _now().isoformat(),
+                    "trigger": trigger,
+                },
+            )
+            logger.warning(
+                "sync_reconcile_needs_confirmation",
+                tenant_slug=tenant.slug,
+                tenant_id=tenant.id,
+                reason=result.reason,
+                drift_count=drift["count"],
+                zero_count=result.zero_count,
+                matched_count=result.matched_count,
+            )
+            await audit.log(
+                actor="system",
+                action="sync.reconcile_needs_confirmation",
+                entity="sync_run",
+                tenant_id=tenant.id,
+                payload={
+                    "reason": result.reason,
+                    "zero_count": result.zero_count,
+                    "matched_count": result.matched_count,
+                    "threshold": result.threshold,
+                    "drift": drift,
+                    "snapshot_id": meta.id,
+                    "trigger": trigger,
+                },
+            )
+            return {
+                "status": "needs_confirmation",
+                "reason": result.reason,
+                "zero_count": result.zero_count,
+                "matched_count": result.matched_count,
+                "threshold": result.threshold,
+                **base,
+            }
+
+        # Refresh the baseline from what Shopify now holds: the SKUs we just
+        # wrote and the ones verified already right. Same value format as the
+        # push, so its next diff starts from truth.
+        previous = await state.get_product_hashes(tenant.id)
+        refreshed = {
+            **previous,
+            **{sku: str(stock) for sku, stock in plan.in_sync.items()},
+            **{d.sku: str(d.new_stock) for d in result},
+        }
+        await state.set_product_hashes(tenant.id, refreshed)
+        await state.clear_last_error(tenant.id, only_prefix=RECONCILE_ERROR_PREFIX)
+        await state.record_run_duration(tenant.id, duration, RECONCILE_MODE)
+        no_level = report["no_level"]
+        await state.set_last_reconcile_outcome(
+            tenant.id,
+            {
+                "status": "ok",
+                "snapshot_id": meta.id,
+                "drift": drift,
+                "updated": len(result),
+                "in_sync": report["in_sync"]["count"],
+                "no_level": {
+                    "count": no_level["count"],
+                    "pushed": no_level["pushed"],
+                    "skipped_zero": no_level["skipped_zero"],
+                },
+                "unknown_stock": report["unknown_stock"]["count"],
+                "not_in_shopify": report["not_in_shopify"]["count"],
+                "scanned": report["scanned"],
+                "duration_seconds": duration,
+                "started_at": run_started_at.isoformat(),
+                "at": _now().isoformat(),
+                "trigger": trigger,
+            },
+        )
+        logger.info(
+            "sync_reconcile_completed",
+            tenant_slug=tenant.slug,
+            tenant_id=tenant.id,
+            snapshot_id=meta.id,
+            drift_count=drift["count"],
+            drift_total_abs_delta=drift["total_abs_delta"],
+            updated=len(result),
+            duration_seconds=duration,
+        )
+        await audit.log(
+            actor="system",
+            action="sync.reconcile_completed",
+            entity="sync_run",
+            tenant_id=tenant.id,
+            payload={
+                "drift": drift,
+                "updated": len(result),
+                "scanned": report["scanned"],
+                "snapshot_id": meta.id,
+                "trigger": trigger,
+            },
+        )
+        return {"status": "ok", "updated": len(result), **base}
     finally:
         await storefront.aclose()
 

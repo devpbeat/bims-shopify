@@ -22,6 +22,34 @@ BIMS_STOCK = "https://bims.example.com/api/products_stocks/stock_fenicio.json"
 BIMS_DELETED = "https://bims.example.com/api/products/deleted.json"
 
 
+def inventory_response(skus: list[str], levels: dict[str, int | None]) -> dict:
+    """The ``ListVariantInventory`` answer: ``levels[sku]`` is the available
+    quantity at the location, or ``None`` (also: SKU absent) for NO level there."""
+    nodes = []
+    for i, sku in enumerate(skus, start=1):
+        quantity = levels.get(sku)
+        level = (
+            None
+            if quantity is None
+            else {"quantities": [{"name": "available", "quantity": quantity}]}
+        )
+        nodes.append(
+            {
+                "id": f"gid://shopify/ProductVariant/{i}",
+                "sku": sku,
+                "inventoryItem": {"id": f"gid://shopify/InventoryItem/{i}", "inventoryLevel": level},
+            }
+        )
+    return {
+        "data": {
+            "productVariants": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": nodes,
+            }
+        }
+    }
+
+
 def variants_response(*skus: str) -> dict:
     return {
         "data": {
@@ -42,13 +70,29 @@ def variants_response(*skus: str) -> dict:
 
 
 class ShopifyWorld:
-    """Fake Shopify. ``pushed`` maps SKU -> the last quantity written for it."""
+    """Fake Shopify. ``pushed`` maps SKU -> the last quantity written for it.
 
-    def __init__(self, skus: list[str], *, fail_writes: bool = False) -> None:
+    ``levels`` is what Shopify REALLY holds per SKU (``None``/absent: no
+    inventory level at the location). Writes update it, unless
+    ``ignore_writes`` (a mutation accepted but never applied)."""
+
+    def __init__(
+        self,
+        skus: list[str],
+        *,
+        fail_writes: bool = False,
+        levels: dict[str, int | None] | None = None,
+        ignore_writes: bool = False,
+    ) -> None:
         self.skus = list(skus)
         self.fail_writes = fail_writes
+        self.levels: dict[str, int | None] = dict(levels or {})
+        self.ignore_writes = ignore_writes
         self.write_calls = 0
         self.listing_calls = 0
+        self.inventory_reads = 0
+        #: Called after every inventory read (e.g. to move a fake clock).
+        self.after_inventory_read = None
         self.pushed: dict[str, int] = {}
         #: SKU -> stock BIMS serves, or None while BIMS is "down" (HTTP 500).
         self.bims_stock_by_sku: dict[str, float] | None = None
@@ -102,10 +146,19 @@ class ShopifyWorld:
                 return httpx.Response(500, json={"errors": "shopify down"})
             by_item = {f"gid://shopify/InventoryItem/{i}": s for i, s in enumerate(self.skus, start=1)}
             for q in body["variables"]["input"]["quantities"]:
-                self.pushed[by_item[q["inventoryItemId"]]] = q["quantity"]
+                sku = by_item[q["inventoryItemId"]]
+                self.pushed[sku] = q["quantity"]
+                if not self.ignore_writes:
+                    self.levels[sku] = q["quantity"]
             return httpx.Response(
                 200, json={"data": {"inventorySetQuantities": {"userErrors": []}}}
             )
+        if "ListVariantInventory" in body["query"]:
+            self.inventory_reads += 1
+            response = httpx.Response(200, json=inventory_response(self.skus, self.levels))
+            if self.after_inventory_read is not None:
+                self.after_inventory_read()
+            return response
         self.listing_calls += 1
         return httpx.Response(200, json=variants_response(*self.skus))
 
