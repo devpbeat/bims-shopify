@@ -28,6 +28,10 @@ Because the push reads our own database, BIMS being slow, flaky or down no longe
 means Shopify gets nothing: the push keeps working from the last good snapshot
 until that snapshot is older than `snapshot_max_age_minutes` (see below).
 
+A third, slow worker, the **reconcile**, checks the result against Shopify itself
+(see [Reconciliation](#reconciliation-against-shopifys-real-inventory)). It is not
+part of the normal flow; it is the safety net under it.
+
 Both intervals and the staleness limit are per-tenant, edited through the tenant
 API (`PATCH /tenants/{slug}`, also accepted on create and `PUT`), and picked up
 **without a restart**: the API call reschedules the running jobs immediately and a
@@ -190,10 +194,160 @@ same two functions the scheduler runs (not a separate code path):
 | `diagnose` | **live** BIMS | it explains a live discrepancy; deliberately not switched |
 | `import`, `cleanup_no_stock` | live BIMS | not switched |
 
+## Reconciliation against Shopify's real inventory
+
+### Why the push can freeze a SKU
+
+The push does not look at Shopify. It diffs the snapshot against a **stored baseline
+of what it last pushed** (`sync_states.product_hashes`). As long as Shopify really
+holds what the baseline says, that is a perfect and nearly free diff. The moment the
+two diverge, the SKU is **frozen**: the push keeps concluding "already in sync" and
+never touches it again, and the only cure used to be a manual `force` run (which
+fixes it only until the next drift).
+
+The two diverge for ordinary reasons:
+
+* a push that failed halfway (the first batches landed, the rest did not);
+* a quantity edited by hand in the Shopify admin;
+* a mutation Shopify accepted but did not apply;
+* a job killed mid-flight (it has happened repeatedly during deploys).
+
+Symptom: pulls healthy and punctual, `last_push` reporting `updated: 1`, and a
+merchant looking at variants whose stock has not moved for hours while BIMS shows
+other numbers.
+
+### What the reconcile does
+
+`ops.sync_workers.do_reconcile` ignores the baseline entirely:
+
+1. Refuses to run on a **missing, incomplete or stale snapshot**, with the very same
+   rule as the push (`snapshot_decline`), and judges the snapshot **again right
+   before writing** (reading a whole catalog takes a while). It declines with a
+   recorded reason and Shopify is not written.
+2. Pages **every variant with its real `available` quantity at the tenant's
+   location** (`ShopifyClient.iter_variant_inventory`).
+3. Compares each with the snapshot (stock consolidated by the pull through
+   `consolidate_sellable_stock`; the reconcile has no second implementation) and
+   pushes **every SKU that differs**, through the same safety guard and the same
+   batch writer as the push.
+4. Refreshes the baseline from what Shopify now holds (the SKUs it wrote and the ones
+   it verified), so the cheap incremental pushes that follow work from truth again.
+
+Rules it keeps from the push, on purpose:
+
+* **Mass-zero guard.** If the corrections would zero more than `max_zero_ratio`
+  (default 20%) of the SKUs to change, or change more than `max_changed_variants`
+  (default 500), nothing is written and the outcome is `needs_confirmation`. The
+  drift is still reported. It matters *more* here: a reconcile sends more values,
+  so a bad snapshot could do more damage. `force` is the explicit operator override.
+* **Absent BIMS stock is UNKNOWN**, never zero. A Shopify SKU the snapshot has no
+  stock for is left alone and only counted (`unknown_stock`).
+* **Integers.** The push writes integers, so the comparison is made on the integer
+  that would be written: BIMS `2.5` against Shopify `2` is not drift (it would
+  otherwise "drift" on every run and never settle).
+
+A variant with **no inventory level at the location** is not a variant holding zero,
+and the reconcile keeps them apart:
+
+| Snapshot | Shopify | Result |
+|---|---|---|
+| 5 | no level | pushed (the write stocks the item at the location); counted under `no_level.pushed`, not under `drift` |
+| 0 | no level | **not pushed**: writing a zero would invent a level that was never stocked; counted under `no_level.skipped_zero` |
+| 0 | level, 0 | in sync |
+| 3 | level, 0 | drift (`shopify: 0`) |
+
+### Reading the drift number
+
+The result and `last_reconcile` in `GET /sync/{slug}/snapshot` (kept apart from
+`last_push` on purpose, so "the push had nothing to do" and "the reconcile found 400
+silently wrong SKUs" can never look alike):
+
+```json
+"last_reconcile": {
+  "status": "ok",
+  "drift": {
+    "count": 12,              // SKUs whose real Shopify quantity differed from the snapshot
+    "total_abs_delta": 87,    // units out, summed
+    "max_abs_delta": 30,
+    "sample": [{"sku": "A1", "shopify": 2, "snapshot": 5, "delta": 3}]   // bounded (DRIFT_SAMPLE_SIZE = 20)
+  },
+  "updated": 15, "in_sync": 12606,
+  "no_level": {"count": 3, "pushed": 3, "skipped_zero": 0},
+  "unknown_stock": 4, "not_in_shopify": 9,
+  "scanned": {"snapshot": 12621, "shopify": 12630},
+  "duration_seconds": 412.3, "trigger": "scheduled"
+}
+```
+
+`status` is one of `ok`, `needs_confirmation` (guard fired, nothing written),
+`declined` (no usable snapshot), `failed`, or a `skipped` note (`last_skip`) next to
+the last real outcome. `drift.count` is the health metric.
+
+**What a healthy value looks like.** Close to zero. A handful is normal: a unit sold
+in Shopify moves its `available` down at once, while BIMS only reflects the sale at
+the next pull, so a few SKUs sold in the last minutes legitimately differ. Expect
+roughly "orders in the last pull interval", not hundreds.
+
+**What a bad value means.** A count that stays high, or **rises run after run**, means
+something upstream is dropping writes: the same SKUs reappearing in `drift.sample`
+after being corrected point at a mutation Shopify accepts but does not apply; a jump
+right after a deploy points at killed pushes; `failed` samples and the
+`sync.reconcile_error` / `sync.error` audit entries show write errors. A huge first
+number on a tenant that has never been reconciled is expected (that is the frozen
+backlog) and will likely trip the `max_changed_variants` guard: review the sample,
+then run once with `force`.
+
+### When to run it by hand
+
+* a merchant reports stale numbers while pulls look healthy;
+* after a Shopify incident, a deploy that killed a running push, or any run that
+  recorded failures;
+* after changing `shopify_location_id` or `stock_consolidation`;
+* to take a baseline reading on a tenant that has never been reconciled
+  (`dry_run: true` reports the drift without writing).
+
+```
+POST /ops/{slug}/run   {"command": "reconcile", "options": {"dry_run": true}}
+POST /ops/{slug}/run   {"command": "reconcile", "options": {"force": false}}
+```
+
+`dry_run` reads Shopify and reports the drift and whether the guard would fire; it
+writes nothing and does not touch the baseline. `force` bypasses the guard, as for
+`sync`. Poll `GET /ops/{slug}/jobs/{job_id}`; the result has the same `drift` and
+`report` as above. There is no HTTP shortcut like `POST /sync/{slug}/run`: a
+catalog-wide read outlasts a proxy timeout, so it is only an ops job.
+
+### Cadence, cost and locking
+
+`reconcile_interval_minutes`, per tenant, **default 480 (three times a day)**,
+editable through the tenant API like the other intervals and applied without a
+restart. Why not minutes: it pages the **entire** Shopify catalog (28,000+ variants,
+about 280 requests of 100 variants), which is far more expensive than a push, and
+a healthy system has almost nothing to correct. Three runs a day bound how long a
+drifted SKU can stay wrong to about eight hours while costing a few percent of the
+Shopify rate budget. The floor is **60 minutes, or 3x the slowest recent reconcile**,
+whichever is larger (history under its own `reconcile` key); a lower value is
+rejected with HTTP 422, like the other workers.
+
+After a restart the first reconcile fires after `last reconcile + interval`, or about
+five minutes after boot when never run or overdue, so frequent deploys neither starve
+it nor start a catalog scan while the app is still settling.
+
+**It never runs concurrently with the push** for the same tenant. The reconcile
+holds the push lock for the whole run (otherwise a push could land newer values
+between the Shopify read and the write, and the reconcile would overwrite them with
+an older read). So: a push tick that finds a reconcile running is skipped and
+recorded (`last_push.last_skip`); a reconcile tick that finds a push running waits for
+it (a push lasts seconds); a second reconcile tick while one is running is skipped
+and recorded. It does not take the pull lock: a pull may still land a new snapshot,
+the reconcile keeps using the one it started from. The one-shot `sync` holds the push
+lock too, so it excludes the reconcile.
+
 ## Intervals
 
 `sync_interval_minutes` is the **pull** interval (default 30, the name predates the
-split); `push_interval_minutes` is the push interval (default 5). The old global
+split); `push_interval_minutes` is the push interval (default 5);
+`reconcile_interval_minutes` is the reconcile interval (default 480). The old global
 `SYNC_INTERVAL_MINUTES` env var is not read.
 
 ### Minimum safe interval (enforced, measured separately)
@@ -206,13 +360,16 @@ worker (`sync_states.sync_duration_history`, last 40 per worker, window of 10):
   rounded up to whole minutes, never below 5; with no history, 30 minutes.
 * **Push** floor: the same rule on completed pushes, never below 1 minute; with no
   history, 1 minute.
+* **Reconcile** floor: the same rule on completed reconciles, never below 60 minutes;
+  with no history, 60 minutes.
 
 The histories are kept apart on purpose: a push takes seconds, and mixing it into the
 pull's history would let the pull interval drop far below what BIMS sustains.
 
 An interval below the floor is **rejected with HTTP 422** whose body states the
 numbers. The check runs only when that interval is being changed. Read the current
-recommendations from `GET /sync/{slug}/status` -> `sync_interval` and `push_interval`.
+recommendations from `GET /sync/{slug}/status` -> `sync_interval`, `push_interval` and
+`reconcile_interval`.
 
 ### `sync_mode` is deprecated
 
