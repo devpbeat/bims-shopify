@@ -70,3 +70,37 @@ async def test_combined_lock_releases_the_first_lock_if_the_second_cannot_be_tak
         await waiter
     locks.push(1).release()
     assert not locks.pull(1).locked()  # the pull lock taken first was given back
+
+
+async def test_reconcile_holds_its_own_lock_and_the_push_lock_but_never_the_pull_lock():
+    locks = SyncLocks()
+    reconcile = locks.reconcile_worker(1)
+    assert not reconcile.locked()
+    async with reconcile:
+        assert locks.reconcile(1).locked() and locks.push(1).locked()
+        assert not locks.pull(1).locked()  # a pull may still land a new snapshot
+    assert not locks.reconcile(1).locked() and not locks.push(1).locked()
+
+
+async def test_reconcile_waits_for_a_running_push_instead_of_overlapping():
+    locks = SyncLocks()
+    order: list[str] = []
+
+    async def push():
+        async with locks.push(1):
+            order.append("push-start")
+            await asyncio.sleep(0.05)
+            order.append("push-end")
+
+    task = asyncio.create_task(push())
+    await asyncio.sleep(0.01)
+    async with locks.reconcile_worker(1):
+        order.append("reconcile")
+    await task
+    assert order == ["push-start", "push-end", "reconcile"]
+
+
+async def test_the_reconcile_lock_is_per_tenant():
+    locks = SyncLocks()
+    async with locks.reconcile_worker(1):
+        assert not locks.reconcile(2).locked() and not locks.push(2).locked()

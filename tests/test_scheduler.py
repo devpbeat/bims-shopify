@@ -419,3 +419,232 @@ async def test_a_restart_does_not_repull_a_fresh_snapshot_nor_starve_an_old_one(
         assert old_next - datetime.now(UTC) < timedelta(seconds=5)  # overdue: now
     finally:
         scheduler.shutdown()
+
+
+# -- reconcile worker: a third, slow, per-tenant job -------------------------------
+
+
+async def test_each_tenant_also_gets_a_reconcile_job_on_its_own_interval():
+    tenant = replace(
+        _make_tenant(1), sync_interval_minutes=30, push_interval_minutes=5, reconcile_interval_minutes=480
+    )
+    scheduler = TenantSyncScheduler(
+        FakeTenantRepository([tenant]), _noop, push_fn=_noop, reconcile_fn=_noop
+    )
+    scheduler.start()
+    try:
+        await scheduler.reconcile()
+        assert _job_interval(scheduler, 1, "reconcile") == timedelta(minutes=480)
+        assert _job_interval(scheduler, 1, "pull") == timedelta(minutes=30)
+        assert _job_interval(scheduler, 1, "push") == timedelta(minutes=5)
+    finally:
+        scheduler.shutdown()
+
+
+async def test_reconcile_interval_reschedules_live_without_touching_the_other_jobs():
+    tenant = replace(_make_tenant(1), reconcile_interval_minutes=480)
+    repo = FakeTenantRepository([tenant])
+    scheduler = TenantSyncScheduler(repo, _noop, push_fn=_noop, reconcile_fn=_noop)
+    scheduler.start()
+    try:
+        await scheduler.reconcile()
+        push_next = scheduler._scheduler.get_job("tenant-push-1").next_run_time
+
+        repo.set(replace(tenant, reconcile_interval_minutes=240))  # picked up from storage
+        await scheduler.reconcile()
+        assert _job_interval(scheduler, 1, "reconcile") == timedelta(minutes=240)
+
+        saved = replace(tenant, reconcile_interval_minutes=120)  # and by the tenant API at once
+        repo.set(saved)
+        scheduler.reschedule_tenant(saved)
+        assert _job_interval(scheduler, 1, "reconcile") == timedelta(minutes=120)
+        assert scheduler._scheduler.get_job("tenant-push-1").next_run_time == push_next
+    finally:
+        scheduler.shutdown()
+
+
+async def test_a_deactivated_or_removed_tenant_loses_its_reconcile_job_too():
+    tenant = _make_tenant(1)
+    repo = FakeTenantRepository([tenant])
+    scheduler = TenantSyncScheduler(repo, _noop, push_fn=_noop, reconcile_fn=_noop)
+    scheduler.start()
+    try:
+        await scheduler.reconcile()
+        repo.set(replace(tenant, active=False))
+        await scheduler.reconcile()
+        assert _job_interval(scheduler, 1, "reconcile") is None
+        repo.set(tenant)
+        await scheduler.reconcile()
+        assert _job_interval(scheduler, 1, "reconcile") is not None
+        scheduler.remove_tenant(1)
+        assert _job_interval(scheduler, 1, "reconcile") is None
+    finally:
+        scheduler.shutdown()
+
+
+async def test_a_reconcile_tick_waits_for_a_running_push_and_never_overlaps_it():
+    repo = FakeTenantRepository([_make_tenant(1)])
+    push_started, release_push = asyncio.Event(), asyncio.Event()
+    events: list[str] = []
+
+    async def slow_push(tenant: Tenant) -> None:
+        events.append("push-start")
+        push_started.set()
+        await release_push.wait()
+        events.append("push-end")
+
+    async def reconcile(tenant: Tenant) -> None:
+        events.append("reconcile")
+
+    scheduler = TenantSyncScheduler(repo, _noop, push_fn=slow_push, reconcile_fn=reconcile)
+    await scheduler.run_push_tenant(1)
+    await push_started.wait()
+
+    await scheduler.run_reconcile_tenant(1)
+    await asyncio.sleep(0.03)
+    assert events == ["push-start"]  # waiting, not running beside the push
+
+    release_push.set()
+    await asyncio.sleep(0.03)
+    assert events == ["push-start", "push-end", "reconcile"]
+
+
+async def test_a_push_tick_stands_aside_while_a_reconcile_is_running():
+    repo = FakeTenantRepository([_make_tenant(1)])
+    started, release = asyncio.Event(), asyncio.Event()
+    pushes, skips = [], []
+
+    async def slow_reconcile(tenant: Tenant) -> None:
+        started.set()
+        await release.wait()
+
+    async def push(tenant: Tenant) -> None:
+        pushes.append(tenant.id)
+
+    async def on_skip(kind: str, tenant: Tenant) -> None:
+        skips.append(kind)
+
+    scheduler = TenantSyncScheduler(
+        repo, _noop, push_fn=push, reconcile_fn=slow_reconcile, skip_fn=on_skip
+    )
+    await scheduler.run_reconcile_tenant(1)
+    await started.wait()
+    await scheduler.run_push_tenant(1)
+    assert pushes == [] and skips == ["push"]
+    release.set()
+    await asyncio.sleep(0.03)
+    await scheduler.run_push_tenant(1)
+    await asyncio.sleep(0.03)
+    assert pushes == [1]
+
+
+async def test_a_reconcile_tick_that_finds_the_previous_reconcile_running_is_skipped_and_recorded():
+    repo = FakeTenantRepository([_make_tenant(1)])
+    started, release = asyncio.Event(), asyncio.Event()
+    runs, skips = [], []
+
+    async def slow_reconcile(tenant: Tenant) -> None:
+        runs.append(tenant.id)
+        started.set()
+        await release.wait()
+
+    async def on_skip(kind: str, tenant: Tenant) -> None:
+        skips.append(kind)
+
+    scheduler = TenantSyncScheduler(
+        repo, _noop, push_fn=_noop, reconcile_fn=slow_reconcile, skip_fn=on_skip
+    )
+    await scheduler.run_reconcile_tenant(1)
+    await started.wait()
+    await scheduler.run_reconcile_tenant(1)
+    assert runs == [1] and skips == ["reconcile"]
+    release.set()
+    await asyncio.sleep(0.03)
+
+
+async def test_a_reconcile_does_not_block_the_pull():
+    repo = FakeTenantRepository([_make_tenant(1)])
+    started, release = asyncio.Event(), asyncio.Event()
+    pulls = []
+
+    async def slow_reconcile(tenant: Tenant) -> None:
+        started.set()
+        await release.wait()
+
+    async def pull(tenant: Tenant) -> None:
+        pulls.append(tenant.id)
+
+    scheduler = TenantSyncScheduler(repo, pull, push_fn=_noop, reconcile_fn=slow_reconcile)
+    await scheduler.run_reconcile_tenant(1)
+    await started.wait()
+    await scheduler.run_tenant(1)
+    await asyncio.sleep(0.03)
+    assert pulls == [1]
+    release.set()
+    await asyncio.sleep(0.03)
+
+
+async def test_the_one_shot_lock_and_the_reconcile_exclude_each_other():
+    repo = FakeTenantRepository([_make_tenant(1)])
+    runs, skips = [], []
+
+    async def reconcile(tenant: Tenant) -> None:
+        runs.append("reconcile")
+
+    scheduler = TenantSyncScheduler(repo, _noop, push_fn=_noop, reconcile_fn=reconcile)
+    async with scheduler.lock_for_tenant(1):  # pull-now-then-push-now holds the push lock
+        await scheduler.run_reconcile_tenant(1)
+        await asyncio.sleep(0.03)
+        assert runs == []  # the reconcile waits for the one-shot
+    await asyncio.sleep(0.03)
+    assert runs == ["reconcile"]
+    assert skips == []
+
+
+async def test_first_reconcile_waits_a_grace_period_when_there_is_no_history():
+    tenant = replace(_make_tenant(1), reconcile_interval_minutes=480)
+
+    async def never(t: Tenant):
+        return None
+
+    scheduler = TenantSyncScheduler(
+        FakeTenantRepository([tenant]),
+        _noop,
+        push_fn=_noop,
+        reconcile_fn=_noop,
+        last_reconcile_fn=never,
+    )
+    scheduler.start()
+    try:
+        await scheduler.reconcile()
+        nxt = scheduler._scheduler.get_job("tenant-reconcile-1").next_run_time
+        assert timedelta(minutes=4) < nxt - datetime.now(UTC) < timedelta(minutes=6)
+    finally:
+        scheduler.shutdown()
+
+
+async def test_a_restart_does_not_starve_the_reconcile_nor_repeat_a_recent_one():
+    recent = replace(_make_tenant(1), reconcile_interval_minutes=480)
+    overdue = replace(_make_tenant(2), reconcile_interval_minutes=480)
+    now = datetime.now(UTC)
+    last = {1: now - timedelta(hours=1), 2: now - timedelta(hours=20)}
+
+    async def last_reconcile(t: Tenant):
+        return last[t.id]
+
+    scheduler = TenantSyncScheduler(
+        FakeTenantRepository([recent, overdue]),
+        _noop,
+        push_fn=_noop,
+        reconcile_fn=_noop,
+        last_reconcile_fn=last_reconcile,
+    )
+    scheduler.start()
+    try:
+        await scheduler.reconcile()
+        recent_next = scheduler._scheduler.get_job("tenant-reconcile-1").next_run_time
+        overdue_next = scheduler._scheduler.get_job("tenant-reconcile-2").next_run_time
+        assert timedelta(hours=6) < recent_next - now < timedelta(hours=7, minutes=1)  # 8h - 1h
+        assert overdue_next - now < timedelta(minutes=6)  # overdue: after the grace only
+    finally:
+        scheduler.shutdown()

@@ -1,11 +1,16 @@
-"""AsyncIOScheduler running each active tenant's two inventory-sync workers.
+"""AsyncIOScheduler running each active tenant's inventory-sync workers.
 
-Every active tenant has TWO interval jobs, independent of each other:
+Every active tenant has THREE interval jobs, independent of each other:
 
 * ``tenant-pull-{id}``: refresh the BIMS catalog snapshot, every
   ``sync_interval_minutes``. It takes as long as BIMS takes.
 * ``tenant-push-{id}``: push snapshot differences to Shopify, every
   ``push_interval_minutes``. It never calls BIMS and takes seconds.
+* ``tenant-reconcile-{id}``: compare Shopify's REAL quantities with the
+  snapshot and correct what differs, every ``reconcile_interval_minutes``
+  (a few times a day: it pages the whole Shopify catalog). It holds the push
+  lock while it runs, so it never overlaps the push: a push tick stands aside
+  (recorded), and a reconcile tick that finds a push running waits for it.
 
 A cheap reconcile job keeps the set of jobs aligned with the stored tenants
 (new, deactivated, changed interval), and the tenant API calls
@@ -39,6 +44,8 @@ TenantSyncFn = Callable[[Tenant], Awaitable[None]]
 SkipFn = Callable[[str, Tenant], Awaitable[None]]
 #: When did this tenant's catalog pull last run (None: never)?
 LastPullFn = Callable[[Tenant], Awaitable[datetime | None]]
+#: When did this tenant's reconcile last run (None: never)?
+LastReconcileFn = Callable[[Tenant], Awaitable[datetime | None]]
 #: Yields a tenant repository bound to a fresh, short-lived DB session.
 RepositoryScope = Callable[[], AbstractAsyncContextManager[TenantRepository]]
 
@@ -46,6 +53,14 @@ RECONCILE_JOB_ID = "tenant-sync-reconcile"
 
 PULL = "pull"
 PUSH = "push"
+RECONCILE = "reconcile"
+
+#: A newly created reconcile job first fires no sooner than this after boot, so
+#: a deploy does not start a catalog-wide scan while the app is still settling
+#: (and the pull is typically running).
+RECONCILE_STARTUP_GRACE = timedelta(minutes=5)
+
+_JOB_PREFIXES = ("tenant-pull-", "tenant-push-", "tenant-reconcile-")
 
 
 @dataclass(frozen=True)
@@ -57,6 +72,7 @@ class _Worker:
 _WORKERS = {
     PULL: _Worker(PULL, lambda tenant: tenant.sync_interval_minutes),
     PUSH: _Worker(PUSH, lambda tenant: tenant.push_interval_minutes),
+    RECONCILE: _Worker(RECONCILE, lambda tenant: tenant.reconcile_interval_minutes),
 }
 
 
@@ -79,12 +95,19 @@ class TenantSyncScheduler:
         push_fn: TenantSyncFn | None = None,
         skip_fn: SkipFn | None = None,
         last_pull_fn: LastPullFn | None = None,
+        reconcile_fn: TenantSyncFn | None = None,
+        last_reconcile_fn: LastReconcileFn | None = None,
     ) -> None:
         self._tenant_repository = tenant_repository
         #: ``sync_fn`` is the PULL worker (the name predates the split).
-        self._fns: dict[str, TenantSyncFn | None] = {PULL: sync_fn, PUSH: push_fn}
+        self._fns: dict[str, TenantSyncFn | None] = {
+            PULL: sync_fn,
+            PUSH: push_fn,
+            RECONCILE: reconcile_fn,
+        }
         self._skip_fn = skip_fn
         self._last_pull_fn = last_pull_fn
+        self._last_reconcile_fn = last_reconcile_fn
         self._reconcile_interval_minutes = reconcile_interval_minutes
         # Prefer a fresh session per lookup: a repository bound to one
         # long-lived AsyncSession serves stale identity-map rows, so a change
@@ -111,11 +134,24 @@ class TenantSyncScheduler:
         of either worker stand aside, and it waits for a running tick first."""
         return self.locks.combined(tenant_id)
 
+    def reconcile_lock_for_tenant(self, tenant_id: int) -> CombinedLock:
+        """The reconcile lock and the push lock, for an on-demand reconcile (the
+        ``reconcile`` ops job): while held, scheduled pushes and reconciles
+        stand aside, and it waits for a running push first."""
+        return self.locks.reconcile_worker(tenant_id)
+
+    def _lock_for(self, kind: str, tenant_id: int) -> asyncio.Lock:
+        if kind == PULL:
+            return self.locks.pull(tenant_id)
+        if kind == RECONCILE:
+            return self.locks.reconcile(tenant_id)
+        return self.locks.push(tenant_id)
+
     async def _launch(self, kind: str, tenant: Tenant) -> None:
         fn = self._fns[kind]
         if fn is None or not tenant.active or tenant.id is None:
             return
-        lock = self.locks.pull(tenant.id) if kind == PULL else self.locks.push(tenant.id)
+        lock = self._lock_for(kind, tenant.id)
         if lock.locked():
             await self._record_skip(kind, tenant)
             return
@@ -123,7 +159,8 @@ class TenantSyncScheduler:
         # is acquired without suspending, so two simultaneous ticks cannot both
         # pass the check above and start overlapping runs.
         await lock.acquire()
-        task = asyncio.create_task(self._run_holding(lock, fn, tenant))
+        run = self._run_reconcile if kind == RECONCILE else self._run_holding
+        task = asyncio.create_task(run(lock, fn, tenant))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
@@ -144,6 +181,19 @@ class TenantSyncScheduler:
             await fn(tenant)
         finally:
             lock.release()
+
+    async def _run_reconcile(
+        self, reconcile_lock: asyncio.Lock, fn: TenantSyncFn, tenant: Tenant
+    ) -> None:
+        """Run a reconcile once the push lock is ours too (waiting for a push
+        in flight rather than skipping: it only runs a few times a day, and a
+        push is over in seconds). ``reconcile_lock`` was taken at launch."""
+        try:
+            assert tenant.id is not None
+            async with self.locks.push(tenant.id):
+                await fn(tenant)
+        finally:
+            reconcile_lock.release()
 
     async def run_once(self) -> None:
         """Run every active tenant's workers now, regardless of their intervals."""
@@ -171,14 +221,25 @@ class TenantSyncScheduler:
         """Push tick for one tenant."""
         await self._tick(PUSH, tenant_id)
 
+    async def run_reconcile_tenant(self, tenant_id: int) -> None:
+        """Reconcile tick for one tenant."""
+        await self._tick(RECONCILE, tenant_id)
+
     # -- job management -------------------------------------------------
 
-    def reschedule_tenant(self, tenant: Tenant, *, next_pull_at: datetime | None = None) -> None:
+    def reschedule_tenant(
+        self,
+        tenant: Tenant,
+        *,
+        next_pull_at: datetime | None = None,
+        next_reconcile_at: datetime | None = None,
+    ) -> None:
         """Create, re-time or drop this tenant's jobs to match ``tenant``.
 
         A job is only touched when its interval actually changed, so
         reconciling never resets a countdown that is already running.
-        ``next_pull_at`` sets when a NEWLY created pull job first fires."""
+        ``next_pull_at`` / ``next_reconcile_at`` set when a NEWLY created pull /
+        reconcile job first fires."""
         if tenant.id is None:
             return
         if not tenant.active:
@@ -190,11 +251,17 @@ class TenantSyncScheduler:
             minutes = worker.interval_minutes(tenant)
             job_id = job_id_for(tenant.id, kind)
             job = self._scheduler.get_job(job_id)
-            target = self.run_tenant if kind == PULL else self.run_push_tenant
+            target = {
+                PULL: self.run_tenant,
+                PUSH: self.run_push_tenant,
+                RECONCILE: self.run_reconcile_tenant,
+            }[kind]
             if job is None:
                 kwargs = {}
                 if kind == PULL and next_pull_at is not None:
                     kwargs["next_run_time"] = next_pull_at
+                if kind == RECONCILE and next_reconcile_at is not None:
+                    kwargs["next_run_time"] = next_reconcile_at
                 self._scheduler.add_job(
                     target,
                     trigger=IntervalTrigger(minutes=minutes),
@@ -239,6 +306,26 @@ class TenantSyncScheduler:
             return now
         return max(now, last + timedelta(minutes=tenant.sync_interval_minutes))
 
+    async def _first_reconcile_time(self, tenant: Tenant) -> datetime | None:
+        """When a newly created reconcile job should first fire.
+
+        Like the pull, the APScheduler default (one full interval from
+        creation) would push a reconcile back by hours on every restart, and
+        starve it with frequent deploys. With the last run known:
+        ``last + interval``; never run, or overdue: after the startup grace.
+        ``None`` keeps the default."""
+        if self._last_reconcile_fn is None:
+            return None
+        earliest = datetime.now(UTC) + RECONCILE_STARTUP_GRACE
+        try:
+            last = await self._last_reconcile_fn(tenant)
+        except Exception as exc:  # fall back to the default rather than fail reconcile
+            logger.warning("last_reconcile_lookup_failed", tenant_id=tenant.id, error=str(exc))
+            return None
+        if last is None:
+            return earliest
+        return max(earliest, last + timedelta(minutes=tenant.reconcile_interval_minutes))
+
     async def reconcile(self) -> None:
         """Align the scheduled jobs with the active tenants in storage."""
         async with self._repository_scope() as repo:
@@ -252,9 +339,14 @@ class TenantSyncScheduler:
             next_pull_at = None
             if self._scheduler.get_job(job_id_for(tenant.id, PULL)) is None:
                 next_pull_at = await self._first_pull_time(tenant)
-            self.reschedule_tenant(tenant, next_pull_at=next_pull_at)
+            next_reconcile_at = None
+            if self._scheduler.get_job(job_id_for(tenant.id, RECONCILE)) is None:
+                next_reconcile_at = await self._first_reconcile_time(tenant)
+            self.reschedule_tenant(
+                tenant, next_pull_at=next_pull_at, next_reconcile_at=next_reconcile_at
+            )
         for job in self._scheduler.get_jobs():
-            if job.id.startswith(("tenant-pull-", "tenant-push-")) and job.id not in wanted:
+            if job.id.startswith(_JOB_PREFIXES) and job.id not in wanted:
                 self._scheduler.remove_job(job.id)
 
     async def _safe_reconcile(self) -> None:
