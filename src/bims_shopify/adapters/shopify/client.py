@@ -74,7 +74,9 @@ query ListAllVariants($cursor: String) {
 # there (never stocked/activated), which is NOT the same as an available
 # quantity of 0. `product` is deliberately not selected: it is not needed and
 # every extra object per node raises the query cost of a 28k-variant scan.
-# Field shape: InventoryItem.inventoryLevel(locationId: ID!): InventoryLevel and
+# `includeInactive` defaults to false, so "null" means no ACTIVE level there.
+# Field shape (checked against the 2025-07 reference):
+# InventoryItem.inventoryLevel(locationId: ID!, includeInactive: Boolean = false): InventoryLevel and
 # InventoryLevel.quantities(names: [String!]!): [InventoryQuantity!]! (name,
 # quantity) -- https://shopify.dev/docs/api/admin-graphql/2025-07/objects/InventoryLevel
 _LIST_VARIANT_INVENTORY = """
@@ -449,8 +451,8 @@ class ShopifyClient:
         ``tenant.shopify_location_id``.
 
         Yields ``{sku, inventory_item_id, available}``. ``available`` is
-        ``None`` when the item has no inventory level at that location (or the
-        level carries no ``available`` entry): "not stocked there" is not
+        ``None`` when the item has no active inventory level at that location
+        (or the level carries no ``available`` entry): "not stocked there" is not
         "zero", and callers must not conflate them. Variants without a SKU are
         skipped; SKUs are stripped, as in ``build_sku_inventory_map``.
 

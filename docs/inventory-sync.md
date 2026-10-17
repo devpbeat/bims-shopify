@@ -246,7 +246,8 @@ Rules it keeps from the push, on purpose:
   that would be written: BIMS `2.5` against Shopify `2` is not drift (it would
   otherwise "drift" on every run and never settle).
 
-A variant with **no inventory level at the location** is not a variant holding zero,
+A variant with **no active inventory level at the location** (Shopify returns `null`
+for a never-stocked or deactivated level) is not a variant holding zero,
 and the reconcile keeps them apart:
 
 | Snapshot | Shopify | Result |
