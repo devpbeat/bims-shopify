@@ -23,6 +23,7 @@ from bims_shopify.api.sync import _do_run_sync
 from bims_shopify.application.sync_inventory import ProgressFn
 from bims_shopify.config import get_settings
 from bims_shopify.domain.tenant import Tenant
+from bims_shopify.ops.sync_workers import do_reconcile
 
 
 async def run_sync(
@@ -56,6 +57,33 @@ async def run_sync(
                 full=full,
                 force=force,
                 progress=progress,
+            )
+    finally:
+        await engine.dispose()
+
+
+async def run_reconcile(
+    tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None
+) -> dict[str, Any]:
+    """Reconcile Shopify's real quantities against the snapshot, on demand.
+
+    The very same ``do_reconcile`` the scheduled tick runs (only the trigger
+    label differs). Options: ``dry_run`` (default False: report the drift,
+    write nothing) and ``force`` (default False: bypass the safety guard).
+
+    Concurrency: the caller (JobRunner._run) holds the tenant's reconcile lock
+    and push lock (``TenantSyncScheduler.reconcile_lock_for_tenant``) for the
+    whole run; this function acquires no lock itself.
+    """
+    dry_run = bool(options.get("dry_run", False))
+    force = bool(options.get("force", False))
+
+    settings = get_settings()
+    engine, session_factory = create_engine_and_sessionmaker(settings)
+    try:
+        async with session_factory() as session:
+            return await do_reconcile(
+                tenant, session, dry_run=dry_run, force=force, progress=progress, trigger="manual"
             )
     finally:
         await engine.dispose()

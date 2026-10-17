@@ -36,6 +36,7 @@ _VALID_COMMANDS = {
     "diagnose",
     "warehouses",
     "sync",
+    "reconcile",
     "refresh",
 }
 
@@ -56,6 +57,7 @@ class RunJobRequest(BaseModel):
         "diagnose",
         "warehouses",
         "sync",
+        "reconcile",
         "refresh",
     ]
     options: dict[str, Any] = Field(default_factory=dict)
@@ -97,6 +99,15 @@ def _validate_options(command: str, options: dict[str, Any]) -> dict[str, Any]:
     if command == "sync":
         result: dict[str, Any] = {}
         for key in ("dry_run", "full", "force"):
+            value = options.get(key, False)
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=422, detail=f"options.{key} must be a boolean")
+            result[key] = value
+        return result
+
+    if command == "reconcile":
+        result = {}
+        for key in ("dry_run", "force"):
             value = options.get(key, False)
             if not isinstance(value, bool):
                 raise HTTPException(status_code=422, detail=f"options.{key} must be a boolean")

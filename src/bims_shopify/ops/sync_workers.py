@@ -172,6 +172,23 @@ async def last_pull_at(session_factory: async_sessionmaker, tenant: Tenant) -> d
     return max(candidates) if candidates else None
 
 
+async def last_reconcile_at(session_factory: async_sessionmaker, tenant: Tenant) -> datetime | None:
+    """When this tenant's reconcile last really ran (scanned Shopify), for the
+    scheduler to time the first one after a restart. ``None``: never.
+
+    A decline or a skip did not scan anything, so it does not count: a
+    reconcile that was declined for a missing snapshot is still owed."""
+    if tenant.id is None:
+        return None
+    async with session_factory() as session:
+        outcome = await SqlAlchemySyncStateRepository(session).get_last_reconcile_outcome(
+            tenant.id
+        )
+    if outcome and outcome.get("status") in ("ok", "needs_confirmation", "failed") and outcome.get("at"):
+        return datetime.fromisoformat(outcome["at"])
+    return None
+
+
 async def do_pull(
     tenant: Tenant,
     session: AsyncSession,

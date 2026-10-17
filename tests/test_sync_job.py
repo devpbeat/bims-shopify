@@ -366,3 +366,106 @@ async def test_sync_job_waits_for_shared_tenant_lock(app_and_tenant, monkeypatch
     await asyncio.wait_for(executed.wait(), timeout=5.0)
     job = await _wait_for_status(session_factory, job_id, {"succeeded", "failed"})
     assert job.status == "succeeded"
+
+
+# -- the on-demand reconcile --------------------------------------------------------
+
+
+async def test_reconcile_job_corrects_drift_end_to_end(app_and_tenant):
+    from bims_shopify.adapters.persistence.sync_state_repository import (
+        SqlAlchemySyncStateRepository,
+    )
+    from tests.sync_world import ShopifyWorld, land_snapshot
+
+    app, tenant, session_factory, _job_runner = app_and_tenant
+    await land_snapshot(session_factory, tenant, {"SKU1": 5})
+    world = ShopifyWorld(["SKU1"], levels={"SKU1": 2})
+    with world:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/ops/acme/run",
+                json={"command": "reconcile", "options": {}},
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+            )
+            assert response.status_code == 200
+            job = await _wait_for_status(
+                session_factory, response.json()["job_id"], {"succeeded", "failed"}
+            )
+
+    assert job.status == "succeeded", job.error
+    assert job.result["status"] == "ok" and job.result["drift"]["count"] == 1
+    assert world.pushed == {"SKU1": 5} and world.bims_calls == 0
+    async with session_factory() as session:
+        outcome = (await SqlAlchemySyncStateRepository(session).get_status(tenant.id))[
+            "last_reconcile_outcome"
+        ]
+    assert outcome["trigger"] == "manual" and outcome["drift"]["count"] == 1
+
+
+async def test_reconcile_job_default_options_and_validation(app_and_tenant, monkeypatch):
+    app, _tenant, session_factory, _job_runner = app_and_tenant
+    seen: list[dict] = []
+
+    async def _capture(tenant, options, progress):
+        seen.append(options)
+        return {"status": "ok"}
+
+    monkeypatch.setitem(
+        __import__("bims_shopify.ops.job_runner", fromlist=["_COMMAND_RUNNERS"])._COMMAND_RUNNERS,
+        "reconcile",
+        _capture,
+    )
+    headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        ok = await client.post(
+            "/ops/acme/run", json={"command": "reconcile", "options": {}}, headers=headers
+        )
+        assert ok.status_code == 200
+        await _wait_for_status(session_factory, ok.json()["job_id"], {"succeeded", "failed"})
+        bad = await client.post(
+            "/ops/acme/run",
+            json={"command": "reconcile", "options": {"force": "yes"}},
+            headers=headers,
+        )
+    assert seen == [{"dry_run": False, "force": False}]
+    assert bad.status_code == 422
+
+
+async def test_reconcile_job_waits_for_the_shared_reconcile_lock_not_the_sync_one(
+    app_and_tenant, monkeypatch
+):
+    """It serialises with the scheduled reconcile and the push (the lock the
+    scheduler hands out), and is NOT held up by the pull+push sync lock."""
+    app, _tenant, session_factory, job_runner = app_and_tenant
+    reconcile_lock, sync_lock = asyncio.Lock(), asyncio.Lock()
+    job_runner.set_reconcile_lock_provider(lambda _tenant_id: reconcile_lock)
+    job_runner.set_sync_lock_provider(lambda _tenant_id: sync_lock)
+    executed = asyncio.Event()
+
+    async def _runner(tenant, options, progress):
+        executed.set()
+        return {"status": "ok"}
+
+    monkeypatch.setitem(
+        __import__("bims_shopify.ops.job_runner", fromlist=["_COMMAND_RUNNERS"])._COMMAND_RUNNERS,
+        "reconcile",
+        _runner,
+    )
+    await sync_lock.acquire()  # a one-shot sync in flight must not matter here
+    await reconcile_lock.acquire()  # a scheduled reconcile / push in flight must
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/ops/acme/run",
+                json={"command": "reconcile", "options": {}},
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+            )
+            job_id = response.json()["job_id"]
+            await asyncio.sleep(0.1)
+            assert not executed.is_set()
+    finally:
+        reconcile_lock.release()
+    await asyncio.wait_for(executed.wait(), timeout=5.0)
+    job = await _wait_for_status(session_factory, job_id, {"succeeded", "failed"})
+    assert job.status == "succeeded"
+    sync_lock.release()

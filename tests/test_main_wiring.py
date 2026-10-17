@@ -48,6 +48,11 @@ async def test_lifespan_schedules_a_pull_job_and_a_push_job_per_active_tenant(mo
             push = scheduler._scheduler.get_job("tenant-push-1")
             assert pull.trigger.interval == timedelta(minutes=30)
             assert push.trigger.interval == timedelta(minutes=5)
+            reconcile = scheduler._scheduler.get_job("tenant-reconcile-1")
+            assert reconcile.trigger.interval == timedelta(minutes=480)
+            assert scheduler._last_reconcile_fn is not None
+            # the on-demand reconcile job shares the reconcile + push locks
+            assert app.state.job_runner._tenant_reconcile_lock_provider(1).locked() is False
             # skip recording and boot-time pull timing are wired, not left at None
             assert scheduler._skip_fn is not None and scheduler._last_pull_fn is not None
             # the ops "sync" job shares the combined pull+push lock

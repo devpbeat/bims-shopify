@@ -48,6 +48,7 @@ _COMMAND_RUNNERS = {
     "diagnose": catalog.run_diagnose,
     "warehouses": catalog.run_warehouses,
     "sync": sync_job.run_sync,
+    "reconcile": sync_job.run_reconcile,
     "refresh": refresh_job.run_refresh,
 }
 
@@ -71,9 +72,15 @@ class JobRunner:
         # (`POST /sync/{slug}/run`) for the same tenant -- all three share
         # the exact same lock object. See `set_sync_lock_provider`.
         self._tenant_sync_lock_provider: Callable[[int], asyncio.Lock] | None = None
+        # Same idea for "reconcile": the scheduler's reconcile lock + push lock,
+        # so an on-demand reconcile never runs beside a scheduled one or a push.
+        self._tenant_reconcile_lock_provider: Callable[[int], asyncio.Lock] | None = None
 
     def set_sync_lock_provider(self, provider: Callable[[int], asyncio.Lock]) -> None:
         self._tenant_sync_lock_provider = provider
+
+    def set_reconcile_lock_provider(self, provider: Callable[[int], asyncio.Lock]) -> None:
+        self._tenant_reconcile_lock_provider = provider
 
     def _lock_for(self, tenant_id: int, command: str) -> asyncio.Lock:
         key = (tenant_id, command)
@@ -104,11 +111,15 @@ class JobRunner:
     async def _run(self, job_id: int, tenant_id: int, command: str, options: dict[str, Any]) -> None:
         lock = self._lock_for(tenant_id, command)
         async with lock:
-            if command == "sync" and self._tenant_sync_lock_provider is not None:
-                # Also hold the shared tenant sync lock for the whole run,
-                # so this job serializes with the scheduler tick and manual
-                # HTTP sync -- not just with other "sync" ops jobs.
-                shared_lock = self._tenant_sync_lock_provider(tenant_id)
+            provider = {
+                "sync": self._tenant_sync_lock_provider,
+                "reconcile": self._tenant_reconcile_lock_provider,
+            }.get(command)
+            if provider is not None:
+                # Also hold the shared tenant lock for the whole run, so this
+                # job serializes with the scheduler ticks (and for "sync" the
+                # manual HTTP sync) -- not just with other jobs of its kind.
+                shared_lock = provider(tenant_id)
                 async with shared_lock:
                     await self._execute(job_id, tenant_id, command, options)
             else:

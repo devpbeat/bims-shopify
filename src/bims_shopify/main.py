@@ -34,7 +34,14 @@ from bims_shopify.config import get_settings
 from bims_shopify.logging import configure_logging, get_logger
 from bims_shopify.ops.auto_import import AutoImportCoordinator
 from bims_shopify.ops.job_runner import JobRunner
-from bims_shopify.ops.sync_workers import do_pull, do_push, last_pull_at, record_skip
+from bims_shopify.ops.sync_workers import (
+    do_pull,
+    do_push,
+    do_reconcile,
+    last_pull_at,
+    last_reconcile_at,
+    record_skip,
+)
 from bims_shopify.scheduler import TenantSyncScheduler
 
 logger = get_logger(__name__)
@@ -126,6 +133,31 @@ def _make_push_fn(session_factory):
     return _push_tenant
 
 
+def _make_reconcile_fn(session_factory):
+    """Build the scheduler's per-tenant RECONCILE callback (Shopify's real
+    quantities vs the snapshot).
+
+    The same ``do_reconcile`` the ``reconcile`` ops command runs. The
+    scheduler runs it holding the tenant's push lock, so it never overlaps a
+    push; it declines, with a recorded reason, on a missing, incomplete or
+    stale snapshot, exactly as the push does.
+    """
+
+    async def _reconcile_tenant(tenant) -> None:
+        async with session_factory() as session:
+            try:
+                await do_reconcile(tenant, session, trigger="scheduled")
+            except Exception as exc:  # one tenant's failure must not affect others
+                logger.error(
+                    "scheduled_reconcile_tenant_failed",
+                    tenant_slug=tenant.slug,
+                    tenant_id=tenant.id,
+                    error=str(exc),
+                )
+
+    return _reconcile_tenant
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.log_level)
@@ -155,6 +187,8 @@ def create_app() -> FastAPI:
                 _make_pull_fn(session_factory),
                 repository_scope=tenant_repository_scope,
                 push_fn=_make_push_fn(session_factory),
+                reconcile_fn=_make_reconcile_fn(session_factory),
+                last_reconcile_fn=functools.partial(last_reconcile_at, session_factory),
                 skip_fn=functools.partial(record_skip, session_factory),
                 last_pull_fn=functools.partial(last_pull_at, session_factory),
             )
@@ -164,6 +198,9 @@ def create_app() -> FastAPI:
         # sync job, the scheduled pull and push ticks, and a manual HTTP sync
         # can never overlap for the same tenant.
         job_runner.set_sync_lock_provider(scheduler.lock_for_tenant)
+        # The "reconcile" ops job holds the reconcile lock and the push lock,
+        # like the scheduled reconcile, so neither overlaps a push.
+        job_runner.set_reconcile_lock_provider(scheduler.reconcile_lock_for_tenant)
         scheduler.start()
 
         # Separate ticking loop from the inventory-sync scheduler above: this
