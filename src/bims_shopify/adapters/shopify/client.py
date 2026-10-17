@@ -69,6 +69,32 @@ query ListAllVariants($cursor: String) {
 }
 """
 
+# Read-only: every variant with the quantity Shopify REALLY holds at one
+# location. `inventoryLevel(locationId:)` is null when the item has no level
+# there (never stocked/activated), which is NOT the same as an available
+# quantity of 0. `product` is deliberately not selected: it is not needed and
+# every extra object per node raises the query cost of a 28k-variant scan.
+# Field shape: InventoryItem.inventoryLevel(locationId: ID!): InventoryLevel and
+# InventoryLevel.quantities(names: [String!]!): [InventoryQuantity!]! (name,
+# quantity) -- https://shopify.dev/docs/api/admin-graphql/2025-07/objects/InventoryLevel
+_LIST_VARIANT_INVENTORY = """
+query ListVariantInventory($cursor: String, $locationId: ID!) {
+  productVariants(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      sku
+      inventoryItem {
+        id
+        inventoryLevel(locationId: $locationId) {
+          quantities(names: ["available"]) { name quantity }
+        }
+      }
+    }
+  }
+}
+"""
+
 _VARIANTS_BULK_UPDATE = """
 mutation ProductVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
   productVariantsBulkUpdate(productId: $productId, variants: $variants) {
@@ -417,6 +443,50 @@ class ShopifyClient:
             if not page_info["hasNextPage"]:
                 return
             cursor = page_info["endCursor"]
+
+    async def iter_variant_inventory(self, tenant: Tenant) -> AsyncIterator[dict[str, Any]]:
+        """Page through every variant with its ACTUAL available quantity at
+        ``tenant.shopify_location_id``.
+
+        Yields ``{sku, inventory_item_id, available}``. ``available`` is
+        ``None`` when the item has no inventory level at that location (or the
+        level carries no ``available`` entry): "not stocked there" is not
+        "zero", and callers must not conflate them. Variants without a SKU are
+        skipped; SKUs are stripped, as in ``build_sku_inventory_map``.
+
+        A full-catalog read (about one request per 100 variants), used by the
+        reconciliation pass -- never by the cheap incremental push.
+        """
+        cursor: str | None = None
+        while True:
+            data = await self._graphql(
+                _LIST_VARIANT_INVENTORY,
+                {"cursor": cursor, "locationId": tenant.shopify_location_id},
+            )
+            connection = data["productVariants"]
+            for node in connection["nodes"]:
+                sku = (node.get("sku") or "").strip()
+                item = node.get("inventoryItem") or {}
+                if not sku or not item.get("id"):
+                    continue
+                yield {
+                    "sku": sku,
+                    "inventory_item_id": item["id"],
+                    "available": self._available_quantity(item.get("inventoryLevel")),
+                }
+            page_info = connection["pageInfo"]
+            if not page_info["hasNextPage"]:
+                return
+            cursor = page_info["endCursor"]
+
+    @staticmethod
+    def _available_quantity(level: dict[str, Any] | None) -> int | None:
+        """The ``available`` quantity of an inventory level, or ``None`` when
+        there is no level or no such entry (never a made-up zero)."""
+        for entry in (level or {}).get("quantities") or []:
+            if entry.get("name") == "available" and entry.get("quantity") is not None:
+                return int(entry["quantity"])
+        return None
 
     async def bulk_update_variants(self, product_id: str, variants: list[dict[str, Any]]) -> None:
         """Update multiple variants of a single product via productVariantsBulkUpdate."""

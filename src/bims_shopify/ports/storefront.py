@@ -1,6 +1,7 @@
 """Port describing operations the application needs from a storefront (Shopify)."""
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from bims_shopify.domain.product import InventoryDelta
@@ -19,6 +20,13 @@ class StorefrontPort(Protocol):
         includes DRAFT products, unlike ``find_variant_by_sku``'s
         query-based lookup.
         """
+        ...
+
+    def iter_variant_inventory(self, tenant: Tenant) -> AsyncIterator[dict[str, Any]]:
+        """Yield ``{sku, inventory_item_id, available}`` for every variant, where
+        ``available`` is the quantity Shopify really holds at the tenant's
+        location, or ``None`` when the item has no inventory level there
+        (distinct from a stocked zero)."""
         ...
 
     async def set_inventory_quantities(
