@@ -112,6 +112,9 @@ class SqlAlchemySyncStateRepository:
             "last_run_summary": dict(model.last_run_summary or {}),
             "last_pull_outcome": dict(model.last_pull_outcome) if model.last_pull_outcome else None,
             "last_push_outcome": dict(model.last_push_outcome) if model.last_push_outcome else None,
+            "last_reconcile_outcome": (
+                dict(model.last_reconcile_outcome) if model.last_reconcile_outcome else None
+            ),
         }
 
     async def set_last_pull_outcome(self, tenant_id: int, outcome: dict) -> None:
@@ -125,6 +128,16 @@ class SqlAlchemySyncStateRepository:
         model = await self._get_or_create_state(tenant_id)
         model.last_push_outcome = outcome
         await self._session.commit()
+
+    async def set_last_reconcile_outcome(self, tenant_id: int, outcome: dict) -> None:
+        """What the most recent reconcile did, with its drift numbers."""
+        model = await self._get_or_create_state(tenant_id)
+        model.last_reconcile_outcome = outcome
+        await self._session.commit()
+
+    async def get_last_reconcile_outcome(self, tenant_id: int) -> dict | None:
+        model = await self._get_or_create_state(tenant_id)
+        return dict(model.last_reconcile_outcome) if model.last_reconcile_outcome else None
 
     async def get_last_push_outcome(self, tenant_id: int) -> dict | None:
         model = await self._get_or_create_state(tenant_id)

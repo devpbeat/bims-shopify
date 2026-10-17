@@ -32,11 +32,18 @@ DEFAULT_MIN_INTERVAL_MINUTES = 30
 #: History keys. A pull is always a full pull, whatever ``sync_mode`` says.
 PULL_MODE = "full"
 PUSH_MODE = "push"
+RECONCILE_MODE = "reconcile"
 
 #: The push worker never calls BIMS and normally takes seconds, so it may tick
 #: far more often than a pull. It is still bounded by its own measured runs.
 PUSH_ABSOLUTE_MIN_INTERVAL_MINUTES = 1
 PUSH_DEFAULT_MIN_INTERVAL_MINUTES = 1
+
+#: A reconcile pages the WHOLE Shopify catalog (tens of thousands of variants,
+#: minutes to tens of minutes under Shopify's query-cost throttle) while holding
+#: the tenant's push lock, so it is never allowed more often than hourly.
+RECONCILE_ABSOLUTE_MIN_INTERVAL_MINUTES = 60
+RECONCILE_DEFAULT_MIN_INTERVAL_MINUTES = 60
 
 #: Only the most recent completed runs count, so one ancient outlier does
 #: not pin the floor forever and a recent slowdown shows up quickly.
@@ -79,6 +86,13 @@ def compute_interval_floor_for(durations: list[float], mode: str) -> IntervalFlo
             absolute_min=PUSH_ABSOLUTE_MIN_INTERVAL_MINUTES,
             default_min=PUSH_DEFAULT_MIN_INTERVAL_MINUTES,
         )
+    if mode == RECONCILE_MODE:
+        return compute_interval_floor(
+            durations,
+            mode,
+            absolute_min=RECONCILE_ABSOLUTE_MIN_INTERVAL_MINUTES,
+            default_min=RECONCILE_DEFAULT_MIN_INTERVAL_MINUTES,
+        )
     return compute_interval_floor(durations, mode)
 
 
@@ -100,7 +114,12 @@ def rejection_detail(
 ) -> dict:
     """Body of the 422 returned for an interval below the floor."""
     is_push = floor.sync_mode == PUSH_MODE
-    runs = "push runs" if is_push else f"{floor.sync_mode} syncs"
+    is_reconcile = floor.sync_mode == RECONCILE_MODE
+    runs = (
+        "push runs"
+        if is_push
+        else "reconcile runs" if is_reconcile else f"{floor.sync_mode} syncs"
+    )
     if floor.basis == "measured":
         evidence = (
             f"The slowest of the last {floor.runs_considered} completed "
@@ -108,7 +127,11 @@ def rejection_detail(
             f"{SAFETY_FACTOR}x that, rounded up, is {floor.minutes} minutes."
         )
     else:
-        history = "push history" if is_push else f"sync history for {floor.sync_mode} mode"
+        history = (
+            "push history"
+            if is_push
+            else "reconcile history" if is_reconcile else f"sync history for {floor.sync_mode} mode"
+        )
         evidence = (
             f"There is no measured {history} yet, so the "
             f"conservative default of {floor.minutes} minutes applies until runs are measured."

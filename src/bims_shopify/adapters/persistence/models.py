@@ -71,6 +71,10 @@ class TenantModel(Base):
     sync_interval_minutes: Mapped[int] = mapped_column(Integer, default=30, server_default="30")
     #: Push worker cadence (the PULL cadence is ``sync_interval_minutes``).
     push_interval_minutes: Mapped[int] = mapped_column(Integer, default=5, server_default="5")
+    #: Reconcile worker cadence (Shopify's real quantities vs the snapshot).
+    reconcile_interval_minutes: Mapped[int] = mapped_column(
+        Integer, default=480, server_default="480"
+    )
     #: The push worker declines to push from a snapshot older than this.
     snapshot_max_age_minutes: Mapped[int] = mapped_column(
         Integer, default=120, server_default="120"
@@ -95,6 +99,9 @@ class SyncStateModel(Base):
     last_pull_outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     #: Outcome of the latest push tick (ok | unchanged | declined | needs_confirmation | failed).
     last_push_outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: Outcome of the latest reconcile (ok | declined | needs_confirmation | failed | skipped)
+    #: with its drift numbers. Kept apart from the push outcome on purpose.
+    last_reconcile_outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class OAuthStateModel(Base):

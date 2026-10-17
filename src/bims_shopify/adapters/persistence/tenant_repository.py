@@ -47,6 +47,7 @@ class SqlAlchemyTenantRepository:
             sync_mode=SyncMode(model.sync_mode),
             sync_interval_minutes=model.sync_interval_minutes,
             push_interval_minutes=model.push_interval_minutes,
+            reconcile_interval_minutes=model.reconcile_interval_minutes,
             snapshot_max_age_minutes=model.snapshot_max_age_minutes,
             pull_max_drop_ratio=model.pull_max_drop_ratio,
         )
@@ -81,6 +82,7 @@ class SqlAlchemyTenantRepository:
         model.sync_mode = tenant.sync_mode.value
         model.sync_interval_minutes = tenant.sync_interval_minutes
         model.push_interval_minutes = tenant.push_interval_minutes
+        model.reconcile_interval_minutes = tenant.reconcile_interval_minutes
         model.snapshot_max_age_minutes = tenant.snapshot_max_age_minutes
         model.pull_max_drop_ratio = tenant.pull_max_drop_ratio
 

@@ -24,6 +24,7 @@ from bims_shopify.api.portal_auth import hash_password
 from bims_shopify.application.sync_interval import (
     PULL_MODE,
     PUSH_MODE,
+    RECONCILE_MODE,
     interval_floor_for,
     rejection_detail,
 )
@@ -39,6 +40,8 @@ from .deps import (
 
 #: Upper bound for the per-tenant sync interval (one day).
 MAX_SYNC_INTERVAL_MINUTES = 1440
+#: Upper bound for the reconcile interval (one week).
+MAX_RECONCILE_INTERVAL_MINUTES = 10080
 #: Upper bound for the snapshot staleness limit (one week).
 MAX_SNAPSHOT_MAX_AGE_MINUTES = 10080
 
@@ -53,6 +56,8 @@ async def _enforce_interval_floor(
     * PULL (``sync_interval_minutes``): floor from recent completed pulls. Every
       pull is a full pull, so the floor never depends on ``sync_mode``.
     * PUSH (``push_interval_minutes``): floor from recent completed pushes.
+    * RECONCILE (``reconcile_interval_minutes``): floor from recent completed
+      reconciles, never below an hour.
 
     With no history the pull gets the documented conservative default and the
     push the 1-minute minimum. Each is checked only when it is being changed
@@ -72,6 +77,15 @@ async def _enforce_interval_floor(
             raise HTTPException(
                 status_code=422,
                 detail=rejection_detail(floor, tenant.push_interval_minutes, "push_interval_minutes"),
+            )
+    if before is None or tenant.reconcile_interval_minutes != before.reconcile_interval_minutes:
+        floor = await interval_floor_for(repo, tenant.id, RECONCILE_MODE)
+        if tenant.reconcile_interval_minutes < floor.minutes:
+            raise HTTPException(
+                status_code=422,
+                detail=rejection_detail(
+                    floor, tenant.reconcile_interval_minutes, "reconcile_interval_minutes"
+                ),
             )
 
 
@@ -151,6 +165,7 @@ class TenantCreate(BaseModel):
     sync_mode: SyncMode = SyncMode.FULL
     sync_interval_minutes: int = Field(default=30, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
     push_interval_minutes: int = Field(default=5, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
+    reconcile_interval_minutes: int = Field(default=480, ge=1, le=MAX_RECONCILE_INTERVAL_MINUTES)
     snapshot_max_age_minutes: int = Field(default=120, ge=1, le=MAX_SNAPSHOT_MAX_AGE_MINUTES)
     pull_max_drop_ratio: float = Field(default=0.30, gt=0, le=1)
 
@@ -198,6 +213,9 @@ class TenantPatch(BaseModel):
     sync_mode: SyncMode | None = None
     sync_interval_minutes: int | None = Field(default=None, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
     push_interval_minutes: int | None = Field(default=None, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
+    reconcile_interval_minutes: int | None = Field(
+        default=None, ge=1, le=MAX_RECONCILE_INTERVAL_MINUTES
+    )
     snapshot_max_age_minutes: int | None = Field(
         default=None, ge=1, le=MAX_SNAPSHOT_MAX_AGE_MINUTES
     )
@@ -243,6 +261,7 @@ class TenantOut(BaseModel):
     sync_mode: SyncMode
     sync_interval_minutes: int
     push_interval_minutes: int
+    reconcile_interval_minutes: int
     snapshot_max_age_minutes: int
     pull_max_drop_ratio: float
 
@@ -269,6 +288,7 @@ class TenantOut(BaseModel):
             sync_mode=tenant.sync_mode,
             sync_interval_minutes=tenant.sync_interval_minutes,
             push_interval_minutes=tenant.push_interval_minutes,
+            reconcile_interval_minutes=tenant.reconcile_interval_minutes,
             snapshot_max_age_minutes=tenant.snapshot_max_age_minutes,
             pull_max_drop_ratio=tenant.pull_max_drop_ratio,
         )

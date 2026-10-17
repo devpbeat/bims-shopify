@@ -379,3 +379,74 @@ async def test_frequent_push_records_never_evict_the_pull_measurements(ctx):
         repo = SqlAlchemySyncStateRepository(session)
         assert await repo.get_recent_durations(acme.id, "full") == [204.0]
         assert len(await repo.get_recent_durations(acme.id, "push")) == 10
+
+
+# -- reconcile worker: its own cadence and floor ---------------------------------
+
+
+def test_reconcile_floor_is_an_hour_at_least_and_follows_measured_runs():
+    from bims_shopify.application.sync_interval import RECONCILE_MODE, compute_interval_floor_for
+
+    # A reconcile pages the whole Shopify catalog: never allowed more often than hourly.
+    assert compute_interval_floor_for([], RECONCILE_MODE).minutes == 60
+    assert compute_interval_floor_for([30.0], RECONCILE_MODE).minutes == 60
+    # 25 minutes measured -> 3x = 75.
+    assert compute_interval_floor_for([1500.0], RECONCILE_MODE).minutes == 75
+
+
+async def test_reconcile_interval_defaults_to_a_few_times_a_day_and_round_trips(ctx):
+    app, _sf, _acme = ctx
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.get("/tenants/acme", headers=HEADERS)).json()[
+            "reconcile_interval_minutes"
+        ] == 480
+        patched = await client.patch(
+            "/tenants/acme", headers=HEADERS, json={"reconcile_interval_minutes": 720}
+        )
+        assert patched.status_code == 200
+        assert patched.json()["reconcile_interval_minutes"] == 720
+        assert (await client.get("/tenants/acme", headers=HEADERS)).json()[
+            "reconcile_interval_minutes"
+        ] == 720
+
+
+async def test_reconcile_interval_below_the_floor_is_rejected(ctx):
+    app, session_factory, acme = ctx
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        rejected = await client.patch(
+            "/tenants/acme", headers=HEADERS, json={"reconcile_interval_minutes": 30}
+        )
+        assert rejected.status_code == 422
+        assert "reconcile_interval_minutes=30" in rejected.json()["detail"]["message"]
+
+        await _record(session_factory, acme.id, 1500.0, "reconcile")
+        too_low = await client.patch(
+            "/tenants/acme", headers=HEADERS, json={"reconcile_interval_minutes": 74}
+        )
+        assert too_low.status_code == 422 and too_low.json()["detail"]["min_safe_minutes"] == 75
+        ok = await client.patch(
+            "/tenants/acme", headers=HEADERS, json={"reconcile_interval_minutes": 75}
+        )
+        assert ok.status_code == 200
+
+
+async def test_an_unrelated_edit_is_not_blocked_by_the_reconcile_floor(ctx):
+    app, session_factory, acme = ctx
+    await _record(session_factory, acme.id, 6000.0, "reconcile")  # floor now 300
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(
+            "/tenants/acme", headers=HEADERS, json={"push_interval_minutes": 9}
+        )
+    assert response.status_code == 200
+
+
+async def test_reconcile_outcome_is_stored_apart_from_the_push_outcome(ctx):
+    _app, session_factory, acme = ctx
+    async with session_factory() as session:
+        repo = SqlAlchemySyncStateRepository(session)
+        assert (await repo.get_status(acme.id))["last_reconcile_outcome"] is None
+        await repo.set_last_push_outcome(acme.id, {"status": "ok"})
+        await repo.set_last_reconcile_outcome(acme.id, {"status": "ok", "drift": {"count": 3}})
+        status = await repo.get_status(acme.id)
+    assert status["last_reconcile_outcome"] == {"status": "ok", "drift": {"count": 3}}
+    assert status["last_push_outcome"] == {"status": "ok"}

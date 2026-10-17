@@ -84,6 +84,10 @@ class Tenant:
     sync_interval_minutes: int = 30
     #: PUSH worker cadence (snapshot -> Shopify).
     push_interval_minutes: int = 5
+    #: RECONCILE worker cadence (Shopify's real quantities vs the snapshot).
+    #: Far more expensive than a push (it pages the whole Shopify catalog), so
+    #: it runs a few times a day, not every few minutes.
+    reconcile_interval_minutes: int = 480
     #: The push worker declines to push from a snapshot older than this.
     snapshot_max_age_minutes: int = 120
     #: A pull with MORE than this fraction fewer rows than the previous snapshot is rejected
