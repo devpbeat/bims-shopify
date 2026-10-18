@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from bims_shopify.application.sync_inventory import GUARD_MIN_SAMPLE
 from bims_shopify.adapters.persistence.snapshot_repository import SqlAlchemySnapshotRepository
 from bims_shopify.adapters.persistence.sync_state_repository import SqlAlchemySyncStateRepository
 from bims_shopify.api.sync import _do_run_sync
@@ -80,7 +81,7 @@ async def test_oneshot_always_compares_against_what_shopify_holds_now(migrated_d
 async def test_a_rejected_pull_stops_the_oneshot_before_it_pushes(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
-    skus = [f"S{i}" for i in range(10)]
+    skus = [f"S{i}" for i in range(GUARD_MIN_SAMPLE + 5)]
     await land_snapshot(session_factory, tenant, {s: 4 for s in skus})
     world = ShopifyWorld(skus)
     world.serve_bims({"S0": 1, "S1": 1, "S2": 1})  # BIMS suddenly returns 3 of 10
@@ -113,7 +114,7 @@ async def test_oneshot_dry_run_reports_without_writing_and_still_refreshes_the_s
 async def test_oneshot_guard_still_blocks_a_mass_zero(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
-    skus = [f"S{i}" for i in range(10)]
+    skus = [f"S{i}" for i in range(GUARD_MIN_SAMPLE + 5)]
     world = ShopifyWorld(skus, levels={s: 5 for s in skus})
     world.serve_bims({s: 0 for s in skus})
     with world:

@@ -34,6 +34,13 @@ async def _emit_progress(progress: ProgressFn | None, done: int, total: int | No
 # dry_run=False.
 DEFAULT_MAX_ZERO_RATIO = 0.20
 DEFAULT_MAX_CHANGED_VARIANTS = 500
+#: Below this many changed SKUs the zero-RATIO check is not evaluated. The
+#: ratio exists to catch a catalog-wide wipe (BIMS answering with garbage),
+#: which is an event of thousands of SKUs. With continuous pulls most cycles
+#: carry a handful of changes, where one legitimately sold-out item is 25% of
+#: the batch and would block the cycle on noise. The absolute cap below still
+#: applies at every size.
+GUARD_MIN_SAMPLE = 25
 
 # Shopify's GraphQL Admin API enforces a maximum of 250 elements for array
 # input arguments (see https://shopify.dev/docs/api/usage/limits), which
@@ -143,7 +150,7 @@ def check_safety_guard(
     zero_count = sum(1 for d in resolved if d.new_stock == 0)
     zero_ratio = zero_count / matched_count
 
-    if zero_ratio > max_zero_ratio:
+    if matched_count >= GUARD_MIN_SAMPLE and zero_ratio > max_zero_ratio:
         return NeedsConfirmation(
             reason="zero_ratio_exceeded",
             zero_count=zero_count,

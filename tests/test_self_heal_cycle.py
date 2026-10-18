@@ -7,6 +7,7 @@ running anything by hand, and a cycle with nothing to do writes nothing.
 """
 from __future__ import annotations
 
+from bims_shopify.application.sync_inventory import GUARD_MIN_SAMPLE
 from bims_shopify.adapters.persistence.sync_state_repository import SqlAlchemySyncStateRepository
 from bims_shopify.ops.sync_workers import do_cycle
 from tests.heal_world import HealShopify, land_catalog, product
@@ -135,11 +136,11 @@ def _draft_with_stock():
 async def test_the_mass_zero_guard_stops_creating_and_publishing_on_that_snapshot(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
-    existing = {f"E{i}": f"EXISTING {i} (M)" for i in range(10)}
+    existing = {f"E{i}": f"EXISTING {i} (M)" for i in range(GUARD_MIN_SAMPLE + 5)}
     # BIMS "lost" all stock of the existing products, and shows one new product with stock.
     items = [(sku, name, 0.0) for sku, name in existing.items()] + [("N1", "NEW ONE (M)", 4.0)]
     await land_catalog(session_factory, tenant, items)
-    world = HealShopify([product(i + 1, f"EXISTING {i}", {f"E{i}": "M"}) for i in range(10)])
+    world = HealShopify([product(i + 1, f"EXISTING {i}", {f"E{i}": "M"}) for i in range(GUARD_MIN_SAMPLE + 5)])
     world.products.append(_draft_with_stock())
     world.levels = {sku: 5 for sku in existing}  # what Shopify really holds
     with world:
@@ -217,10 +218,10 @@ async def test_every_stage_works_from_the_snapshot_the_cycle_started_with(migrat
 
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
-    existing = {f"E{i}": f"EXISTING {i} (M)" for i in range(10)}
+    existing = {f"E{i}": f"EXISTING {i} (M)" for i in range(GUARD_MIN_SAMPLE + 5)}
     bad = [(sku, name, 0.0) for sku, name in existing.items()]  # BIMS "lost" all stock
     await land_catalog(session_factory, tenant, bad)
-    world = HealShopify([product(i + 1, f"EXISTING {i}", {f"E{i}": "M"}) for i in range(10)])
+    world = HealShopify([product(i + 1, f"EXISTING {i}", {f"E{i}": "M"}) for i in range(GUARD_MIN_SAMPLE + 5)])
     world.levels = {sku: 5 for sku in existing}
 
     real_reconcile = sync_workers.do_reconcile

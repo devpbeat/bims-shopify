@@ -21,6 +21,7 @@ import respx
 from cryptography.fernet import Fernet
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from bims_shopify.application.sync_inventory import GUARD_MIN_SAMPLE
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.adapters.persistence.sync_state_repository import (
@@ -236,7 +237,9 @@ async def test_scheduled_sync_ignores_the_legacy_incremental_setting(env):
 async def test_scheduled_full_sync_guard_still_blocks_mass_zero(env):
     session_factory, make_tenant = env
     tenant = await make_tenant()
-    skus = [f"SKU{i}" for i in range(10)]
+    # Above GUARD_MIN_SAMPLE: the ratio is only evaluated on a meaningful batch.
+    size = GUARD_MIN_SAMPLE + 5
+    skus = [f"SKU{i}" for i in range(size)]
     mock, pushes = _mock_world(
         {sku: 0 for sku in skus}, levels={sku: 5 for sku in skus}
     )  # BIMS suddenly says 0 everywhere, Shopify still holds 5
@@ -251,7 +254,7 @@ async def test_scheduled_full_sync_guard_still_blocks_mass_zero(env):
         )
     assert entry is not None
     assert entry.payload["reason"] == "zero_ratio_exceeded"
-    assert entry.payload["zero_count"] == 10 and entry.payload["drift"]["count"] == 10
+    assert entry.payload["zero_count"] == size and entry.payload["drift"]["count"] == size
 
 
 async def test_needs_confirmation_result_reports_mode(env):
@@ -259,7 +262,8 @@ async def test_needs_confirmation_result_reports_mode(env):
 
     session_factory, make_tenant = env
     tenant = await make_tenant()
-    skus = [f"SKU{i}" for i in range(10)]
+    # Above GUARD_MIN_SAMPLE so the ratio is actually evaluated.
+    skus = [f"SKU{i}" for i in range(GUARD_MIN_SAMPLE + 5)]
     mock, _pushes = _mock_world({sku: 0 for sku in skus}, levels={sku: 5 for sku in skus})
     with mock:
         async with session_factory() as session:

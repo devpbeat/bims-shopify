@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from bims_shopify.application.sync_inventory import GUARD_MIN_SAMPLE
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.sync_state_repository import SqlAlchemySyncStateRepository
 from bims_shopify.ops.sync_workers import do_reconcile
@@ -265,7 +266,10 @@ async def test_fractional_bims_stock_is_compared_as_the_integer_that_would_be_pu
 async def test_the_mass_zero_guard_still_fires_and_nothing_is_written(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
-    skus = [f"S{i}" for i in range(10)]
+    # Above GUARD_MIN_SAMPLE: below it the ratio is not evaluated at all, because
+    # a handful of sold-out items is noise, not a catalog wipe.
+    size = GUARD_MIN_SAMPLE + 5
+    skus = [f"S{i}" for i in range(size)]
     await land_snapshot(session_factory, tenant, {sku: 0 for sku in skus})  # a "bad" snapshot
     world = ShopifyWorld(skus, levels={sku: 5 for sku in skus})
     with world:
@@ -274,11 +278,11 @@ async def test_the_mass_zero_guard_still_fires_and_nothing_is_written(migrated_d
     assert result["status"] == "needs_confirmation"
     assert result["reason"] == "zero_ratio_exceeded"
     assert world.write_calls == 0 and world.levels == {sku: 5 for sku in skus}
-    assert result["drift"]["count"] == 10  # the drift is still reported
+    assert result["drift"]["count"] == size  # the drift is still reported
     assert result["report"]["guard"]["fired"] is True
     state = await _state(session_factory, tenant.id)
     outcome = state["last_reconcile_outcome"]
-    assert outcome["status"] == "needs_confirmation" and outcome["drift"]["count"] == 10
+    assert outcome["status"] == "needs_confirmation" and outcome["drift"]["count"] == size
     assert state["last_run_at"] is None  # nothing was written: the watermark did not advance
 
 
