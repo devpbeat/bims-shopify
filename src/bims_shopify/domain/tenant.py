@@ -80,23 +80,19 @@ class Tenant:
     #: Shopify. Defaults to summing only the positive warehouses -- see
     #: ``domain/stock_consolidation.py`` for why negatives must not subtract.
     stock_consolidation: StockConsolidation = DEFAULT_STOCK_CONSOLIDATION
-    #: PULL worker cadence (BIMS -> snapshot). The name predates the split.
-    sync_interval_minutes: int = 30
-    #: PUSH worker cadence (snapshot -> Shopify).
-    push_interval_minutes: int = 5
-    #: RECONCILE worker cadence (Shopify's real quantities vs the snapshot).
-    #: Far more expensive than a push (it pages the whole Shopify catalog), so
-    #: it runs a few times a day, not every few minutes.
-    reconcile_interval_minutes: int = 480
-    #: The push worker declines to push from a snapshot older than this.
+    #: The pull loop runs back to back, paced by how long BIMS takes to answer. This is the
+    #: minimum pause between the END of one pull and the START of the next, so a pull that
+    #: answers instantly (an error, an empty page) can never become a hot loop against BIMS.
+    pull_min_gap_seconds: int = 60
+    #: A write cycle declines to write from a snapshot older than this.
     snapshot_max_age_minutes: int = 120
     #: A pull with MORE than this fraction fewer rows than the previous snapshot is rejected
     #: (0.30: a 33,705 -> 11,355 row pull is a 66% drop and is refused; 1.0 disables it).
     pull_max_drop_ratio: float = 0.30
-    #: Scheduled cycle, stage 1: create the BIMS products / variants with stock
+    #: Write cycle, stage 1: create the BIMS products / variants with stock
     #: that the store lacks. Default ON; switch off per tenant without a deploy.
     auto_create_missing: bool = True
-    #: Scheduled cycle, stage 3: publish the draft products that pass the
+    #: Write cycle, stage 3: publish the draft products that pass the
     #: ``publish`` gates (images, confirmed stock). Default ON.
     auto_publish: bool = True
 

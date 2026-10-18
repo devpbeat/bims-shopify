@@ -16,13 +16,8 @@ from bims_shopify.adapters.persistence.sync_state_repository import (
 from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
-from bims_shopify.application.push_snapshot import snapshot_decline
-from bims_shopify.application.sync_interval import (
-    PULL_MODE,
-    PUSH_MODE,
-    RECONCILE_MODE,
-    interval_floor_for,
-)
+from bims_shopify.application.run_history import CYCLE_MODE, PULL_MODE
+from bims_shopify.application.snapshot_gate import snapshot_decline
 from bims_shopify.application.sync_inventory import ProgressFn
 from bims_shopify.logging import get_logger
 from bims_shopify.sync_locks import CombinedLock
@@ -33,8 +28,8 @@ router = APIRouter(prefix="/sync", tags=["sync"], dependencies=[Depends(require_
 logger = get_logger(__name__)
 
 def _lock_for_tenant(request: Request, tenant_id: int) -> asyncio.Lock | CombinedLock:
-    """Reuse the scheduler's per-tenant locks (pull and push together) so a
-    manual run can never execute concurrently with a scheduled pull or push
+    """Reuse the scheduler's per-tenant locks (pull and write together) so a
+    manual run can never execute concurrently with a scheduled pull or write cycle
     (or another manual run) for the same tenant."""
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is not None:
@@ -80,7 +75,7 @@ async def _do_run_sync(
     force: bool = False,
     progress: ProgressFn | None = None,
 ):
-    """One-shot sync: pull now, then push now (``ops.sync_workers.do_run_sync``).
+    """One-shot sync: pull now, then reconcile now (``ops.sync_workers.do_run_sync``).
 
     Shared by the manual HTTP endpoint, the background ops job
     (ops/sync_job.py) and the post-activation dry run, so behavior never
@@ -105,35 +100,27 @@ async def get_sync_status(
 
     sync_state_repo = SqlAlchemySyncStateRepository(session)
     status = await sync_state_repo.get_status(tenant.id)
-    floor = await interval_floor_for(sync_state_repo, tenant.id, PULL_MODE)
-    status["sync_interval"] = {
-        "configured_minutes": tenant.sync_interval_minutes,
-        "min_safe_minutes": floor.minutes,
-        "basis": floor.basis,
-        "slowest_recent_seconds": floor.slowest_seconds,
-        "runs_considered": floor.runs_considered,
+    # How long the two workers really take: the evidence for whether one write cycle per
+    # snapshot keeps up with the pull loop. A cycle slower than a pull means skipped snapshots.
+    status["pull"] = {
+        "min_gap_seconds": tenant.pull_min_gap_seconds,
+        **_duration_view(await sync_state_repo.get_recent_durations(tenant.id, PULL_MODE)),
         # Every pull is a full pull; the setting below no longer changes that.
-        "sync_mode": floor.sync_mode,
         "sync_mode_setting": tenant.sync_mode.value,
     }
-    push_floor = await interval_floor_for(sync_state_repo, tenant.id, PUSH_MODE)
-    status["push_interval"] = {
-        "configured_minutes": tenant.push_interval_minutes,
-        "min_safe_minutes": push_floor.minutes,
-        "basis": push_floor.basis,
-        "slowest_recent_seconds": push_floor.slowest_seconds,
-        "runs_considered": push_floor.runs_considered,
-    }
-    reconcile_floor = await interval_floor_for(sync_state_repo, tenant.id, RECONCILE_MODE)
-    status["reconcile_interval"] = {
-        "configured_minutes": tenant.reconcile_interval_minutes,
-        "min_safe_minutes": reconcile_floor.minutes,
-        "basis": reconcile_floor.basis,
-        "slowest_recent_seconds": reconcile_floor.slowest_seconds,
-        "runs_considered": reconcile_floor.runs_considered,
-    }
+    status["write_cycle"] = _duration_view(
+        await sync_state_repo.get_recent_durations(tenant.id, CYCLE_MODE)
+    )
     status["snapshot_max_age_minutes"] = tenant.snapshot_max_age_minutes
     return status
+
+
+def _duration_view(durations: list[float]) -> dict:
+    return {
+        "runs_considered": len(durations),
+        "slowest_recent_seconds": max(durations) if durations else None,
+        "latest_seconds": durations[-1] if durations else None,
+    }
 
 
 def _meta_view(meta, now: datetime) -> dict:
@@ -150,15 +137,17 @@ async def get_snapshot(
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     session: AsyncSession = _Depends(get_db_session),
 ):
-    """The catalog snapshot the push worker reads, and what the workers last did.
+    """The catalog snapshot the write cycle reads, and what the workers last did.
 
-    ``current`` is the snapshot a push would use (``null`` before the first
+    ``current`` is the snapshot a write cycle would use (``null`` before the first
     pull lands); ``history`` lists the last pulls newest first, including
     rejected ones (``status: rejected`` with its ``rejection`` reason).
-    ``usable_for_push`` / ``decline`` say whether the push worker would use the
+    ``usable_for_write`` / ``decline`` say whether a write cycle would use the
     current snapshot right now and, if not, why. ``last_reconcile`` is the last
-    reconciliation against Shopify's real quantities, with its ``drift`` count
-    (a healthy system sits near zero). Cheap: metadata only.
+    stock pass against Shopify's real quantities, with its ``drift`` count (the
+    per-cycle health number: a healthy system sits near zero) and, under
+    ``last_skip``, the last snapshot a still-running cycle had to skip. Cheap:
+    metadata only.
     """
     tenant = await repo.get_by_slug(tenant_slug)
     if tenant is None:
@@ -174,9 +163,6 @@ async def get_snapshot(
         "current": _meta_view(current, now) if current else None,
         "history": [_meta_view(meta, now) for meta in history],
         "last_pull": status["last_pull_outcome"],
-        "last_push": status["last_push_outcome"],
-        # Apart from the push on purpose: "the push had nothing to do" and
-        # "the reconcile found N silently wrong SKUs" must never look alike.
         "last_reconcile": status["last_reconcile_outcome"],
         # What the scheduled cycle's stages last did, one entry per stage
         # (``create``: products created, variants added, conflicts, failures;
@@ -184,12 +170,10 @@ async def get_snapshot(
         # snapshot it judged and when.
         "last_heal": status["last_heal_outcome"],
         "max_age_minutes": tenant.snapshot_max_age_minutes,
-        "usable_for_push": verdict is None,
+        "usable_for_write": verdict is None,
         "decline": {"reason": verdict[0], **verdict[1]} if verdict else None,
         "settings": {
-            "pull_interval_minutes": tenant.sync_interval_minutes,
-            "push_interval_minutes": tenant.push_interval_minutes,
-            "reconcile_interval_minutes": tenant.reconcile_interval_minutes,
+            "pull_min_gap_seconds": tenant.pull_min_gap_seconds,
             "snapshot_max_age_minutes": tenant.snapshot_max_age_minutes,
             "pull_max_drop_ratio": tenant.pull_max_drop_ratio,
             "auto_create_missing": tenant.auto_create_missing,

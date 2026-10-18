@@ -45,9 +45,7 @@ class SqlAlchemyTenantRepository:
             auto_import_interval_minutes=model.auto_import_interval_minutes,
             auto_import_only_with_stock=model.auto_import_only_with_stock,
             sync_mode=SyncMode(model.sync_mode),
-            sync_interval_minutes=model.sync_interval_minutes,
-            push_interval_minutes=model.push_interval_minutes,
-            reconcile_interval_minutes=model.reconcile_interval_minutes,
+            pull_min_gap_seconds=model.pull_min_gap_seconds,
             snapshot_max_age_minutes=model.snapshot_max_age_minutes,
             pull_max_drop_ratio=model.pull_max_drop_ratio,
             auto_create_missing=model.auto_create_missing,
@@ -82,9 +80,7 @@ class SqlAlchemyTenantRepository:
         model.auto_import_interval_minutes = tenant.auto_import_interval_minutes
         model.auto_import_only_with_stock = tenant.auto_import_only_with_stock
         model.sync_mode = tenant.sync_mode.value
-        model.sync_interval_minutes = tenant.sync_interval_minutes
-        model.push_interval_minutes = tenant.push_interval_minutes
-        model.reconcile_interval_minutes = tenant.reconcile_interval_minutes
+        model.pull_min_gap_seconds = tenant.pull_min_gap_seconds
         model.snapshot_max_age_minutes = tenant.snapshot_max_age_minutes
         model.pull_max_drop_ratio = tenant.pull_max_drop_ratio
         model.auto_create_missing = tenant.auto_create_missing

@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import secrets
 from dataclasses import replace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
@@ -21,13 +22,7 @@ from bims_shopify.adapters.persistence.sync_state_repository import (
     SqlAlchemySyncStateRepository,
 )
 from bims_shopify.api.portal_auth import hash_password
-from bims_shopify.application.sync_interval import (
-    PULL_MODE,
-    PUSH_MODE,
-    RECONCILE_MODE,
-    interval_floor_for,
-    rejection_detail,
-)
+from bims_shopify.application.run_history import CYCLE_MODE, PULL_MODE
 from bims_shopify.domain.tenant import PaymentProvider, ReorderStrategy, SyncMode, Tenant
 
 from .deps import (
@@ -38,87 +33,80 @@ from .deps import (
     require_admin,
 )
 
-#: Upper bound for the per-tenant sync interval (one day).
-MAX_SYNC_INTERVAL_MINUTES = 1440
-#: Upper bound for the reconcile interval (one week).
-MAX_RECONCILE_INTERVAL_MINUTES = 10080
+#: Bounds of the minimum gap between two pulls (seconds). The floor stops a gap so small that
+#: the pull loop could hammer BIMS; the ceiling keeps a typo from freezing the sync for a day.
+MIN_PULL_GAP_SECONDS = 10
+MAX_PULL_GAP_SECONDS = 3600
 #: Upper bound for the snapshot staleness limit (one week).
 MAX_SNAPSHOT_MAX_AGE_MINUTES = 10080
+
+#: Settings that no longer exist. Sending one is refused loudly instead of being silently
+#: ignored, so nobody believes a cadence they set still applies.
+REMOVED_SETTINGS = {
+    "sync_interval_minutes": "the pull has no fixed interval any more; use pull_min_gap_seconds",
+    "push_interval_minutes": "there is no push interval: a write cycle runs once per new snapshot",
+    "reconcile_interval_minutes": "there is no reconcile interval: every write cycle reconciles",
+}
+
+
+def _reject_removed_settings(data: object) -> object:
+    if isinstance(data, dict):
+        gone = [name for name in REMOVED_SETTINGS if name in data]
+        if gone:
+            raise ValueError(
+                "; ".join(f"{name} was removed: {REMOVED_SETTINGS[name]}" for name in gone)
+            )
+    return data
+
 
 router = APIRouter(prefix="/tenants", tags=["tenants"], dependencies=[Depends(require_admin)])
 
 
-async def _enforce_interval_floor(
-    session: AsyncSession, tenant: Tenant, before: Tenant | None = None
+#: The snapshot may be this many pull periods old before a write cycle declines: two means
+#: exactly one pull can fail, be rejected or be skipped without writing going dark; a third
+#: consecutive miss does stop it.
+STALENESS_PULL_PERIODS = 2
+
+
+async def _enforce_staleness_limit(
+    session: AsyncSession, before: Tenant | None, tenant: Tenant
 ) -> None:
-    """Reject (422) a worker interval below its measured minimum safe interval.
+    """Reject (422) a staleness limit the measured pull and write-cycle durations can never
+    satisfy.
 
-    * PULL (``sync_interval_minutes``): floor from recent completed pulls. Every
-      pull is a full pull, so the floor never depends on ``sync_mode``.
-    * PUSH (``push_interval_minutes``): floor from recent completed pushes.
-    * RECONCILE (``reconcile_interval_minutes``): floor from recent completed
-      reconciles, never below an hour.
-
-    With no history the pull gets the documented conservative default and the
-    push the 1-minute minimum. Each is checked only when it is being changed
-    (``before`` given), so an unrelated edit is never blocked by a
-    pre-existing low value.
-    """
-    repo = SqlAlchemySyncStateRepository(session)
-    if before is None or tenant.sync_interval_minutes != before.sync_interval_minutes:
-        floor = await interval_floor_for(repo, tenant.id, PULL_MODE)
-        if tenant.sync_interval_minutes < floor.minutes:
-            raise HTTPException(
-                status_code=422, detail=rejection_detail(floor, tenant.sync_interval_minutes)
-            )
-    if before is None or tenant.push_interval_minutes != before.push_interval_minutes:
-        floor = await interval_floor_for(repo, tenant.id, PUSH_MODE)
-        if tenant.push_interval_minutes < floor.minutes:
-            raise HTTPException(
-                status_code=422,
-                detail=rejection_detail(floor, tenant.push_interval_minutes, "push_interval_minutes"),
-            )
-    if before is None or tenant.reconcile_interval_minutes != before.reconcile_interval_minutes:
-        floor = await interval_floor_for(repo, tenant.id, RECONCILE_MODE)
-        if tenant.reconcile_interval_minutes < floor.minutes:
-            raise HTTPException(
-                status_code=422,
-                detail=rejection_detail(
-                    floor, tenant.reconcile_interval_minutes, "reconcile_interval_minutes"
-                ),
-            )
-
-
-#: The snapshot may be this many pull intervals old before the push declines:
-#: two means exactly one pull can fail, be rejected or be skipped without the
-#: push going dark; a third consecutive miss does stop it.
-STALENESS_PULL_INTERVALS = 2
-
-
-def _enforce_staleness_limit(before: Tenant | None, tenant: Tenant) -> None:
-    """Reject (422) a staleness limit the pull cadence can never satisfy.
-
-    Checked only when the pull interval or the limit changes. With a limit
-    shorter than the pull cadence the snapshot is "stale" for part of every
-    cycle and the push would decline for no reason.
+    Checked only when the minimum gap or the limit changes, and only once there is measured
+    history (a tenant that never completed a run has nothing to be inconsistent with). With
+    a limit shorter than one pull period (the slowest recent pull plus the gap) the snapshot
+    is "stale" for part of every period; shorter than the write cycle, the cycle would find
+    its own snapshot stale before it wrote.
     """
     if (
         before is not None
-        and before.sync_interval_minutes == tenant.sync_interval_minutes
+        and before.pull_min_gap_seconds == tenant.pull_min_gap_seconds
         and before.snapshot_max_age_minutes == tenant.snapshot_max_age_minutes
     ):
         return
-    needed = STALENESS_PULL_INTERVALS * tenant.sync_interval_minutes
+    repo = SqlAlchemySyncStateRepository(session)
+    pulls = [] if tenant.id is None else await repo.get_recent_durations(tenant.id, PULL_MODE)
+    cycles = [] if tenant.id is None else await repo.get_recent_durations(tenant.id, CYCLE_MODE)
+    if not pulls and not cycles:
+        return
+    period_seconds = max(
+        (max(pulls) + tenant.pull_min_gap_seconds) if pulls else 0,
+        max(cycles) if cycles else 0,
+    )
+    needed = STALENESS_PULL_PERIODS * math.ceil(period_seconds / 60)
     if tenant.snapshot_max_age_minutes < needed:
         raise HTTPException(
             status_code=422,
             detail={
                 "message": (
-                    f"snapshot_max_age_minutes={tenant.snapshot_max_age_minutes} is too small for "
-                    f"sync_interval_minutes={tenant.sync_interval_minutes}: the push would decline "
-                    f"as stale during part of every cycle. It must be at least "
-                    f"{STALENESS_PULL_INTERVALS} x the pull interval = {needed} minutes, so one "
-                    "failed or rejected pull does not stop the push."
+                    f"snapshot_max_age_minutes={tenant.snapshot_max_age_minutes} is too small "
+                    f"for the measured runs: the slowest recent pull plus the minimum gap, or "
+                    f"the slowest recent write cycle, takes {math.ceil(period_seconds / 60)} "
+                    f"minutes, and writes would decline as stale during part of every period. "
+                    f"It must be at least {STALENESS_PULL_PERIODS} x that = {needed} minutes, so "
+                    "one failed or rejected pull does not stop writing."
                 ),
                 "field": "snapshot_max_age_minutes",
                 "min_minutes": needed,
@@ -128,8 +116,8 @@ def _enforce_staleness_limit(before: Tenant | None, tenant: Tenant) -> None:
 
 
 def _reschedule_live(request: Request, tenant: Tenant) -> None:
-    """Apply the saved tenant's interval to the running scheduler, so a
-    change takes effect immediately instead of at the next restart."""
+    """Apply the saved tenant to the running scheduler (wake its pull loop, start or
+    stop it), so a change takes effect immediately instead of at the next restart."""
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is not None:
         scheduler.reschedule_tenant(tenant)
@@ -163,13 +151,18 @@ class TenantCreate(BaseModel):
     auto_import_interval_minutes: int = 360
     auto_import_only_with_stock: bool = True
     sync_mode: SyncMode = SyncMode.FULL
-    sync_interval_minutes: int = Field(default=30, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
-    push_interval_minutes: int = Field(default=5, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
-    reconcile_interval_minutes: int = Field(default=480, ge=1, le=MAX_RECONCILE_INTERVAL_MINUTES)
+    pull_min_gap_seconds: int = Field(
+        default=60, ge=MIN_PULL_GAP_SECONDS, le=MAX_PULL_GAP_SECONDS
+    )
     snapshot_max_age_minutes: int = Field(default=120, ge=1, le=MAX_SNAPSHOT_MAX_AGE_MINUTES)
     pull_max_drop_ratio: float = Field(default=0.30, gt=0, le=1)
     auto_create_missing: bool = True
     auto_publish: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_removed_settings(cls, data: object) -> object:
+        return _reject_removed_settings(data)
 
     @field_validator("bims_timezone")
     @classmethod
@@ -213,10 +206,8 @@ class TenantPatch(BaseModel):
     auto_import_interval_minutes: int | None = None
     auto_import_only_with_stock: bool | None = None
     sync_mode: SyncMode | None = None
-    sync_interval_minutes: int | None = Field(default=None, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
-    push_interval_minutes: int | None = Field(default=None, ge=1, le=MAX_SYNC_INTERVAL_MINUTES)
-    reconcile_interval_minutes: int | None = Field(
-        default=None, ge=1, le=MAX_RECONCILE_INTERVAL_MINUTES
+    pull_min_gap_seconds: int | None = Field(
+        default=None, ge=MIN_PULL_GAP_SECONDS, le=MAX_PULL_GAP_SECONDS
     )
     snapshot_max_age_minutes: int | None = Field(
         default=None, ge=1, le=MAX_SNAPSHOT_MAX_AGE_MINUTES
@@ -224,6 +215,11 @@ class TenantPatch(BaseModel):
     pull_max_drop_ratio: float | None = Field(default=None, gt=0, le=1)
     auto_create_missing: bool | None = None
     auto_publish: bool | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_removed_settings(cls, data: object) -> object:
+        return _reject_removed_settings(data)
 
     @field_validator("bims_api_key", "shopify_access_token", "shopify_webhook_secret")
     @classmethod
@@ -263,9 +259,7 @@ class TenantOut(BaseModel):
     auto_import_interval_minutes: int
     auto_import_only_with_stock: bool
     sync_mode: SyncMode
-    sync_interval_minutes: int
-    push_interval_minutes: int
-    reconcile_interval_minutes: int
+    pull_min_gap_seconds: int
     snapshot_max_age_minutes: int
     pull_max_drop_ratio: float
     auto_create_missing: bool
@@ -292,9 +286,7 @@ class TenantOut(BaseModel):
             auto_import_interval_minutes=tenant.auto_import_interval_minutes,
             auto_import_only_with_stock=tenant.auto_import_only_with_stock,
             sync_mode=tenant.sync_mode,
-            sync_interval_minutes=tenant.sync_interval_minutes,
-            push_interval_minutes=tenant.push_interval_minutes,
-            reconcile_interval_minutes=tenant.reconcile_interval_minutes,
+            pull_min_gap_seconds=tenant.pull_min_gap_seconds,
             snapshot_max_age_minutes=tenant.snapshot_max_age_minutes,
             pull_max_drop_ratio=tenant.pull_max_drop_ratio,
             auto_create_missing=tenant.auto_create_missing,
@@ -317,8 +309,7 @@ async def create_tenant(
     session: AsyncSession = Depends(get_db_session),
 ):
     tenant = Tenant(id=None, **body.model_dump())
-    await _enforce_interval_floor(session, tenant)
-    _enforce_staleness_limit(None, tenant)
+    await _enforce_staleness_limit(session, None, tenant)
     created = await repo.create(tenant)
     await audit.log(
         actor="admin",
@@ -353,8 +344,7 @@ async def update_tenant(
     if existing is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
     updated = Tenant(id=existing.id, **body.model_dump())
-    await _enforce_interval_floor(session, updated, existing)
-    _enforce_staleness_limit(existing, updated)
+    await _enforce_staleness_limit(session, existing, updated)
     saved = await repo.update(updated)
     await audit.log(
         actor="admin",
@@ -388,8 +378,7 @@ async def patch_tenant(
 
     changes = body.model_dump(exclude_unset=True)
     updated = replace(existing, **changes)
-    await _enforce_interval_floor(session, updated, existing)
-    _enforce_staleness_limit(existing, updated)
+    await _enforce_staleness_limit(session, existing, updated)
     saved = await repo.update(updated)
     await audit.log(
         actor="admin",

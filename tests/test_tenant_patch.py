@@ -237,25 +237,25 @@ async def test_patch_sync_mode_round_trips_and_defaults_to_full(app_ctx):
     assert model.sync_mode == "incremental"
 
 
-async def test_patch_sync_interval_round_trips_and_defaults_to_30(app_ctx):
+async def test_patch_pull_min_gap_round_trips_and_defaults_to_60(app_ctx):
     app, _settings, _acme = app_ctx
     transport = ASGITransport(app=app)
     headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         got = await client.get("/tenants/acme", headers=headers)
-        assert got.json()["sync_interval_minutes"] == 30
+        assert got.json()["pull_min_gap_seconds"] == 60
 
-        patched = await client.patch("/tenants/acme", headers=headers, json={"sync_interval_minutes": 45})
+        patched = await client.patch("/tenants/acme", headers=headers, json={"pull_min_gap_seconds": 90})
         assert patched.status_code == 200
-        assert patched.json()["sync_interval_minutes"] == 45
+        assert patched.json()["pull_min_gap_seconds"] == 90
 
         for bad in (0, -5, 100000):
             rejected = await client.patch(
-                "/tenants/acme", headers=headers, json={"sync_interval_minutes": bad}
+                "/tenants/acme", headers=headers, json={"pull_min_gap_seconds": bad}
             )
             assert rejected.status_code == 422
 
-    assert (await _get_model(app, "acme")).sync_interval_minutes == 45
+    assert (await _get_model(app, "acme")).pull_min_gap_seconds == 90
 
 
 class _RecordingScheduler:
@@ -264,7 +264,7 @@ class _RecordingScheduler:
         self.removed: list[int] = []
 
     def reschedule_tenant(self, tenant) -> None:
-        self.rescheduled.append((tenant.slug, tenant.sync_interval_minutes))
+        self.rescheduled.append((tenant.slug, tenant.pull_min_gap_seconds))
 
     def remove_tenant(self, tenant_id: int) -> None:
         self.removed.append(tenant_id)
@@ -277,7 +277,7 @@ async def test_patch_reschedules_the_live_scheduler(app_ctx):
     transport = ASGITransport(app=app)
     headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        await client.patch("/tenants/acme", headers=headers, json={"sync_interval_minutes": 60})
+        await client.patch("/tenants/acme", headers=headers, json={"pull_min_gap_seconds": 120})
         await client.delete("/tenants/acme", headers=headers)
-    assert scheduler.rescheduled == [("acme", 60)]
+    assert scheduler.rescheduled == [("acme", 120)]
     assert scheduler.removed == [acme.id]
