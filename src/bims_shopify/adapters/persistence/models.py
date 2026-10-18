@@ -15,6 +15,7 @@ from sqlalchemy import (
     UniqueConstraint,
     false,
     text,
+    true,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -81,6 +82,12 @@ class TenantModel(Base):
     )
     #: A pull with MORE than this fraction fewer rows than the previous snapshot is rejected.
     pull_max_drop_ratio: Mapped[float] = mapped_column(Float, default=0.30, server_default="0.3")
+    #: Scheduled cycle, stage 1: create the BIMS products/variants with stock the store lacks.
+    auto_create_missing: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true()
+    )
+    #: Scheduled cycle, stage 3: publish the draft products that pass the publish gates.
+    auto_publish: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
 
 
 class SyncStateModel(Base):
@@ -102,6 +109,12 @@ class SyncStateModel(Base):
     #: Outcome of the latest reconcile (ok | declined | needs_confirmation | failed | skipped)
     #: with its drift numbers. Kept apart from the push outcome on purpose.
     last_reconcile_outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: What the scheduled cycle's create-missing and publish stages last did, one
+    #: sub-dict per stage (``create`` / ``publish``), each with its own snapshot id.
+    last_heal_outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: ``{"at", "skus", "parked"}``: the SKUs last seen in Shopify, so a cycle with
+    #: nothing new to create costs no Shopify call. Large, so never in the status.
+    shopify_sku_index: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class OAuthStateModel(Base):

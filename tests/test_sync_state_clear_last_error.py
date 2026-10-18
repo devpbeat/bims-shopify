@@ -77,3 +77,20 @@ async def test_clear_last_error_is_noop_when_no_error_set(session_factory):
         status = await repo.get_status(2)
     assert status["last_error"] is None
     assert status["last_error_at"] is None
+
+
+async def test_heal_outcome_and_shopify_sku_index_round_trip(session_factory):
+    async with session_factory() as session:
+        repo = SqlAlchemySyncStateRepository(session)
+        assert (await repo.get_status(1))["last_heal_outcome"] is None
+        assert await repo.get_shopify_sku_index(1) is None
+
+        await repo.set_last_heal_outcome(1, {"create": {"status": "ok"}})
+        await repo.set_shopify_sku_index(1, {"at": "2026-10-17T00:00:00+00:00", "skus": ["A"]})
+
+    async with session_factory() as session:
+        repo = SqlAlchemySyncStateRepository(session)
+        status = await repo.get_status(1)
+        assert status["last_heal_outcome"] == {"create": {"status": "ok"}}
+        assert "shopify_sku_index" not in status  # tens of thousands of SKUs stay out of the status
+        assert (await repo.get_shopify_sku_index(1))["skus"] == ["A"]

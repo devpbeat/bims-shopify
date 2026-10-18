@@ -168,6 +168,8 @@ class TenantCreate(BaseModel):
     reconcile_interval_minutes: int = Field(default=480, ge=1, le=MAX_RECONCILE_INTERVAL_MINUTES)
     snapshot_max_age_minutes: int = Field(default=120, ge=1, le=MAX_SNAPSHOT_MAX_AGE_MINUTES)
     pull_max_drop_ratio: float = Field(default=0.30, gt=0, le=1)
+    auto_create_missing: bool = True
+    auto_publish: bool = True
 
     @field_validator("bims_timezone")
     @classmethod
@@ -220,6 +222,8 @@ class TenantPatch(BaseModel):
         default=None, ge=1, le=MAX_SNAPSHOT_MAX_AGE_MINUTES
     )
     pull_max_drop_ratio: float | None = Field(default=None, gt=0, le=1)
+    auto_create_missing: bool | None = None
+    auto_publish: bool | None = None
 
     @field_validator("bims_api_key", "shopify_access_token", "shopify_webhook_secret")
     @classmethod
@@ -264,6 +268,8 @@ class TenantOut(BaseModel):
     reconcile_interval_minutes: int
     snapshot_max_age_minutes: int
     pull_max_drop_ratio: float
+    auto_create_missing: bool
+    auto_publish: bool
 
     @classmethod
     def from_domain(cls, tenant: Tenant) -> TenantOut:
@@ -291,6 +297,8 @@ class TenantOut(BaseModel):
             reconcile_interval_minutes=tenant.reconcile_interval_minutes,
             snapshot_max_age_minutes=tenant.snapshot_max_age_minutes,
             pull_max_drop_ratio=tenant.pull_max_drop_ratio,
+            auto_create_missing=tenant.auto_create_missing,
+            auto_publish=tenant.auto_publish,
         )
 
 

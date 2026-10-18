@@ -182,6 +182,29 @@ async def test_patch_auto_import_only_with_stock_round_trips(app_ctx):
     assert model.auto_import_only_with_stock is False
 
 
+async def test_self_healing_stages_default_on_and_can_be_switched_off_without_a_deploy(app_ctx):
+    app, _settings, _acme = app_ctx
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        body = (await client.get("/tenants/acme", headers=headers)).json()
+        assert body["auto_create_missing"] is True
+        assert body["auto_publish"] is True
+
+        patched = await client.patch(
+            "/tenants/acme",
+            headers=headers,
+            json={"auto_create_missing": False, "auto_publish": False},
+        )
+    assert patched.status_code == 200
+    assert patched.json()["auto_create_missing"] is False
+    assert patched.json()["auto_publish"] is False
+
+    model = await _get_model(app, "acme")
+    assert model.auto_create_missing is False
+    assert model.auto_publish is False
+
+
 async def test_patch_rejects_empty_secret(app_ctx):
     app, _settings, _acme = app_ctx
     transport = ASGITransport(app=app)

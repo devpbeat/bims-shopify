@@ -50,6 +50,8 @@ class SqlAlchemyTenantRepository:
             reconcile_interval_minutes=model.reconcile_interval_minutes,
             snapshot_max_age_minutes=model.snapshot_max_age_minutes,
             pull_max_drop_ratio=model.pull_max_drop_ratio,
+            auto_create_missing=model.auto_create_missing,
+            auto_publish=model.auto_publish,
         )
 
     def _apply_domain(self, model: TenantModel, tenant: Tenant) -> None:
@@ -85,6 +87,8 @@ class SqlAlchemyTenantRepository:
         model.reconcile_interval_minutes = tenant.reconcile_interval_minutes
         model.snapshot_max_age_minutes = tenant.snapshot_max_age_minutes
         model.pull_max_drop_ratio = tenant.pull_max_drop_ratio
+        model.auto_create_missing = tenant.auto_create_missing
+        model.auto_publish = tenant.auto_publish
 
     async def get_by_slug(self, slug: str) -> Tenant | None:
         result = await self._session.execute(select(TenantModel).where(TenantModel.slug == slug))

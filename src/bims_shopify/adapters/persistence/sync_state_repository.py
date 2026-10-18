@@ -115,6 +115,9 @@ class SqlAlchemySyncStateRepository:
             "last_reconcile_outcome": (
                 dict(model.last_reconcile_outcome) if model.last_reconcile_outcome else None
             ),
+            "last_heal_outcome": (
+                dict(model.last_heal_outcome) if model.last_heal_outcome else None
+            ),
         }
 
     async def set_last_pull_outcome(self, tenant_id: int, outcome: dict) -> None:
@@ -134,6 +137,26 @@ class SqlAlchemySyncStateRepository:
         model = await self._get_or_create_state(tenant_id)
         model.last_reconcile_outcome = outcome
         await self._session.commit()
+
+    async def set_last_heal_outcome(self, tenant_id: int, outcome: dict) -> None:
+        """What the scheduled cycle's create-missing / publish stages last did."""
+        model = await self._get_or_create_state(tenant_id)
+        model.last_heal_outcome = outcome
+        await self._session.commit()
+
+    async def get_last_heal_outcome(self, tenant_id: int) -> dict | None:
+        model = await self._get_or_create_state(tenant_id)
+        return dict(model.last_heal_outcome) if model.last_heal_outcome else None
+
+    async def set_shopify_sku_index(self, tenant_id: int, index: dict) -> None:
+        """Remember which SKUs Shopify held at the last scan (see the model)."""
+        model = await self._get_or_create_state(tenant_id)
+        model.shopify_sku_index = index
+        await self._session.commit()
+
+    async def get_shopify_sku_index(self, tenant_id: int) -> dict | None:
+        model = await self._get_or_create_state(tenant_id)
+        return dict(model.shopify_sku_index) if model.shopify_sku_index else None
 
     async def get_last_reconcile_outcome(self, tenant_id: int) -> dict | None:
         model = await self._get_or_create_state(tenant_id)

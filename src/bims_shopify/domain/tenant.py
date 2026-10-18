@@ -93,6 +93,12 @@ class Tenant:
     #: A pull with MORE than this fraction fewer rows than the previous snapshot is rejected
     #: (0.30: a 33,705 -> 11,355 row pull is a 66% drop and is refused; 1.0 disables it).
     pull_max_drop_ratio: float = 0.30
+    #: Scheduled cycle, stage 1: create the BIMS products / variants with stock
+    #: that the store lacks. Default ON; switch off per tenant without a deploy.
+    auto_create_missing: bool = True
+    #: Scheduled cycle, stage 3: publish the draft products that pass the
+    #: ``publish`` gates (images, confirmed stock). Default ON.
+    auto_publish: bool = True
 
     @property
     def bims_auth_header(self) -> str:
