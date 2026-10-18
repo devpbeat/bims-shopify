@@ -6,6 +6,7 @@ safety guard surfacing as needs_confirmation via HTTP, and status readback.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -23,6 +24,7 @@ from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
 from bims_shopify.api import health, payments, sync, tenants, webhooks
+from tests.sync_world import inventory_response
 from bims_shopify.config import Settings
 from bims_shopify.domain.tenant import PaymentProvider, ReorderStrategy, Tenant
 
@@ -174,11 +176,16 @@ def _graphql_url() -> str:
 
 
 @pytest.fixture
-def mock_bims_one_product_and_shopify_variant():
-    """BIMS returns one product with stock=5; Shopify resolves its variant
-    and accepts the inventory push. Used to prove force re-pushes even when
-    the stored product_hashes watermark already equals the current BIMS
-    stock (the store-wipe-and-rebuild scenario)."""
+def shopify_levels() -> dict[str, int]:
+    """What the fake Shopify really holds per SKU (absent: no inventory level)."""
+    return {}
+
+
+@pytest.fixture
+def mock_bims_one_product_and_shopify_variant(shopify_levels):
+    """BIMS returns one product with stock=5; Shopify holds ``shopify_levels`` for it and
+    applies the inventory writes it receives. Used to prove a run compares with what Shopify
+    really holds."""
     list_all_variants_response = {
         "data": {
             "productVariants": {
@@ -234,67 +241,56 @@ def mock_bims_one_product_and_shopify_variant():
         # more than once (the pull's catalog stats, the push's SKU map) and
         # writes only when something changed.
         def graphql(request: httpx.Request) -> httpx.Response:
-            if b"inventorySetQuantities" in request.content:
+            body = json.loads(request.content)
+            if "inventorySetQuantities" in body["query"]:
+                for q in body["variables"]["input"]["quantities"]:
+                    shopify_levels["SKU1"] = q["quantity"]
                 return httpx.Response(200, json=set_quantities_response)
+            if "ListVariantInventory" in body["query"]:
+                return httpx.Response(200, json=inventory_response(["SKU1"], dict(shopify_levels)))
             return httpx.Response(200, json=list_all_variants_response)
 
         mock.post(_graphql_url()).mock(side_effect=graphql)
         yield mock
 
 
-async def test_force_true_re_pushes_even_when_hashes_already_match(
-    app_and_tenant, mock_bims_one_product_and_shopify_variant
+async def test_a_run_corrects_whatever_shopify_holds_no_matter_what_was_sent_before(
+    app_and_tenant, mock_bims_one_product_and_shopify_variant, shopify_levels
 ):
-    """Regression test: after a store wipe+rebuild, product_hashes can
-    already equal current BIMS stock, so a normal run reports matched=0.
-    force=true must ignore that watermark and push anyway."""
+    """Regression for the old frozen-SKU bug (a stored "last sent" value that matched BIMS
+    while Shopify had drifted after a wipe+rebuild): the run compares with what Shopify
+    really holds, so there is nothing stored that can make it report "already in sync"."""
     transport = ASGITransport(app=app_and_tenant)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # Prime product_hashes to already equal current BIMS stock (SKU1=5),
-        # simulating stale hashes surviving a Shopify-side wipe+rebuild.
-        async with app_and_tenant.state.session_factory() as session:
-            from bims_shopify.adapters.persistence.sync_state_repository import (
-                SqlAlchemySyncStateRepository,
-            )
-            from bims_shopify.adapters.persistence.tenant_repository import (
-                SqlAlchemyTenantRepository,
-            )
-
-            repo = SqlAlchemyTenantRepository(
-                session, SecretBox(app_and_tenant.state.settings.fernet_key)
-            )
-            tenant = await repo.get_by_slug("acme")
-            sync_state_repo = SqlAlchemySyncStateRepository(session)
-            await sync_state_repo.set_product_hashes(tenant.id, {"SKU1": "5"})
-            await session.commit()
-
-        # Sanity: without force, the stale-but-matching watermark yields
-        # zero matched deltas (this is the bug being fixed).
-        non_force_response = await client.post(
+        shopify_levels["SKU1"] = 1  # Shopify drifted; BIMS says 5
+        drifted = await client.post(
             "/sync/acme/run",
             params={"dry_run": "false"},
             headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
         )
-        assert non_force_response.status_code == 200
-        non_force_body = non_force_response.json()
-        assert non_force_body["synced_deltas"] == 0
-        # The no-op is explained: the SKU was examined on both sides and
-        # found unchanged, so matched=0 cannot be mistaken for "looked at nothing".
-        assert non_force_body["scanned"] == {"bims": 1, "shopify": 1}
-        assert non_force_body["report"]["unchanged"]["count"] == 1
-        assert non_force_body["report"]["updated"]["count"] == 0
+        assert drifted.status_code == 200
+        body = drifted.json()
+        assert body["status"] == "ok" and body["updated"] == 1
+        assert body["drift"]["count"] == 1
+        assert body["scanned"] == {"snapshot": 1, "shopify": 1}
+        assert shopify_levels["SKU1"] == 5
 
-        force_response = await client.post(
+        settled = await client.post(
+            "/sync/acme/run",
+            params={"dry_run": "false"},
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        assert settled.json()["drift"]["count"] == 0 and settled.json()["updated"] == 0
+
+        shopify_levels["SKU1"] = 9
+        forced = await client.post(
             "/sync/acme/run",
             params={"dry_run": "false", "force": "true"},
             headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
         )
-    assert force_response.status_code == 200
-    body = force_response.json()
-    assert body["status"] == "ok"
-    assert body["synced_deltas"] == 1
-    assert body["report"]["updated"]["count"] == 1
-    assert body["report"]["guard"]["forced"] is True
+    assert forced.status_code == 200
+    assert forced.json()["report"]["guard"]["forced"] is True
+    assert shopify_levels["SKU1"] == 5
 
 
 async def test_get_reconciliation_404s_when_none_persisted(app_and_tenant):
@@ -363,9 +359,9 @@ async def test_sync_summary_persists_real_phase_timings(
         )
     summary = status.json()["last_run_summary"]
     for timings in (run.json()["timings"], summary["timings"]):
-        # The pull's phase durations travel with the snapshot the push read.
+        # The pull's phase durations travel with the snapshot the write read.
         assert timings["catalog_pull_seconds"] > 0
         assert timings["stock_fetch_seconds"] > 0
-        assert 0 < timings["push_seconds"] <= summary["duration_seconds"]
+        assert 0 < timings["reconcile_seconds"] <= summary["duration_seconds"]
     assert summary["catalog_pull"]["rows"] == 1
     assert summary["catalog_pull"]["complete"] is True

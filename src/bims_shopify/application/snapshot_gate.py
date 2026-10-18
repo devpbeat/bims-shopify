@@ -1,7 +1,7 @@
-"""Use case rules for the PUSH worker: when is a snapshot fit to push from.
+"""When is a snapshot fit to write to Shopify from.
 
-Pushing from a stale or incomplete snapshot is worse than not pushing: Shopify
-would be overwritten with numbers BIMS no longer has. The push therefore
+Writing from a stale or incomplete snapshot is worse than not writing: Shopify
+would be overwritten with numbers BIMS no longer has. Every write cycle therefore
 declines, says why, and leaves Shopify as it is.
 """
 from __future__ import annotations
@@ -20,7 +20,7 @@ DECLINE_STALE = "stale"
 def snapshot_decline(
     meta: SnapshotMeta | None, tenant: Tenant, now: datetime
 ) -> tuple[str, dict[str, Any]] | None:
-    """Why the push must not run from ``meta``, or ``None`` when it may.
+    """Why a write must not run from ``meta``, or ``None`` when it may.
 
     * ``missing``: no snapshot has landed yet.
     * ``incomplete``: the pull was explicitly flagged incomplete

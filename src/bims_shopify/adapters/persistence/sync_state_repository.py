@@ -8,15 +8,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bims_shopify.application.sync_interval import RECENT_RUNS_WINDOW
+from bims_shopify.application.run_history import RECENT_RUNS_WINDOW
 from bims_shopify.datetime_utils import ensure_aware_utc
 
 from .models import ProcessedEventModel, SyncStateModel
 
 
 #: Entries kept in ``sync_duration_history`` PER MODE. Per mode, not overall:
-#: the push worker records far more often than the pull and would otherwise
-#: evict every pull measurement the pull interval floor is derived from.
+#: the write cycle records more often than the pull and would otherwise
+#: evict the pull measurements.
 DURATION_HISTORY_CAP = 40
 
 
@@ -30,7 +30,7 @@ class SqlAlchemySyncStateRepository:
         )
         model = result.scalar_one_or_none()
         if model is None:
-            model = SyncStateModel(tenant_id=tenant_id, product_hashes={})
+            model = SyncStateModel(tenant_id=tenant_id)
             self._session.add(model)
             await self._session.commit()
             await self._session.refresh(model)
@@ -55,9 +55,9 @@ class SqlAlchemySyncStateRepository:
         """Clear a stale error after a successful sync so sync-status stops
         surfacing errors from runs that have since succeeded.
 
-        With ``only_prefix`` (``"pull: "`` / ``"push: "``) the error is cleared
-        only if it came from that worker: the pull and push share one error
-        slot, and a healthy push must not hide a pull that is still failing.
+        With ``only_prefix`` (``"pull: "`` / ``"reconcile: "``) the error is cleared
+        only if it came from that worker: the pull and the write cycle share one
+        error slot, and a healthy cycle must not hide a pull that is still failing.
         """
         model = await self._get_or_create_state(tenant_id)
         if only_prefix is not None and not (model.last_error or "").startswith(only_prefix):
@@ -111,7 +111,6 @@ class SqlAlchemySyncStateRepository:
             "last_error_at": last_error_at.isoformat() if last_error_at else None,
             "last_run_summary": dict(model.last_run_summary or {}),
             "last_pull_outcome": dict(model.last_pull_outcome) if model.last_pull_outcome else None,
-            "last_push_outcome": dict(model.last_push_outcome) if model.last_push_outcome else None,
             "last_reconcile_outcome": (
                 dict(model.last_reconcile_outcome) if model.last_reconcile_outcome else None
             ),
@@ -124,12 +123,6 @@ class SqlAlchemySyncStateRepository:
         """What the most recent pull TICK did: ok / rejected / skipped / failed."""
         model = await self._get_or_create_state(tenant_id)
         model.last_pull_outcome = outcome
-        await self._session.commit()
-
-    async def set_last_push_outcome(self, tenant_id: int, outcome: dict) -> None:
-        """What the most recent push TICK did: ok / unchanged / declined / ..."""
-        model = await self._get_or_create_state(tenant_id)
-        model.last_push_outcome = outcome
         await self._session.commit()
 
     async def set_last_reconcile_outcome(self, tenant_id: int, outcome: dict) -> None:
@@ -161,19 +154,6 @@ class SqlAlchemySyncStateRepository:
     async def get_last_reconcile_outcome(self, tenant_id: int) -> dict | None:
         model = await self._get_or_create_state(tenant_id)
         return dict(model.last_reconcile_outcome) if model.last_reconcile_outcome else None
-
-    async def get_last_push_outcome(self, tenant_id: int) -> dict | None:
-        model = await self._get_or_create_state(tenant_id)
-        return dict(model.last_push_outcome) if model.last_push_outcome else None
-
-    async def get_product_hashes(self, tenant_id: int) -> dict[str, str]:
-        model = await self._get_or_create_state(tenant_id)
-        return dict(model.product_hashes or {})
-
-    async def set_product_hashes(self, tenant_id: int, hashes: dict[str, str]) -> None:
-        model = await self._get_or_create_state(tenant_id)
-        model.product_hashes = hashes
-        await self._session.commit()
 
     async def has_processed_event(self, tenant_id: int, source: str, external_id: str) -> bool:
         result = await self._session.execute(

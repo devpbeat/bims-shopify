@@ -119,7 +119,7 @@ async def test_pull_duration_is_recorded_for_the_pull_interval_floor(migrated_db
     async with session_factory() as session:
         repo = SqlAlchemySyncStateRepository(session)
         assert len(await repo.get_recent_durations(tenant.id, "full")) == 1
-        assert await repo.get_recent_durations(tenant.id, "push") == []
+        assert await repo.get_recent_durations(tenant.id, "reconcile") == []
 
 
 async def test_pull_recomputes_the_dashboard_catalog_stats(migrated_db):
@@ -216,13 +216,13 @@ async def test_a_successful_pull_clears_only_a_pull_error(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
     async with session_factory() as session:
-        await SqlAlchemySyncStateRepository(session).set_last_error(tenant.id, "push: shopify 500")
+        await SqlAlchemySyncStateRepository(session).set_last_error(tenant.id, "reconcile: shopify 500")
     mock, _ = world([_product(1, "A")], {"A": 1}, ["A"])
     with mock:
         await _pull(session_factory, tenant)
     async with session_factory() as session:
         status = await SqlAlchemySyncStateRepository(session).get_status(tenant.id)
-    assert status["last_error"] == "push: shopify 500"
+    assert status["last_error"] == "reconcile: shopify 500"
 
 
 async def test_record_skip_is_visible(migrated_db):
@@ -255,17 +255,20 @@ async def test_a_skipped_pull_keeps_the_last_real_outcome_and_counts_consecutive
     assert outcome["previous"]["status"] == "ok" and outcome["previous"]["snapshot_id"] == 7
 
 
-async def test_a_skipped_push_tick_does_not_overwrite_the_last_push_outcome(migrated_db):
+async def test_a_skipped_write_cycle_does_not_overwrite_the_last_write_outcome(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
     async with session_factory() as session:
-        await SqlAlchemySyncStateRepository(session).set_last_push_outcome(
-            tenant.id, {"status": "declined", "reason": "stale", "at": "2026-10-15T10:00:00+00:00"}
+        await SqlAlchemySyncStateRepository(session).set_last_reconcile_outcome(
+            tenant.id,
+            {"status": "ok", "drift": {"count": 3}, "at": "2026-10-15T10:00:00+00:00"},
         )
-    await record_skip(session_factory, "push", tenant)
+    await record_skip(session_factory, "cycle", tenant)
+    await record_skip(session_factory, "cycle", tenant)
     async with session_factory() as session:
         outcome = (await SqlAlchemySyncStateRepository(session).get_status(tenant.id))[
-            "last_push_outcome"
+            "last_reconcile_outcome"
         ]
-    assert outcome["status"] == "declined" and outcome["reason"] == "stale"
+    assert outcome["status"] == "ok" and outcome["drift"]["count"] == 3  # still readable
     assert outcome["last_skip"]["status"] == "skipped"
+    assert outcome["last_skip"]["skipped_total"] == 2  # skipped snapshots are counted

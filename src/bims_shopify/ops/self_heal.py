@@ -1,7 +1,7 @@
 """The self-healing stages of the scheduled cycle: create what is missing, publish what qualifies.
 
-The cycle (see ``ops.sync_workers.do_cycle``) is: pull -> [create missing] ->
-push stock -> [publish]. This module holds the two optional stages' decisions
+The write cycle (see ``ops.sync_workers.do_cycle``), run once per new snapshot, is: stock ->
+[create missing] -> stock again if anything was created -> [publish]. This module holds the two optional stages' decisions
 and Shopify writes; ``sync_workers`` owns the database bookkeeping around them.
 
 Both stages judge from the persisted snapshot only (they never call BIMS) and
@@ -67,7 +67,7 @@ MAX_PUBLISH_PER_CYCLE = 500
 REPORT_SAMPLE_SIZE = 20
 
 DECLINE_SKU_FIELD = "sku_field_not_code2"
-DECLINE_PUSH_GUARD = "push_guard_fired"
+DECLINE_STOCK_GUARD = "stock_guard_fired"
 
 
 def sku_field_decline(tenant: Tenant) -> tuple[str, dict[str, Any]] | None:
@@ -98,7 +98,7 @@ class CreateStageResult:
     report: dict[str, Any]
     #: The SKU index to remember, or ``None`` to leave the stored one alone.
     new_index: dict[str, Any] | None = None
-    #: SKUs this run wrote to Shopify (their push baseline must be invalidated).
+    #: SKUs this run wrote to Shopify: when any, the cycle runs a second stock pass for them.
     written_skus: set[str] = field(default_factory=set)
 
 

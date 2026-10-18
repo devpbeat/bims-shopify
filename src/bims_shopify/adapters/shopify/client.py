@@ -471,7 +471,7 @@ class ShopifyClient:
         skipped; SKUs are stripped, as in ``build_sku_inventory_map``.
 
         A full-catalog read (about one request per 100 variants), used by the
-        reconciliation pass -- never by the cheap incremental push.
+        stock pass of every write cycle (``do_reconcile``).
         """
         cursor: str | None = None
         while True:

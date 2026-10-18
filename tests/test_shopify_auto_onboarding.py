@@ -120,11 +120,11 @@ async def _get_state(app, shop: str) -> str:
 
 def _graphql_side_effect(request: httpx.Request) -> httpx.Response:
     """Route by GraphQL operation name so the same mock URL can answer both
-    the onboarding location lookup and the scheduled sync's bulk variant
-    listing (used by build_sku_inventory_map)."""
+    the onboarding location lookup and the sync's variant listings (the pull's catalog
+    stats and the reconcile's quantity read)."""
     body = json.loads(request.content)
     query = body.get("query", "")
-    if "ListAllVariants" in query:
+    if "ListAllVariants" in query or "ListVariantInventory" in query:
         return httpx.Response(
             200,
             json={

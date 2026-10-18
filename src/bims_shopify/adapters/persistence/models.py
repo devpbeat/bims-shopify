@@ -69,24 +69,20 @@ class TenantModel(Base):
     auto_import_interval_minutes: Mapped[int] = mapped_column(Integer, default=360)
     auto_import_only_with_stock: Mapped[bool] = mapped_column(Boolean, default=True)
     sync_mode: Mapped[str] = mapped_column(String(16), default="full", server_default="full")
-    sync_interval_minutes: Mapped[int] = mapped_column(Integer, default=30, server_default="30")
-    #: Push worker cadence (the PULL cadence is ``sync_interval_minutes``).
-    push_interval_minutes: Mapped[int] = mapped_column(Integer, default=5, server_default="5")
-    #: Reconcile worker cadence (Shopify's real quantities vs the snapshot).
-    reconcile_interval_minutes: Mapped[int] = mapped_column(
-        Integer, default=480, server_default="480"
-    )
-    #: The push worker declines to push from a snapshot older than this.
+    #: Minimum pause between the end of one pull and the start of the next (the pull loop
+    #: itself has no fixed cadence).
+    pull_min_gap_seconds: Mapped[int] = mapped_column(Integer, default=60, server_default="60")
+    #: A write cycle declines to write from a snapshot older than this.
     snapshot_max_age_minutes: Mapped[int] = mapped_column(
         Integer, default=120, server_default="120"
     )
     #: A pull with MORE than this fraction fewer rows than the previous snapshot is rejected.
     pull_max_drop_ratio: Mapped[float] = mapped_column(Float, default=0.30, server_default="0.3")
-    #: Scheduled cycle, stage 1: create the BIMS products/variants with stock the store lacks.
+    #: Write cycle, stage 1: create the BIMS products/variants with stock the store lacks.
     auto_create_missing: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=true()
     )
-    #: Scheduled cycle, stage 3: publish the draft products that pass the publish gates.
+    #: Write cycle, stage 3: publish the draft products that pass the publish gates.
     auto_publish: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
 
 
@@ -96,7 +92,6 @@ class SyncStateModel(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     tenant_id: Mapped[int] = mapped_column(Integer, index=True, unique=True)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    product_hashes: Mapped[dict] = mapped_column(JSON, default=dict)
     last_error: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_run_summary: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -104,10 +99,8 @@ class SyncStateModel(Base):
     sync_duration_history: Mapped[list] = mapped_column(JSON, default=list, server_default="[]")
     #: Outcome of the latest pull tick (ok | rejected | skipped | failed) with its numbers.
     last_pull_outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    #: Outcome of the latest push tick (ok | unchanged | declined | needs_confirmation | failed).
-    last_push_outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    #: Outcome of the latest reconcile (ok | declined | needs_confirmation | failed | skipped)
-    #: with its drift numbers. Kept apart from the push outcome on purpose.
+    #: Outcome of the latest write cycle's stock pass (ok | declined | needs_confirmation |
+    #: failed), with its drift numbers, plus ``last_skip`` when a snapshot was skipped.
     last_reconcile_outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     #: What the scheduled cycle's create-missing and publish stages last did, one
     #: sub-dict per stage (``create`` / ``publish``), each with its own snapshot id.

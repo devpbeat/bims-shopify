@@ -1,20 +1,23 @@
-"""Composition of the two inventory-sync workers over the persisted snapshot.
+"""Composition of the inventory-sync workers over the persisted snapshot.
 
 * ``do_pull``: BIMS -> our database (``PullCatalogSnapshot``). Takes as long as
   BIMS takes, never touches Shopify inventory.
-* ``do_push``: our database -> Shopify (``SyncInventoryToShopify`` fed by the
-  snapshot). Never calls BIMS.
-* ``do_run_sync``: the one-shot ``pull now, then push now`` used by
+* ``do_reconcile``: our database -> Shopify, and the ONLY way stock is written. It reads
+  Shopify's real quantities, compares them with the snapshot and writes what differs.
+  Never calls BIMS.
+* ``do_cycle``: what runs once per new snapshot: ``do_reconcile``, then the self-healing
+  stages (create what is missing, give it stock, publish what qualifies).
+* ``do_run_sync``: the one-shot ``pull now, then reconcile now`` used by
   ``POST /sync/{slug}/run`` and the ``sync`` ops command. It is exactly those
   two functions in sequence, not a third code path.
 
-None of these take locks: the caller (scheduler tick, HTTP endpoint, job
+None of these take locks: the caller (scheduler, HTTP endpoint, job
 runner) owns serialisation, see ``bims_shopify.sync_locks``.
 """
 from __future__ import annotations
 
 import time
-from dataclasses import asdict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -28,16 +31,11 @@ from bims_shopify.adapters.persistence.sync_state_repository import SqlAlchemySy
 from bims_shopify.adapters.shopify.client import ShopifyClient
 from bims_shopify.adapters.snapshot_erp import SnapshotERPAdapter
 from bims_shopify.application.pull_snapshot import PullCatalogSnapshot
-from bims_shopify.application.push_snapshot import snapshot_decline
+from bims_shopify.application.snapshot_gate import snapshot_decline
 from bims_shopify.application.reconcile_inventory import ReconcileInventory
-from bims_shopify.application.sync_interval import PULL_MODE, PUSH_MODE, RECONCILE_MODE
-from bims_shopify.application.sync_inventory import (
-    DryRunReport,
-    NeedsConfirmation,
-    ProgressFn,
-    SyncInventoryToShopify,
-)
-from bims_shopify.domain.snapshot import CatalogPull, SnapshotMeta
+from bims_shopify.application.run_history import CYCLE_MODE, PULL_MODE
+from bims_shopify.application.sync_inventory import NeedsConfirmation, ProgressFn
+from bims_shopify.domain.snapshot import CatalogPull, CatalogSnapshot, SnapshotMeta
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 from bims_shopify.ops.catalog import (
@@ -47,7 +45,7 @@ from bims_shopify.ops.catalog import (
     reconciliation_diff,
 )
 from bims_shopify.ops.self_heal import (
-    DECLINE_PUSH_GUARD,
+    DECLINE_STOCK_GUARD,
     create_missing,
     eligible_groups,
     publish_qualifying,
@@ -57,14 +55,33 @@ from bims_shopify.ops.self_heal import (
 logger = get_logger(__name__)
 
 PULL_ERROR_PREFIX = "pull: "
-PUSH_ERROR_PREFIX = "push: "
 RECONCILE_ERROR_PREFIX = "reconcile: "
 
-SKIP_REASON = "previous run still running; this tick was skipped, not queued"
+SKIP_REASON = "previous run still running; this one was skipped, not queued"
+
+#: ``record_skip`` kinds: a pull that found the previous pull (or a manual sync) running, and
+#: a write cycle that found the previous cycle (or a manual run) still going.
+SKIP_PULL = "pull"
+SKIP_CYCLE = "cycle"
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class PinnedSnapshot:
+    """The snapshot a whole write cycle works from, read ONCE when the cycle starts.
+
+    A stock pass takes as long as a pull, so by the time the create and publish stages run a
+    newer snapshot may have landed, and an older one may even have had its rows purged. The
+    stages must judge, and act on, the very snapshot the stock pass compared (including its
+    mass-zero verdict), never on whatever is current by then. ``meta=None`` pins "there was
+    no snapshot".
+    """
+
+    meta: SnapshotMeta | None
+    snapshot: CatalogSnapshot | None
 
 
 async def shopify_variant_facts(storefront: ShopifyClient) -> tuple[dict[str, int], set[str]]:
@@ -111,26 +128,29 @@ async def compute_catalog_stats(tenant: Tenant, pull: CatalogPull) -> dict[str, 
 
 
 async def record_skip(session_factory: async_sessionmaker, kind: str, tenant: Tenant) -> None:
-    """Record that a scheduled ``kind`` ("pull" | "push" | "reconcile") tick found the
-    previous run of the same worker still going and did nothing.
+    """Record that a ``kind`` ("pull" | "cycle") found the previous run of the same worker
+    still going and did nothing.
 
-    A skipped tick is not queued: the next interval simply tries again. It is
-    recorded so a worker that never gets to run (for example a pull that takes
-    longer than its interval) is visible instead of silent.
+    A skipped run is not queued. For a pull the loop simply tries again after its
+    minimum gap; for a write cycle the snapshot is dropped and the next snapshot gets its
+    own cycle. It is recorded so a worker that never gets to run (a write cycle that takes
+    longer than the pull cadence) is visible instead of silent.
     """
     if tenant.id is None:
         return
     outcome = {"status": "skipped", "at": _now().isoformat(), "reason": SKIP_REASON, "trigger": "scheduled"}
     async with session_factory() as session:
         state = SqlAlchemySyncStateRepository(session)
-        if kind == "reconcile":
+        if kind == SKIP_CYCLE:
             previous = await state.get_last_reconcile_outcome(tenant.id)
-            # Keep the last real outcome (and its drift numbers) readable; the
-            # overlapping tick is only noted alongside it.
+            # Keep the last real outcome (and its drift numbers) readable; the skipped
+            # snapshot is only noted alongside it, with a running count.
+            last = (previous or {}).get("last_skip") or {}
+            outcome["skipped_total"] = int(last.get("skipped_total", 0)) + 1
             await state.set_last_reconcile_outcome(
                 tenant.id, {**(previous or {}), "last_skip": outcome}
             )
-        elif kind == "pull":
+        else:
             prior = (await state.get_status(tenant.id))["last_pull_outcome"]
             if prior and prior.get("status") == "skipped":
                 outcome["previous"] = prior.get("previous")
@@ -146,15 +166,8 @@ async def record_skip(session_factory: async_sessionmaker, kind: str, tenant: Te
                 tenant_id=tenant.id,
                 payload={"reason": SKIP_REASON},
             )
-        else:
-            previous = await state.get_last_push_outcome(tenant.id)
-            # Do not overwrite a meaningful last outcome (e.g. a decline) with
-            # the noise of an overlapping tick; just note the skip alongside it.
-            await state.set_last_push_outcome(
-                tenant.id, {**(previous or {}), "last_skip": outcome}
-            )
     logger.warning(
-        f"{kind}_tick_skipped",
+        f"{kind}_skipped",
         tenant_slug=tenant.slug,
         tenant_id=tenant.id,
         reason=SKIP_REASON,
@@ -177,23 +190,6 @@ async def last_pull_at(session_factory: async_sessionmaker, tenant: Tenant) -> d
     if outcome and outcome.get("status") in ("ok", "rejected", "failed") and outcome.get("at"):
         candidates.append(datetime.fromisoformat(outcome["at"]))
     return max(candidates) if candidates else None
-
-
-async def last_reconcile_at(session_factory: async_sessionmaker, tenant: Tenant) -> datetime | None:
-    """When this tenant's reconcile last really ran (scanned Shopify), for the
-    scheduler to time the first one after a restart. ``None``: never.
-
-    A decline or a skip did not scan anything, so it does not count: a
-    reconcile that was declined for a missing snapshot is still owed."""
-    if tenant.id is None:
-        return None
-    async with session_factory() as session:
-        outcome = await SqlAlchemySyncStateRepository(session).get_last_reconcile_outcome(
-            tenant.id
-        )
-    if outcome and outcome.get("status") in ("ok", "needs_confirmation", "failed") and outcome.get("at"):
-        return datetime.fromisoformat(outcome["at"])
-    return None
 
 
 async def do_pull(
@@ -244,8 +240,7 @@ async def do_pull(
             raise
 
         duration = time.perf_counter() - clock
-        # A rejected pull still took real BIMS time, so it counts toward the
-        # pull interval floor like an accepted one.
+        # A rejected pull still took real BIMS time, so it counts like an accepted one.
         await state.record_run_duration(tenant.id, duration, PULL_MODE)
         meta = result.meta
         outcome: dict[str, Any] = {
@@ -345,37 +340,7 @@ async def do_pull(
         await client.aclose()
 
 
-# -- PUSH ---------------------------------------------------------------------
-
-#: Push outcomes that are re-evaluated every tick and must not flood the audit
-#: log: only the first occurrence of an identical one is audited.
-_REPEATABLE = ("declined", "needs_confirmation")
-
-
-def _signature(outcome: dict[str, Any] | None) -> tuple[Any, ...] | None:
-    if not outcome:
-        return None
-    return (outcome.get("status"), outcome.get("reason"), outcome.get("snapshot_id"))
-
-
-async def _record_push_outcome(
-    state: SqlAlchemySyncStateRepository,
-    tenant_id: int,
-    outcome: dict[str, Any],
-    previous: dict[str, Any] | None,
-) -> bool:
-    """Persist this tick's outcome; True when it repeats the previous one
-    (same status, reason and snapshot), so the caller can skip re-auditing."""
-    repeated = (
-        outcome["status"] in _REPEATABLE
-        and previous is not None
-        and _signature(previous) == _signature(outcome)
-    )
-    outcome["first_seen_at"] = (
-        (previous or {}).get("first_seen_at") or (previous or {}).get("at") if repeated else outcome["at"]
-    )
-    await state.set_last_push_outcome(tenant_id, outcome)
-    return repeated
+# -- THE SNAPSHOT --------------------------------------------------------------
 
 
 def _snapshot_info(meta: SnapshotMeta, now: datetime) -> dict[str, Any]:
@@ -387,301 +352,6 @@ def _snapshot_info(meta: SnapshotMeta, now: datetime) -> dict[str, Any]:
         "rows": meta.rows_pulled,
         "stock_rows": meta.stock_rows,
     }
-
-
-async def do_push(
-    tenant: Tenant,
-    session: AsyncSession,
-    *,
-    dry_run: bool = False,
-    force: bool = False,
-    progress: ProgressFn | None = None,
-    trigger: str = "scheduled",
-    skip_unchanged: bool = True,
-) -> dict[str, Any]:
-    """Push the difference between the current snapshot and what was last
-    pushed to Shopify. Never calls BIMS.
-
-    * ``push_declined``: no usable snapshot (missing, incomplete, stale). The
-      reason is recorded; Shopify is not touched.
-    * ``unchanged``: ``skip_unchanged`` and the previous push of this very
-      snapshot succeeded, so there is nothing new to compare. Scheduled ticks
-      use this to stay nearly free; the one-shot passes ``skip_unchanged=False``.
-    * ``needs_confirmation``: the mass-zero / max-changed guard fired.
-    * ``ok`` / dry run: same result shapes as before the split.
-
-    ``force`` is the operator override of the guard and of the last-pushed
-    baseline, exactly as before.
-    """
-    if tenant.id is None:
-        raise ValueError("tenant must be persisted before pushing")
-    state = SqlAlchemySyncStateRepository(session)
-    audit = SqlAlchemyAuditLogger(session)
-    snapshots = SqlAlchemySnapshotRepository(session)
-    now = _now()
-    meta = await snapshots.get_current_meta(tenant.id)
-    previous_outcome = await state.get_last_push_outcome(tenant.id)
-
-    verdict = snapshot_decline(meta, tenant, now)
-    if verdict is not None:
-        reason, detail = verdict
-        outcome = {
-            "status": "declined",
-            "reason": reason,
-            "detail": detail,
-            "snapshot_id": meta.id if meta else None,
-            "at": now.isoformat(),
-            "trigger": trigger,
-        }
-        repeated = await _record_push_outcome(state, tenant.id, outcome, previous_outcome)
-        log = logger.debug if repeated else logger.warning
-        log("sync_push_declined", tenant_slug=tenant.slug, tenant_id=tenant.id, reason=reason, **detail)
-        if not repeated:
-            await audit.log(
-                actor="system",
-                action="sync.push_declined",
-                entity="sync_run",
-                tenant_id=tenant.id,
-                payload={"reason": reason, "detail": detail, "trigger": trigger},
-            )
-        return {
-            "status": "push_declined",
-            "reason": reason,
-            "detail": detail,
-            "snapshot": meta.as_dict() if meta else None,
-        }
-    if meta is None:  # unreachable: snapshot_decline reports a missing snapshot
-        raise RuntimeError("push reached the snapshot read without a snapshot")
-
-    if (
-        skip_unchanged
-        and not dry_run
-        and not force
-        and previous_outcome is not None
-        and previous_outcome.get("status") == "ok"
-        and previous_outcome.get("snapshot_id") == meta.id
-    ):
-        return {"status": "unchanged", "snapshot": _snapshot_info(meta, now)}
-
-    snapshot = await snapshots.load(meta)
-    storefront = ShopifyClient(tenant)
-    try:
-        use_case = SyncInventoryToShopify(SnapshotERPAdapter(snapshot), storefront)
-        previous = await state.get_product_hashes(tenant.id)
-        # force=True ignores the stored baseline entirely: every product with
-        # known stock is diffed against an empty one and re-pushed.
-        previous_stocks = (
-            {} if force else {sku: float(value) for sku, value in previous.items() if value}
-        )
-        info = _snapshot_info(meta, now)
-        run_started_at = _now()
-        clock = time.perf_counter()
-        try:
-            result = await use_case.run(
-                tenant, previous_stocks, since=None, dry_run=dry_run, force=force, progress=progress
-            )
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            logger.error(
-                "sync_run_failed",
-                tenant_slug=tenant.slug,
-                tenant_id=tenant.id,
-                dry_run=dry_run,
-                duration_seconds=time.perf_counter() - clock,
-                error=error,
-            )
-            await state.set_last_error(tenant.id, f"{PUSH_ERROR_PREFIX}{error}")
-            await state.set_last_push_outcome(
-                tenant.id,
-                {
-                    "status": "failed",
-                    "error": error,
-                    "snapshot_id": meta.id,
-                    "at": _now().isoformat(),
-                    "trigger": trigger,
-                },
-            )
-            await audit.log(
-                actor="system",
-                action="sync.error",
-                entity="sync_run",
-                tenant_id=tenant.id,
-                payload={
-                    "dry_run": dry_run,
-                    "error": error,
-                    "report": use_case.last_report,
-                    "snapshot_id": meta.id,
-                },
-            )
-            raise
-
-        duration = time.perf_counter() - clock
-        report = use_case.last_report or {}
-
-        if dry_run:
-            dry: DryRunReport = result  # type: ignore[assignment]
-            logger.info(
-                "sync_run_dry_run",
-                tenant_slug=tenant.slug,
-                tenant_id=tenant.id,
-                total_products=dry.total_products,
-                would_update=dry.would_update,
-                skipped_unresolved_stock=dry.skipped_unresolved_stock,
-                duration_seconds=duration,
-            )
-            await audit.log(
-                actor="system",
-                action="sync.dry_run",
-                entity="sync_run",
-                tenant_id=tenant.id,
-                payload={
-                    "total_products": dry.total_products,
-                    "would_update": dry.would_update,
-                    "skipped_unresolved_stock": dry.skipped_unresolved_stock,
-                    "scanned": dry.detail.get("scanned"),
-                    "mode": "full",
-                    "snapshot_id": meta.id,
-                },
-            )
-            return {"dry_run": True, "mode": "full", "report": asdict(dry), "snapshot": info}
-
-        if isinstance(result, NeedsConfirmation):
-            outcome = {
-                "status": "needs_confirmation",
-                "reason": result.reason,
-                "snapshot_id": meta.id,
-                "zero_count": result.zero_count,
-                "matched_count": result.matched_count,
-                "threshold": result.threshold,
-                "at": _now().isoformat(),
-                "trigger": trigger,
-            }
-            repeated = await _record_push_outcome(state, tenant.id, outcome, previous_outcome)
-            log = logger.debug if repeated else logger.warning
-            log(
-                "sync_run_needs_confirmation",
-                tenant_slug=tenant.slug,
-                tenant_id=tenant.id,
-                reason=result.reason,
-                zero_count=result.zero_count,
-                matched_count=result.matched_count,
-                threshold=result.threshold,
-                duration_seconds=duration,
-            )
-            if not repeated:
-                await audit.log(
-                    actor="system",
-                    action="sync.needs_confirmation",
-                    entity="sync_run",
-                    tenant_id=tenant.id,
-                    payload={
-                        "reason": result.reason,
-                        "zero_count": result.zero_count,
-                        "matched_count": result.matched_count,
-                        "threshold": result.threshold,
-                        "report": report,
-                        "snapshot_id": meta.id,
-                    },
-                )
-            # last_sync must NOT advance: nothing was pushed.
-            return {
-                "mode": "full",
-                "scanned": report["scanned"],
-                "report": report,
-                "status": "needs_confirmation",
-                "reason": result.reason,
-                "zero_count": result.zero_count,
-                "matched_count": result.matched_count,
-                "threshold": result.threshold,
-                "snapshot": info,
-            }
-
-        deltas = result
-        # New values WIN over the stored ones: the baseline must advance for
-        # SKUs it already knows (it used to keep the old value for them).
-        await state.set_product_hashes(
-            tenant.id, {**previous, **{delta.sku: str(delta.new_stock) for delta in deltas}}
-        )
-        # last_sync only advances after the full run (including the push)
-        # succeeded end-to-end.
-        await state.set_last_run(tenant.id, run_started_at)
-        await state.clear_last_error(tenant.id, only_prefix=PUSH_ERROR_PREFIX)
-        timings = {
-            "catalog_pull_seconds": meta.timings.get("catalog_pull_seconds"),
-            "stock_fetch_seconds": meta.timings.get("stock_fetch_seconds"),
-            "push_seconds": duration,
-        }
-        summary = {
-            "status": "ok",
-            "matched": len(deltas),
-            "updated": len(deltas),
-            "duration_seconds": duration,
-            "ran_at": run_started_at.isoformat(),
-            "mode": "full",
-            "timings": timings,
-            "catalog_pull": {
-                "rows": meta.rows_pulled,
-                "reported_count": meta.reported_count,
-                "complete": meta.complete,
-                "pages": meta.pages,
-                "stop_reason": meta.stop_reason,
-                "warnings": meta.warnings,
-                "duration_seconds": meta.timings.get("catalog_pull_seconds"),
-            },
-            "scanned": report["scanned"],
-            "report": report,
-            "snapshot": info,
-            "trigger": trigger,
-        }
-        await state.set_last_run_summary(tenant.id, summary)
-        # Under its own history key: a push takes seconds, and recording it
-        # with the pulls would collapse the pull interval floor.
-        await state.record_run_duration(tenant.id, duration, PUSH_MODE)
-        await state.set_last_push_outcome(
-            tenant.id,
-            {
-                "status": "ok",
-                "snapshot_id": meta.id,
-                "updated": len(deltas),
-                "duration_seconds": duration,
-                "at": _now().isoformat(),
-                "trigger": trigger,
-            },
-        )
-        logger.info(
-            "sync_run_completed",
-            tenant_slug=tenant.slug,
-            tenant_id=tenant.id,
-            matched=len(deltas),
-            updated=len(deltas),
-            duration_seconds=duration,
-            snapshot_id=meta.id,
-        )
-        await audit.log(
-            actor="system",
-            action="sync.completed",
-            entity="sync_run",
-            tenant_id=tenant.id,
-            payload={
-                "matched": len(deltas),
-                "updated": len(deltas),
-                "scanned": report["scanned"],
-                "mode": "full",
-                "snapshot_id": meta.id,
-                "trigger": trigger,
-            },
-        )
-        return {
-            "status": "ok",
-            "mode": "full",
-            "synced_deltas": len(deltas),
-            "timings": timings,
-            "scanned": report["scanned"],
-            "report": report,
-            "snapshot": info,
-        }
-    finally:
-        await storefront.aclose()
 
 
 # -- RECONCILE ----------------------------------------------------------------
@@ -700,21 +370,22 @@ async def do_reconcile(
     force: bool = False,
     progress: ProgressFn | None = None,
     trigger: str = "scheduled",
+    pinned: PinnedSnapshot | None = None,
 ) -> dict[str, Any]:
-    """Compare Shopify's REAL quantities with the current snapshot and push
-    every SKU that differs, ignoring the stored baseline. Never calls BIMS.
+    """Write stock: compare Shopify's REAL quantities with the current snapshot and
+    write every SKU that differs. The only stock write path. Never calls BIMS.
 
     * ``reconcile_declined``: no usable snapshot (missing, incomplete, stale),
       judged before Shopify is read and again right before anything is written
       (reading a whole catalog takes a while). Shopify is not touched.
-    * ``needs_confirmation``: the same mass-zero / max-changed guard as the
-      push fired; nothing was written, the drift is still reported.
+    * ``needs_confirmation``: the mass-zero / max-changed guard fired; nothing was
+      written, the drift is still reported.
     * ``ok``: ``drift`` says how many SKUs had drifted, by how much, with a
-      bounded sample. The baseline is then refreshed from what Shopify now
-      holds, so the cheap incremental pushes that follow work from truth.
+      bounded sample. It is the health number of the cycle: it should sit near zero.
 
-    ``force`` is the operator override of the guard, as for the push. The
-    caller holds the tenant's push lock (see ``bims_shopify.sync_locks``).
+    ``force`` is the operator override of the guard. ``pinned`` is the snapshot a write
+    cycle fixed for all its passes (default: the current one). The caller holds the tenant's
+    write lock (see ``bims_shopify.sync_locks``).
     """
     if tenant.id is None:
         raise ValueError("tenant must be persisted before reconciling")
@@ -722,7 +393,7 @@ async def do_reconcile(
     audit = SqlAlchemyAuditLogger(session)
     snapshots = SqlAlchemySnapshotRepository(session)
     now = _now()
-    meta = await snapshots.get_current_meta(tenant.id)
+    meta = pinned.meta if pinned is not None else await snapshots.get_current_meta(tenant.id)
 
     async def decline(at_meta: SnapshotMeta | None, verdict: tuple[str, dict[str, Any]]) -> dict:
         reason, detail = verdict
@@ -760,7 +431,8 @@ async def do_reconcile(
     if meta is None:  # unreachable: snapshot_decline reports a missing snapshot
         raise RuntimeError("reconcile reached the snapshot read without a snapshot")
 
-    snapshot = await snapshots.load(meta)
+    snapshot = pinned.snapshot if pinned is not None else await snapshots.load(meta)
+    assert snapshot is not None
     storefront = ShopifyClient(tenant)
     try:
         use_case = ReconcileInventory(SnapshotERPAdapter(snapshot), storefront)
@@ -820,13 +492,39 @@ async def do_reconcile(
 
         duration = time.perf_counter() - clock
         drift = _drift_summary(report)
-        base = {"drift": drift, "report": report, "snapshot": info, "scanned": report["scanned"]}
+        # The pull's phase durations travel with the snapshot this run read, next to its own.
+        timings = {
+            "catalog_pull_seconds": meta.timings.get("catalog_pull_seconds"),
+            "stock_fetch_seconds": meta.timings.get("stock_fetch_seconds"),
+            "reconcile_seconds": duration,
+        }
+        base = {
+            "mode": "reconcile",
+            "timings": timings,
+            "drift": drift,
+            "report": report,
+            "snapshot": info,
+            "scanned": report["scanned"],
+        }
 
         if dry_run:
+            await audit.log(
+                actor="system",
+                action="sync.dry_run",
+                entity="sync_run",
+                tenant_id=tenant.id,
+                payload={
+                    "would_update": len(plan.to_push),
+                    "drift": drift,
+                    "scanned": report["scanned"],
+                    "guard_fired": isinstance(result, NeedsConfirmation),
+                    "snapshot_id": meta.id,
+                    "mode": "reconcile",
+                },
+            )
             # The guard is evaluated in a dry run too: its numbers are in the report.
             return {
                 "dry_run": True,
-                "mode": "reconcile",
                 "would_update": len(plan.to_push),
                 "guard_fired": isinstance(result, NeedsConfirmation),
                 **base,
@@ -881,18 +579,36 @@ async def do_reconcile(
                 **base,
             }
 
-        # Refresh the baseline from what Shopify now holds: the SKUs we just
-        # wrote and the ones verified already right. Same value format as the
-        # push, so its next diff starts from truth.
-        previous = await state.get_product_hashes(tenant.id)
-        refreshed = {
-            **previous,
-            **{sku: str(stock) for sku, stock in plan.in_sync.items()},
-            **{d.sku: str(d.new_stock) for d in result},
-        }
-        await state.set_product_hashes(tenant.id, refreshed)
         await state.clear_last_error(tenant.id, only_prefix=RECONCILE_ERROR_PREFIX)
-        await state.record_run_duration(tenant.id, duration, RECONCILE_MODE)
+        await state.record_run_duration(tenant.id, duration, CYCLE_MODE)
+        ran_at = run_started_at
+        # last_run_at only advances after a run that wrote (or verified) everything.
+        await state.set_last_run(tenant.id, ran_at)
+        await state.set_last_run_summary(
+            tenant.id,
+            {
+                "status": "ok",
+                "matched": report["in_sync"]["count"] + drift["count"] + report["no_level"]["pushed"],
+                "updated": len(result),
+                "duration_seconds": duration,
+                "ran_at": ran_at.isoformat(),
+                "mode": "reconcile",
+                "timings": timings,
+                "catalog_pull": {
+                    "rows": meta.rows_pulled,
+                    "reported_count": meta.reported_count,
+                    "complete": meta.complete,
+                    "pages": meta.pages,
+                    "stop_reason": meta.stop_reason,
+                    "warnings": meta.warnings,
+                    "duration_seconds": meta.timings.get("catalog_pull_seconds"),
+                },
+                "drift": drift,
+                "scanned": report["scanned"],
+                "snapshot": info,
+                "trigger": trigger,
+            },
+        )
         no_level = report["no_level"]
         await state.set_last_reconcile_outcome(
             tenant.id,
@@ -926,19 +642,23 @@ async def do_reconcile(
             updated=len(result),
             duration_seconds=duration,
         )
-        await audit.log(
-            actor="system",
-            action="sync.reconcile_completed",
-            entity="sync_run",
-            tenant_id=tenant.id,
-            payload={
-                "drift": drift,
-                "updated": len(result),
-                "scanned": report["scanned"],
-                "snapshot_id": meta.id,
-                "trigger": trigger,
-            },
-        )
+        if drift["count"] or result or trigger != "scheduled":
+            # A scheduled cycle that found nothing to fix is recorded in the outcome above
+            # (every cycle), not in the audit log: one entry per ten-minute cycle would bury
+            # the real ones. A manual run is always audited.
+            await audit.log(
+                actor="system",
+                action="sync.reconcile_completed",
+                entity="sync_run",
+                tenant_id=tenant.id,
+                payload={
+                    "drift": drift,
+                    "updated": len(result),
+                    "scanned": report["scanned"],
+                    "snapshot_id": meta.id,
+                    "trigger": trigger,
+                },
+            )
         return {"status": "ok", "updated": len(result), **base}
     finally:
         await storefront.aclose()
@@ -1015,8 +735,8 @@ async def _stage_verdict(
 ) -> tuple[str, dict[str, Any]] | None:
     """Why a catalog-writing stage must not act now, or ``None`` when it may.
 
-    The same snapshot rules the push applies (missing, incomplete, stale), plus:
-    the push's mass-zero / max-changed guard having fired on this very
+    The same snapshot rules the stock pass applies (missing, incomplete, stale), plus:
+    the stock pass's mass-zero / max-changed guard having fired on this very
     snapshot (a snapshot that looks wrong must not create or publish anything),
     and, for the create stage, a SKU field the import cannot name variants after.
     """
@@ -1024,13 +744,13 @@ async def _stage_verdict(
     if verdict is None and sku_field:
         verdict = sku_field_decline(tenant)
     if verdict is None and meta is not None:
-        push = await state.get_last_push_outcome(tenant.id)
+        stock = await state.get_last_reconcile_outcome(tenant.id)
         if (
-            push is not None
-            and push.get("status") == "needs_confirmation"
-            and push.get("snapshot_id") == meta.id
+            stock is not None
+            and stock.get("status") == "needs_confirmation"
+            and stock.get("snapshot_id") == meta.id
         ):
-            verdict = (DECLINE_PUSH_GUARD, {"snapshot_id": meta.id, "push_reason": push.get("reason")})
+            verdict = (DECLINE_STOCK_GUARD, {"snapshot_id": meta.id, "guard_reason": stock.get("reason")})
     return verdict
 
 
@@ -1039,6 +759,7 @@ async def do_create_missing(
     session: AsyncSession,
     *,
     trigger: str = "scheduled",
+    pinned: PinnedSnapshot | None = None,
 ) -> dict[str, Any]:
     """Stage 1 of the scheduled cycle: create what BIMS has in stock and the store lacks.
 
@@ -1047,7 +768,7 @@ async def do_create_missing(
     * ``disabled``: the tenant switched ``auto_create_missing`` off. Nothing is
       read, written or recorded.
     * ``declined``: no usable snapshot (missing, incomplete, stale), a SKU
-      field the import cannot name variants after, or the push's mass-zero
+      field the import cannot name variants after, or the stock pass's mass-zero
       guard fired on this very snapshot (a snapshot that looks wrong creates
       nothing). Shopify is not touched.
     * ``unchanged``: this snapshot was already handled.
@@ -1057,8 +778,8 @@ async def do_create_missing(
       a store that has a real catalog; nothing is written.
     * ``ok``: products created / variants added, conflicts recorded.
 
-    The caller holds the tenant's push lock (the stage writes to the catalog
-    the push and the reconcile read).
+    The caller holds the tenant's write lock (the stage writes to the catalog
+    the stock pass reads).
     """
     if tenant.id is None:
         raise ValueError("tenant must be persisted before creating products")
@@ -1068,7 +789,7 @@ async def do_create_missing(
     audit = SqlAlchemyAuditLogger(session)
     snapshots = SqlAlchemySnapshotRepository(session)
     now = _now()
-    meta = await snapshots.get_current_meta(tenant.id)
+    meta = pinned.meta if pinned is not None else await snapshots.get_current_meta(tenant.id)
     prior = (await state.get_last_heal_outcome(tenant.id) or {}).get(STAGE_CREATE)
 
     verdict = await _stage_verdict(tenant, state, meta, now, sku_field=True)
@@ -1085,7 +806,8 @@ async def do_create_missing(
     ):
         return {"status": "unchanged", "snapshot_id": meta.id}
 
-    snapshot = await snapshots.load(meta)
+    snapshot = pinned.snapshot if pinned is not None else await snapshots.load(meta)
+    assert snapshot is not None
     groups = eligible_groups(snapshot)
     index = await state.get_shopify_sku_index(tenant.id)
     clock = time.perf_counter()
@@ -1119,15 +841,6 @@ async def do_create_missing(
 
     if result.new_index is not None:
         await state.set_shopify_sku_index(tenant.id, result.new_index)
-    if result.written_skus:
-        # The push baseline remembers a stock for SKUs that were not in Shopify
-        # (the push records every delta, matched or not). A just-created variant
-        # starts at zero in Shopify, so it must look NEW to the next push or it
-        # would be judged "unchanged" and never receive its stock.
-        baseline = await state.get_product_hashes(tenant.id)
-        await state.set_product_hashes(
-            tenant.id, {k: v for k, v in baseline.items() if k not in result.written_skus}
-        )
     outcome = {
         "status": result.status,
         "snapshot_id": meta.id,
@@ -1170,6 +883,7 @@ async def do_publish(
     *,
     trigger: str = "scheduled",
     force: bool = False,
+    pinned: PinnedSnapshot | None = None,
 ) -> dict[str, Any]:
     """Stage 3 of the scheduled cycle: publish the drafts that pass the publish gates.
 
@@ -1179,14 +893,14 @@ async def do_publish(
     * ``disabled``: the tenant switched ``auto_publish`` off. Nothing is read,
       written or recorded.
     * ``declined``: same refusals as the create stage (no usable snapshot, or
-      the push guard fired on this snapshot). Shopify is not touched.
+      the stock guard fired on this snapshot). Shopify is not touched.
     * ``unchanged``: this snapshot was already handled and ``force`` is not set.
       The caller forces a run when a stage just created products, because new
       products are drafts waiting for exactly this.
     * ``noop``: no draft qualifies. Costs the draft listing and nothing else.
     * ``ok``: drafts activated and put on the Online Store channel.
 
-    The caller holds the tenant's push lock.
+    The caller holds the tenant's write lock.
     """
     if tenant.id is None:
         raise ValueError("tenant must be persisted before publishing")
@@ -1196,7 +910,7 @@ async def do_publish(
     audit = SqlAlchemyAuditLogger(session)
     snapshots = SqlAlchemySnapshotRepository(session)
     now = _now()
-    meta = await snapshots.get_current_meta(tenant.id)
+    meta = pinned.meta if pinned is not None else await snapshots.get_current_meta(tenant.id)
     prior = (await state.get_last_heal_outcome(tenant.id) or {}).get(STAGE_PUBLISH)
 
     verdict = await _stage_verdict(tenant, state, meta, now)
@@ -1215,7 +929,8 @@ async def do_publish(
     ):
         return {"status": "unchanged", "snapshot_id": meta.id}
 
-    snapshot = await snapshots.load(meta)
+    snapshot = pinned.snapshot if pinned is not None else await snapshots.load(meta)
+    assert snapshot is not None
     require_images = bool(tenant.field_mappings.get("publish_require_images", True))
     clock = time.perf_counter()
     try:
@@ -1284,7 +999,7 @@ async def _isolated(stage: str, tenant: Tenant, call) -> dict[str, Any]:
     """Run an optional stage so its failure is REPORTED and never stops the cycle.
 
     The stage has already recorded and audited its own failure; a Shopify blip
-    in the create or publish stage must not take the stock push down with it.
+    in the create or publish stage must not take the stock pass down with it.
     """
     try:
         return await call()
@@ -1314,39 +1029,48 @@ def _cycle_counts(create: dict[str, Any], publish: dict[str, Any]) -> dict[str, 
 async def do_cycle(
     tenant: Tenant, session: AsyncSession, *, trigger: str = "scheduled"
 ) -> dict[str, Any]:
-    """The scheduled push cycle: stock, then close the gap between BIMS and the store.
+    """The write cycle, run once per new snapshot: stock, then close the gap between
+    BIMS and the store.
 
-    1. ``do_push``: stock, exactly as before. It runs FIRST so its mass-zero /
-       max-changed guard has judged this snapshot before anything is created: a
-       snapshot the guard flagged creates and publishes nothing.
+    1. ``do_reconcile``: stock. It runs FIRST so its mass-zero / max-changed guard has
+       judged this snapshot before anything is created: a snapshot the guard flagged
+       creates and publishes nothing.
     2. ``do_create_missing`` (switch ``auto_create_missing``): products and
        variants BIMS has in stock and the store lacks. When it wrote anything, a
-       second push runs (never skipped as "unchanged") so the new variants
-       receive their stock, and only then...
+       second stock pass runs so the new variants receive their stock (Shopify holds no
+       level for them, so the pass writes them), and only then...
     3. ``do_publish`` (switch ``auto_publish``): drafts that pass the publish
        gates go live. A product is therefore never public while it shows zero.
 
     The optional stages are isolated: one failing is reported under its own key
-    and never stops the others or the stock push. A failing ``do_push`` still
-    raises, as it did when the push was the whole tick.
+    and never stops the others or the stock pass. A failing stock pass still raises.
 
-    The caller holds the tenant's push lock for the whole cycle, so a reconcile
-    and a manual sync stand aside exactly as they do for a plain push. In a
-    healthy steady state the stages do nothing: same snapshot, no Shopify call;
-    new snapshot with nothing new, no create call and one draft listing.
+    The snapshot is read once, when the cycle starts, and every stage works from that one:
+    a stock pass takes minutes, and a newer snapshot landing meanwhile must not slip past the
+    guard verdict the first pass gave its predecessor.
+
+    The caller holds the tenant's write lock for the whole cycle, so a manual sync and
+    an on-demand ops command stand aside. Each stock pass reads the whole Shopify
+    catalog; the create and publish stages do nothing (no Shopify call) for a snapshot
+    they already handled.
     """
-    push = await do_push(tenant, session, trigger=trigger)
+    snapshots = SqlAlchemySnapshotRepository(session)
+    meta = await snapshots.get_current_meta(tenant.id)
+    pinned = PinnedSnapshot(meta, await snapshots.load(meta) if meta is not None else None)
+    stock = await do_reconcile(tenant, session, trigger=trigger, pinned=pinned)
     create = await _isolated(
-        STAGE_CREATE, tenant, lambda: do_create_missing(tenant, session, trigger=trigger)
+        STAGE_CREATE,
+        tenant,
+        lambda: do_create_missing(tenant, session, trigger=trigger, pinned=pinned),
     )
     wrote = bool(create.get("written_skus"))
-    push_after_create: dict[str, Any] | None = None
+    stock_after_create: dict[str, Any] | None = None
     if wrote:
-        push_after_create = await do_push(
-            tenant, session, trigger=trigger, skip_unchanged=False
-        )
+        stock_after_create = await do_reconcile(tenant, session, trigger=trigger, pinned=pinned)
     publish = await _isolated(
-        STAGE_PUBLISH, tenant, lambda: do_publish(tenant, session, trigger=trigger, force=wrote)
+        STAGE_PUBLISH,
+        tenant,
+        lambda: do_publish(tenant, session, trigger=trigger, force=wrote, pinned=pinned),
     )
     counts = _cycle_counts(create, publish)
     if any(counts.values()) or create.get("status") == "failed" or publish.get("status") == "failed":
@@ -1359,9 +1083,9 @@ async def do_cycle(
             **counts,
         )
     return {
-        "push": push,
+        "stock": stock,
         "create": create,
-        "push_after_create": push_after_create,
+        "stock_after_create": stock_after_create,
         "publish": publish,
         "counts": counts,
     }
@@ -1391,13 +1115,12 @@ async def do_run_sync(
     force: bool = False,
     progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
-    """Pull now, then push now: the operator's one-shot sync.
+    """Pull now, then reconcile now: the operator's one-shot sync.
 
-    The very same ``do_pull`` and ``do_push`` the scheduler ticks run, in
-    sequence; the only differences are the trigger label and that the push
-    always compares (``skip_unchanged=False``). A pull the sanity guard
-    rejected stops here: pushing the older snapshot is not what a one-shot
-    asked for, and the reason is returned instead.
+    The very same ``do_pull`` and ``do_reconcile`` the scheduler runs, in sequence; the
+    only difference is the trigger label. A pull the sanity guard rejected stops here:
+    writing from the older snapshot is not what a one-shot asked for, and the reason is
+    returned instead.
 
     The caller holds the tenant's locks (see ``bims_shopify.sync_locks``).
     A dry run still refreshes the snapshot: that is a read of BIMS into our own
@@ -1407,18 +1130,17 @@ async def do_run_sync(
     if pull["status"] != "ok":
         return {
             "status": "pull_rejected",
-            "mode": "full",
+            "mode": "reconcile",
             "reason": pull.get("reason"),
             "detail": pull.get("detail"),
             "pull": pull,
         }
-    push = await do_push(
+    result = await do_reconcile(
         tenant,
         session,
         dry_run=dry_run,
         force=force,
-        progress=_staged(progress, "push"),
+        progress=progress,
         trigger="manual",
-        skip_unchanged=False,
     )
-    return {**push, "pull": {"status": "ok", "snapshot": pull["snapshot"], "stats_error": pull.get("stats_error")}}
+    return {**result, "pull": {"status": "ok", "snapshot": pull["snapshot"], "stats_error": pull.get("stats_error")}}

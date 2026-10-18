@@ -247,7 +247,7 @@ async def test_sync_dry_run_and_completed_write_audit(app_ctx):
     entries = await _entries(app)
     actions = [e.action for e in entries]
     assert "sync.dry_run" in actions
-    assert "sync.completed" in actions
+    assert "sync.reconcile_completed" in actions
 
 
 async def test_webhook_order_received_and_push_disabled_write_audit(app_ctx):

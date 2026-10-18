@@ -1,21 +1,23 @@
 """Use case: compare Shopify's REAL inventory with the snapshot and correct it.
 
-The incremental push diffs the snapshot against a stored baseline of what it
-last pushed, not against what Shopify holds. When the two diverge (a push that
-failed halfway, a hand edit in the Shopify admin, a mutation Shopify accepted
-but did not apply, a job killed mid-flight) the SKU looks "already in sync"
-forever. This pass ignores the baseline entirely: it reads the quantity Shopify
-actually has at the tenant's location, and pushes every SKU that differs from
-the snapshot. How many differed, and by how much, is the report's headline:
-a healthy system reconciles to roughly zero.
+This is the ONLY way stock is written. It reads the quantity Shopify actually has at the
+tenant's location, and writes every SKU that differs from the snapshot (BIMS is the
+source of truth, Shopify is the mirror, and every cycle re-verifies the mirror). It
+used to be the slow, occasional second path next to a cheap push that diffed against a
+stored "what we last sent" baseline; that baseline could drift away from Shopify and
+freeze a SKU forever, so it no longer exists. How many SKUs differed, and by how much,
+is the report's headline: a healthy system reconciles to roughly zero, and the number is
+the per-cycle health metric.
 
-Rules shared with the push, on purpose:
+Rules that hold for every write:
 
-* the snapshot is consumed through the same ``ProductLister`` (the stock in it
+* the snapshot is consumed through the ``ProductLister`` port (the stock in it
   was consolidated with ``consolidate_sellable_stock`` when it was pulled; this
   module has no second consolidation);
-* absent BIMS stock is UNKNOWN (``stock is None``) and is never pushed;
-* the same safety guard (``check_safety_guard``) and the same batch writer.
+* absent BIMS stock is UNKNOWN (``stock is None``) and is never written; a SKU BIMS
+  reports as 0 IS written as 0;
+* the safety guard (``check_safety_guard``) runs before any write, and the batch
+  writer is ``push_in_batches``.
 
 Two Shopify facts this pass must not blur: a variant with NO inventory level at
 the location is not a variant holding zero (writing a zero there would invent
@@ -24,7 +26,7 @@ comparison is made on the integer that would be written.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from bims_shopify.application.sync_inventory import (
     NeedsConfirmation,
@@ -64,8 +66,6 @@ class ReconcilePlan:
     report: dict
     #: SKUs to write, already resolved to their inventory item ids.
     to_push: list[InventoryDelta]
-    #: sku -> snapshot stock, for SKUs verified to hold exactly that in Shopify.
-    in_sync: dict[str, float] = field(default_factory=dict)
 
 
 class ReconcileInventory:
@@ -97,7 +97,7 @@ class ReconcileInventory:
         no_level_pushed = 0
         no_level_skipped_zero = 0
         unknown_stock = 0
-        in_sync: dict[str, float] = {}
+        in_sync = 0
         to_push: list[InventoryDelta] = []
 
         for sku, row in shopify.items():
@@ -119,7 +119,7 @@ class ReconcileInventory:
                 to_push.append(self._delta(sku, None, stock, row))
                 continue
             if available == target:
-                in_sync[sku] = stock
+                in_sync += 1
                 continue
             delta = target - available
             total_abs_delta += abs(delta)
@@ -134,7 +134,7 @@ class ReconcileInventory:
         report = {
             "mode": "reconcile",
             "scanned": {"snapshot": len(snapshot_by_sku), "shopify": len(shopify)},
-            "in_sync": {"count": len(in_sync)},
+            "in_sync": {"count": in_sync},
             # The headline: SKUs whose real Shopify quantity differs from the snapshot.
             "drift": {
                 **drift.as_dict(),
@@ -154,7 +154,7 @@ class ReconcileInventory:
             "blocked_by_guard": {"count": 0, "sample": []},
             "guard": None,
         }
-        return ReconcilePlan(report=report, to_push=to_push, in_sync=in_sync)
+        return ReconcilePlan(report=report, to_push=to_push)
 
     @staticmethod
     def _delta(sku: str, previous: float | None, stock: float, row: dict) -> InventoryDelta:
@@ -176,8 +176,7 @@ class ReconcileInventory:
     ) -> list[InventoryDelta] | NeedsConfirmation:
         """Run the safety guard over the plan and write it.
 
-        ``force`` is the operator override of the guard, exactly as for the
-        push. A dry run evaluates the guard and returns what it would write.
+        ``force`` is the operator override of the guard. A dry run evaluates the guard and returns what it would write.
         """
         report = plan.report
         resolved = plan.to_push

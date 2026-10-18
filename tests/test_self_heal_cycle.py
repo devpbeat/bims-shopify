@@ -1,5 +1,5 @@
-"""The scheduled push cycle: push stock, create what is missing, give the new
-variants their stock, publish what qualifies.
+"""The scheduled write cycle: reconcile stock, create what is missing, give the
+new variants their stock, publish what qualifies.
 
 The point of these tests is the whole loop: a size added in BIMS ends up in the
 store WITH its stock and (when it passes the gates) published, with nobody
@@ -28,11 +28,6 @@ async def _state(session_factory, tenant_id):
         return await SqlAlchemySyncStateRepository(session).get_status(tenant_id)
 
 
-async def _set_hashes(session_factory, tenant_id, hashes):
-    async with session_factory() as session:
-        await SqlAlchemySyncStateRepository(session).set_product_hashes(tenant_id, hashes)
-
-
 async def test_a_size_added_in_bims_reaches_the_store_with_its_stock_by_itself(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
@@ -45,21 +40,20 @@ async def test_a_size_added_in_bims_reaches_the_store_with_its_stock_by_itself(m
     assert world.skus() == {"121790", "121791", "121792"}
     assert world.pushed == {"121790": 3, "121791": 2, "121792": 17}
     assert result["create"]["report"]["variants_added"]["variants"] == 1
-    assert result["push"]["status"] == "ok"
-    assert result["push_after_create"]["status"] == "ok"
+    assert result["stock"]["status"] == "ok"
+    assert result["stock_after_create"]["status"] == "ok"
 
 
-async def test_the_new_variant_gets_its_stock_even_if_the_baseline_already_remembers_a_value(migrated_db):
-    """The push records every delta in its baseline, including SKUs that were not
-    in Shopify yet. Without invalidating those, the freshly created variant would
-    look 'unchanged' and sit at zero forever."""
+async def test_the_new_variant_gets_its_stock_because_shopify_holds_no_level_for_it(migrated_db):
+    """There is no remembered "last pushed" value to mislead the second stock
+    pass: it reads what Shopify holds, and a variant created a moment ago has no
+    inventory level, so it gets its stock. The two variants already right are
+    not rewritten."""
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
     await land_catalog(session_factory, tenant, JEANS)
-    await _set_hashes(
-        session_factory, tenant.id, {"121790": "3.0", "121791": "2.0", "121792": "17.0"}
-    )
     world = HealShopify([product(1, "JEANS OTTO RECTO", {"121790": "28", "121791": "29"})])
+    world.levels = {"121790": 3, "121791": 2}
     with world:
         await _cycle(session_factory, tenant)
 
@@ -101,11 +95,13 @@ async def test_a_cycle_with_nothing_to_do_writes_nothing_and_does_not_scan_twice
     await land_catalog(session_factory, tenant, JEANS)
     world = HealShopify([product(1, "JEANS OTTO RECTO", {"121790": "28", "121791": "29", "121792": "30"})])
     with world:
-        await _cycle(session_factory, tenant)  # settles: pushes the stock, learns the SKUs
+        await _cycle(session_factory, tenant)  # settles: writes the stock, learns the SKUs
         world.calls.clear()
 
+        # Every cycle re-verifies the mirror: ONE Shopify read of the catalog's quantities,
+        # and since nothing differs, no write. The stages already judged this snapshot.
         same = await _cycle(session_factory, tenant)
-        assert world.total_calls == 0, world.calls  # same snapshot: not a single Shopify call
+        assert world.calls == {"inventory_read": 1}, world.calls
         assert same["create"]["status"] == "unchanged" and same["publish"]["status"] == "unchanged"
 
         await land_catalog(session_factory, tenant, JEANS)  # a NEW snapshot, same catalog
@@ -113,7 +109,7 @@ async def test_a_cycle_with_nothing_to_do_writes_nothing_and_does_not_scan_twice
         await _cycle(session_factory, tenant)
 
     assert world.write_calls == 0
-    assert world.count("variants_listing") == 1  # the push's scan; the create stage added none
+    assert world.count("inventory_read") == 1  # the stock pass; the create stage added no scan
     assert world.count("products_listing") == 1  # the draft listing: cheap, no publications call
     assert world.count("publications") == 0
 
@@ -129,7 +125,7 @@ async def test_each_stage_can_be_switched_off_per_tenant(migrated_db):
     assert result["create"]["status"] == "disabled" and result["publish"]["status"] == "disabled"
     assert world.product_sets == [] and world.bulk_creates == [] and world.publishes == []
     assert world.count("products_listing") == 0
-    assert result["push"]["status"] == "ok"  # the stock push is not a stage: it always runs
+    assert result["stock"]["status"] == "ok"  # the stock pass is not a stage: it always runs
 
 
 def _draft_with_stock():
@@ -140,18 +136,17 @@ async def test_the_mass_zero_guard_stops_creating_and_publishing_on_that_snapsho
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
     existing = {f"E{i}": f"EXISTING {i} (M)" for i in range(10)}
-    baseline = {sku: "5.0" for sku in existing}
-    await _set_hashes(session_factory, tenant.id, baseline)
     # BIMS "lost" all stock of the existing products, and shows one new product with stock.
     items = [(sku, name, 0.0) for sku, name in existing.items()] + [("N1", "NEW ONE (M)", 4.0)]
     await land_catalog(session_factory, tenant, items)
     world = HealShopify([product(i + 1, f"EXISTING {i}", {f"E{i}": "M"}) for i in range(10)])
     world.products.append(_draft_with_stock())
+    world.levels = {sku: 5 for sku in existing}  # what Shopify really holds
     with world:
         result = await _cycle(session_factory, tenant)
 
-    assert result["push"]["status"] == "needs_confirmation"
-    assert result["create"]["status"] == "declined" and result["create"]["reason"] == "push_guard_fired"
+    assert result["stock"]["status"] == "needs_confirmation"
+    assert result["create"]["status"] == "declined" and result["create"]["reason"] == "stock_guard_fired"
     assert result["publish"]["status"] == "declined"
     assert world.product_sets == [] and world.publishes == [] and world.pushed == {}
 
@@ -176,7 +171,7 @@ async def test_a_failing_create_does_not_stop_the_stock_push_or_the_publish(migr
     with world:
         result = await _cycle(session_factory, tenant)
 
-    assert result["push"]["status"] == "ok" and world.pushed["A"] == 5
+    assert result["stock"]["status"] == "ok" and world.pushed["A"] == 5
     assert result["create"]["report"]["failed"]["count"] == 1
     assert result["publish"]["status"] in ("ok", "noop")
 
@@ -198,7 +193,7 @@ async def test_a_stage_that_blows_up_is_reported_not_raised(migrated_db, monkeyp
     with world:
         result = await _cycle(session_factory, tenant)
 
-    assert result["push"]["status"] == "ok"
+    assert result["stock"]["status"] == "ok"
     assert result["create"]["status"] == "failed" and "exploded" in result["create"]["error"]
     outcome = (await _state(session_factory, tenant.id))["last_heal_outcome"]["create"]
     assert outcome["status"] == "failed"
@@ -212,3 +207,35 @@ async def test_the_cycle_never_calls_bims(migrated_db):
     world = HealShopify()
     with world:
         await _cycle(session_factory, tenant)
+
+
+async def test_every_stage_works_from_the_snapshot_the_cycle_started_with(migrated_db, monkeypatch):
+    """The stock pass takes as long as a pull, so a newer snapshot can land while it runs.
+    The create stage must still be judged by the guard verdict of the snapshot the cycle
+    compared, never act on the newer one the guard has not seen."""
+    from bims_shopify.ops import sync_workers
+
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant()
+    existing = {f"E{i}": f"EXISTING {i} (M)" for i in range(10)}
+    bad = [(sku, name, 0.0) for sku, name in existing.items()]  # BIMS "lost" all stock
+    await land_catalog(session_factory, tenant, bad)
+    world = HealShopify([product(i + 1, f"EXISTING {i}", {f"E{i}": "M"}) for i in range(10)])
+    world.levels = {sku: 5 for sku in existing}
+
+    real_reconcile = sync_workers.do_reconcile
+
+    async def reconcile_then_a_new_snapshot_lands(*args, **kwargs):
+        result = await real_reconcile(*args, **kwargs)
+        # a pull finished meanwhile: a different snapshot, with a new product in stock
+        await land_catalog(session_factory, tenant, [*bad, ("N1", "NEW ONE (M)", 4.0)])
+        return result
+
+    monkeypatch.setattr(sync_workers, "do_reconcile", reconcile_then_a_new_snapshot_lands)
+    with world:
+        result = await _cycle(session_factory, tenant)
+
+    assert result["stock"]["status"] == "needs_confirmation"  # the guard fired on snapshot 1
+    assert result["create"]["status"] == "declined"
+    assert result["create"]["reason"] == "stock_guard_fired"  # not "creating from snapshot 2"
+    assert world.product_sets == [] and world.pushed == {}

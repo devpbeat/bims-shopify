@@ -162,19 +162,19 @@ async def test_it_declines_from_a_snapshot_it_cannot_trust_and_never_touches_sho
     assert (await _state(session_factory, tenant.id))["last_heal_outcome"]["publish"]["reason"] == "incomplete"
 
 
-async def test_it_declines_when_the_push_guard_fired_on_this_snapshot(migrated_db):
+async def test_it_declines_when_the_stock_guard_fired_on_this_snapshot(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
     meta = await land_catalog(session_factory, tenant, [("A", "JEANS (M)", 3.0)])
     async with session_factory() as session:
-        await SqlAlchemySyncStateRepository(session).set_last_push_outcome(
+        await SqlAlchemySyncStateRepository(session).set_last_reconcile_outcome(
             tenant.id, {"status": "needs_confirmation", "snapshot_id": meta.id}
         )
     world = HealShopify([_draft(1, "JEANS", ["A"])])
     with world:
         result = await _publish(session_factory, tenant)
 
-    assert result["status"] == "declined" and result["reason"] == "push_guard_fired"
+    assert result["status"] == "declined" and result["reason"] == "stock_guard_fired"
     assert world.total_calls == 0
 
 

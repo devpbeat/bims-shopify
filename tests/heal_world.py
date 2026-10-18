@@ -54,6 +54,9 @@ class HealShopify:
         self.status_updates: list[tuple[str, str]] = []
         self.publishes: list[str] = []
         self.pushed: dict[str, int] = {}
+        #: What Shopify REALLY holds per SKU at the location (absent: no inventory level).
+        #: Inventory writes update it, so a second stock pass sees the first one's work.
+        self.levels: dict[str, int] = {}
         #: Titles whose productSet answers with a userError.
         self.fail_titles: set[str] = set()
         self.mock = respx.mock(assert_all_called=False)
@@ -97,8 +100,13 @@ class HealShopify:
         if "inventorySetQuantities" in query:
             self._hit("inventory")
             for q in variables["input"]["quantities"]:
-                self.pushed[q["inventoryItemId"].rsplit("/", 1)[-1]] = q["quantity"]
+                sku = q["inventoryItemId"].rsplit("/", 1)[-1]
+                self.pushed[sku] = q["quantity"]
+                self.levels[sku] = q["quantity"]
             return self._ok({"inventorySetQuantities": {"userErrors": []}})
+        if "ListVariantInventory" in query:
+            self._hit("inventory_read")
+            return self._inventory_read()
         if "ListAllVariants" in query:
             self._hit("variants_listing")
             return self._variants_listing()
@@ -139,6 +147,30 @@ class HealShopify:
                         "product": {"id": p["id"], "title": p["title"]},
                         "inventoryItem": {"id": f"gid://shopify/InventoryItem/{v['sku']}", "tracked": True},
                         "selectedOptions": options,
+                    }
+                )
+        return self._ok(
+            {"productVariants": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}
+        )
+
+    def _inventory_read(self) -> httpx.Response:
+        nodes = []
+        for p in self.products:
+            for v in p["variants"]:
+                quantity = self.levels.get(v["sku"])
+                level = (
+                    None
+                    if quantity is None
+                    else {"quantities": [{"name": "available", "quantity": quantity}]}
+                )
+                nodes.append(
+                    {
+                        "id": f"gid://shopify/ProductVariant/{v['sku']}",
+                        "sku": v["sku"],
+                        "inventoryItem": {
+                            "id": f"gid://shopify/InventoryItem/{v['sku']}",
+                            "inventoryLevel": level,
+                        },
                     }
                 )
         return self._ok(

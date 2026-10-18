@@ -3,7 +3,7 @@
 The metadata is how an operator tells "the pull is healthy" from "the pull has
 been rejected for two days": when the current snapshot was finished, how many
 rows it holds, whether BIMS said it was complete, how long each phase took,
-and what the last pull and push attempts did.
+and what the last pull and write cycle did.
 """
 from __future__ import annotations
 
@@ -104,7 +104,8 @@ async def test_snapshot_endpoint_without_a_snapshot_says_so(ctx):
     assert response.status_code == 200
     body = response.json()
     assert body["current"] is None and body["history"] == []
-    assert body["last_pull"] is None and body["last_push"] is None
+    assert body["last_pull"] is None and body["last_reconcile"] is None
+    assert "last_push" not in body
 
 
 async def test_snapshot_endpoint_unknown_tenant_is_404(ctx):
@@ -120,7 +121,6 @@ async def test_snapshot_endpoint_exposes_metadata_age_history_and_worker_outcome
     async with session_factory() as session:
         repo = SqlAlchemySyncStateRepository(session)
         await repo.set_last_pull_outcome(acme.id, {"status": "ok", "at": "2026-10-15T10:00:00+00:00"})
-        await repo.set_last_push_outcome(acme.id, {"status": "declined", "reason": "stale"})
         await repo.set_last_reconcile_outcome(
             acme.id, {"status": "ok", "drift": {"count": 4, "total_abs_delta": 9, "sample": []}}
         )
@@ -134,17 +134,15 @@ async def test_snapshot_endpoint_exposes_metadata_age_history_and_worker_outcome
     assert current["timings"]["catalog_pull_seconds"] == 36.7
     assert 9.5 <= current["age_minutes"] <= 11
     assert current["stats"] == {"bims": {"eligible_products": 5}}
-    assert body["max_age_minutes"] == 120 and body["usable_for_push"] is True
+    assert body["max_age_minutes"] == 120 and body["usable_for_write"] is True
     assert [h["rows_pulled"] for h in body["history"]] == [5, 3]
     assert [h["status"] for h in body["history"]] == ["current", "superseded"]
     assert body["last_pull"]["status"] == "ok"
-    assert body["last_push"]["reason"] == "stale"
+    assert "last_push" not in body
     assert body["last_reconcile"]["status"] == "ok"
     assert body["last_reconcile"]["drift"]["count"] == 4
     assert body["settings"] == {
-        "pull_interval_minutes": 30,
-        "push_interval_minutes": 5,
-        "reconcile_interval_minutes": 480,
+        "pull_min_gap_seconds": 60,
         "snapshot_max_age_minutes": 120,
         "pull_max_drop_ratio": 0.3,
         "auto_create_missing": True,
@@ -152,15 +150,15 @@ async def test_snapshot_endpoint_exposes_metadata_age_history_and_worker_outcome
     }
 
 
-async def test_snapshot_endpoint_flags_a_snapshot_the_push_would_decline(ctx):
+async def test_snapshot_endpoint_flags_a_snapshot_the_write_cycle_would_decline(ctx):
     app, session_factory, acme = ctx
     await _land(session_factory, acme.id, 3, finished_ago=timedelta(hours=5))
     body = (await _get(app, "/sync/acme/snapshot")).json()
-    assert body["usable_for_push"] is False
+    assert body["usable_for_write"] is False
     assert body["decline"]["reason"] == "stale"
 
 
-async def test_sync_status_carries_both_worker_outcomes(ctx):
+async def test_sync_status_carries_the_pull_outcome_and_no_push_outcome(ctx):
     app, session_factory, acme = ctx
     async with session_factory() as session:
         await SqlAlchemySyncStateRepository(session).set_last_pull_outcome(
@@ -168,7 +166,7 @@ async def test_sync_status_carries_both_worker_outcomes(ctx):
         )
     body = (await _get(app, "/sync/acme/status")).json()
     assert body["last_pull_outcome"]["reason"] == "too_few_rows"
-    assert body["last_push_outcome"] is None
+    assert "last_push_outcome" not in body
 
 
 async def test_dashboard_shows_the_snapshot_and_the_worker_outcomes(ctx):
@@ -189,7 +187,7 @@ async def test_dashboard_shows_the_snapshot_and_the_worker_outcomes(ctx):
     assert body["snapshot"]["complete"] is True
     assert 19 <= body["snapshot"]["age_minutes"] <= 21
     assert body["workers"]["pull"]["status"] == "ok"
-    assert body["workers"]["push"] is None
+    assert body["workers"]["write"] is None and "push" not in body["workers"]
 
 
 async def test_dashboard_hint_points_at_the_pull_not_at_a_manual_status_run(ctx):
@@ -214,19 +212,22 @@ async def test_snapshot_endpoint_has_no_reconcile_outcome_before_the_first_one(c
     app, _session_factory, _acme = ctx
     body = (await _get(app, "/sync/acme/snapshot")).json()
     assert body["last_reconcile"] is None
-    assert body["last_push"] is None  # the two outcomes never share a slot
 
 
-async def test_sync_status_carries_the_reconcile_outcome_and_interval(ctx):
+async def test_sync_status_carries_the_write_outcome_and_its_skips(ctx):
     app, session_factory, acme = ctx
     async with session_factory() as session:
         await SqlAlchemySyncStateRepository(session).set_last_reconcile_outcome(
-            acme.id, {"status": "needs_confirmation", "drift": {"count": 800}}
+            acme.id,
+            {
+                "status": "needs_confirmation",
+                "drift": {"count": 800},
+                "last_skip": {"status": "skipped", "skipped_total": 3},
+            },
         )
     body = (await _get(app, "/sync/acme/status")).json()
     assert body["last_reconcile_outcome"]["drift"]["count"] == 800
-    interval = body["reconcile_interval"]
-    assert interval["configured_minutes"] == 480 and interval["min_safe_minutes"] == 60
+    assert body["last_reconcile_outcome"]["last_skip"]["skipped_total"] == 3
 
 
 async def test_snapshot_endpoint_reports_what_each_self_healing_stage_did(ctx):

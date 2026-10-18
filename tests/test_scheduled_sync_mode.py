@@ -5,7 +5,7 @@ since the pull/push split a partial pull cannot replace the persisted snapshot
 (stock changes do not touch a product's `last_update`, so the unchanged rows
 would keep stale stock). The pull therefore ignores `sync_mode`: a tenant
 stored as `incremental` still pulls everything. The watermark itself is still
-recorded after every successful push.
+recorded after every successful write cycle.
 """
 from __future__ import annotations
 
@@ -29,12 +29,14 @@ from bims_shopify.adapters.persistence.sync_state_repository import (
 from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
 from bims_shopify.config import Settings
 from bims_shopify.domain.tenant import SyncMode, Tenant
-from bims_shopify.main import _make_pull_fn, _make_push_fn
+from bims_shopify.main import _make_cycle_fn, _make_pull_fn
+from tests.sync_world import inventory_response
 
 async def _scheduled_cycle(session_factory, tenant: Tenant) -> None:
-    """One pull tick followed by one push tick, as the scheduler runs them."""
-    await _make_pull_fn(session_factory)(tenant)
-    await _make_push_fn(session_factory)(tenant)
+    """One pull followed by the write cycle its new snapshot triggers, as the scheduler runs them."""
+    landed = await _make_pull_fn(session_factory)(tenant)
+    assert landed is True
+    await _make_cycle_fn(session_factory)(tenant)
 
 
 GRAPHQL = "https://acme.myshopify.com/admin/api/2025-07/graphql.json/"
@@ -126,9 +128,10 @@ def _bims_product(i: int, sku: str) -> dict:
     }
 
 
-def _mock_world(stocks: dict[str, float]):
-    """BIMS returns one product per SKU with the given stock; Shopify has a
-    variant for each. Returns (respx mock, list of inventorySetQuantities calls)."""
+def _mock_world(stocks: dict[str, float], levels: dict[str, int] | None = None):
+    """BIMS returns one product per SKU with the given stock; Shopify has a variant for each,
+    holding ``levels`` (default: no inventory level yet). Returns (respx mock, list of
+    inventorySetQuantities calls)."""
     pushes: list[str] = []
     skus = list(stocks)
 
@@ -147,6 +150,8 @@ def _mock_world(stocks: dict[str, float]):
                     }
                 },
             )
+        if "ListVariantInventory" in body:
+            return httpx.Response(200, json=inventory_response(skus, dict(levels or {})))
         return httpx.Response(200, json=_variants(*skus))
 
     mock = respx.mock(assert_all_called=False)
@@ -208,7 +213,7 @@ async def test_scheduled_sync_full_sends_no_last_update_but_records_watermark(en
     async with session_factory() as session:
         status = await SqlAlchemySyncStateRepository(session).get_status(tenant.id)
     assert datetime.fromisoformat(status["last_run_at"]) > old  # watermark still recorded
-    assert status["last_run_summary"]["mode"] == "full"
+    assert status["last_run_summary"]["mode"] == "reconcile"
 
 
 async def test_scheduled_sync_ignores_the_legacy_incremental_setting(env):
@@ -225,18 +230,16 @@ async def test_scheduled_sync_ignores_the_legacy_incremental_setting(env):
 
     async with session_factory() as session:
         status = await SqlAlchemySyncStateRepository(session).get_status(tenant.id)
-    assert status["last_run_summary"]["mode"] == "full"
+    assert status["last_run_summary"]["mode"] == "reconcile"
 
 
 async def test_scheduled_full_sync_guard_still_blocks_mass_zero(env):
     session_factory, make_tenant = env
     tenant = await make_tenant()
     skus = [f"SKU{i}" for i in range(10)]
-    async with session_factory() as session:
-        await SqlAlchemySyncStateRepository(session).set_product_hashes(
-            tenant.id, {sku: "5" for sku in skus}
-        )
-    mock, pushes = _mock_world({sku: 0 for sku in skus})  # BIMS suddenly says 0 everywhere
+    mock, pushes = _mock_world(
+        {sku: 0 for sku in skus}, levels={sku: 5 for sku in skus}
+    )  # BIMS suddenly says 0 everywhere, Shopify still holds 5
 
     with mock:
         await _scheduled_cycle(session_factory, tenant)
@@ -244,12 +247,11 @@ async def test_scheduled_full_sync_guard_still_blocks_mass_zero(env):
     assert pushes == []  # nothing reached Shopify
     async with session_factory() as session:
         entry = await SqlAlchemyAuditLogger(session).get_latest(
-            action="sync.needs_confirmation", tenant_id=tenant.id
+            action="sync.reconcile_needs_confirmation", tenant_id=tenant.id
         )
     assert entry is not None
-    assert entry.payload["report"]["guard"]["fired"] is True
-    assert entry.payload["report"]["guard"]["zero_count"] == 10
-    assert entry.payload["report"]["mode"] == "full"
+    assert entry.payload["reason"] == "zero_ratio_exceeded"
+    assert entry.payload["zero_count"] == 10 and entry.payload["drift"]["count"] == 10
 
 
 async def test_needs_confirmation_result_reports_mode(env):
@@ -258,16 +260,12 @@ async def test_needs_confirmation_result_reports_mode(env):
     session_factory, make_tenant = env
     tenant = await make_tenant()
     skus = [f"SKU{i}" for i in range(10)]
-    async with session_factory() as session:
-        await SqlAlchemySyncStateRepository(session).set_product_hashes(
-            tenant.id, {sku: "5" for sku in skus}
-        )
-    mock, _pushes = _mock_world({sku: 0 for sku in skus})
+    mock, _pushes = _mock_world({sku: 0 for sku in skus}, levels={sku: 5 for sku in skus})
     with mock:
         async with session_factory() as session:
             result = await _do_run_sync(tenant, False, session, full=True)
     assert result["status"] == "needs_confirmation"
-    assert result["mode"] == "full"
+    assert result["mode"] == "reconcile" and result["report"]["guard"]["fired"] is True
 
 
 async def test_manual_run_result_is_always_a_full_comparison(env):
@@ -286,10 +284,10 @@ async def test_manual_run_result_is_always_a_full_comparison(env):
             dry = await _do_run_sync(tenant, True, session, full=True)
     # `full=False` used to narrow the pull by the watermark; the flag is now
     # accepted but every run compares the whole catalog.
-    assert incremental["mode"] == "full"
-    assert incremental["scanned"] == {"bims": 1, "shopify": 1}
-    assert full["mode"] == "full"
-    assert dry["mode"] == "full"
+    assert incremental["mode"] == "reconcile"
+    assert incremental["scanned"] == {"snapshot": 1, "shopify": 1}
+    assert full["mode"] == "reconcile"
+    assert dry["mode"] == "reconcile" and dry["dry_run"] is True
 
 
 async def test_completed_runs_record_pull_and_push_durations_separately(env):
@@ -301,7 +299,7 @@ async def test_completed_runs_record_pull_and_push_durations_separately(env):
     async with session_factory() as session:
         repo = SqlAlchemySyncStateRepository(session)
         pulls = await repo.get_recent_durations(tenant.id, "full")
-        pushes = await repo.get_recent_durations(tenant.id, "push")
+        pushes = await repo.get_recent_durations(tenant.id, "reconcile")
         incremental = await repo.get_recent_durations(tenant.id, "incremental")
     assert len(pulls) == 1 and pulls[0] > 0
     assert len(pushes) == 1 and pushes[0] > 0
@@ -320,19 +318,19 @@ async def test_scheduled_workers_swallow_a_tenant_failure_and_record_it(env):
     assert status["last_pull_outcome"]["status"] == "failed"
     assert status["last_error"].startswith("pull: ")
 
-    # The push needs no BIMS at all: with no snapshot it declines, it does not crash.
-    await _make_push_fn(session_factory)(tenant)
+    # The write cycle needs no BIMS at all: with no snapshot it declines, it does not crash.
+    await _make_cycle_fn(session_factory)(tenant)
     async with session_factory() as session:
         status = await SqlAlchemySyncStateRepository(session).get_status(tenant.id)
-    assert status["last_push_outcome"]["reason"] == "missing"
+    assert status["last_reconcile_outcome"]["reason"] == "missing"
 
 
-async def test_scheduled_pull_then_push_chain_works_without_the_pull_waiting_on_the_push(env):
+async def test_scheduled_pull_then_write_cycle_chain_works_without_the_pull_waiting_on_the_cycle(env):
     session_factory, make_tenant = env
     tenant = await make_tenant()
     mock, pushes = _mock_world({"SKU1": 5})
     with mock:
         await _make_pull_fn(session_factory)(tenant)
         assert pushes == []  # the pull alone never writes to Shopify
-        await _make_push_fn(session_factory)(tenant)
+        await _make_cycle_fn(session_factory)(tenant)
     assert len(pushes) == 1

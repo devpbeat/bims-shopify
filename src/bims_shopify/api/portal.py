@@ -503,7 +503,7 @@ async def get_portal_dashboard(
         }
 
     last_push_entries = await audit_repo.list_recent_by_action(
-        action="sync.completed", tenant_id=tenant.id, limit=50
+        action="sync.reconcile_completed", tenant_id=tenant.id, limit=50
     )
     last_push = None
     for entry in last_push_entries:
@@ -534,7 +534,7 @@ async def get_portal_dashboard(
         "snapshot": snapshot,
         "workers": {
             "pull": status.get("last_pull_outcome"),
-            "push": status.get("last_push_outcome"),
+            "write": status.get("last_reconcile_outcome"),
         },
         "last_error": status.get("last_error"),
         "last_error_at": status.get("last_error_at"),

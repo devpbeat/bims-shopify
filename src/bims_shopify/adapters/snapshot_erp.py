@@ -9,14 +9,14 @@ from bims_shopify.domain.tenant import Tenant
 
 
 class SnapshotERPAdapter:
-    """Serves the products of one loaded snapshot to ``SyncInventoryToShopify``.
+    """Serves the products of one loaded snapshot to ``ReconcileInventory``.
 
     Eligibility and the absent-stock rule come from ``resolve_product_snapshots``,
     the same function the live adapter uses: a SKU with no stock record is
-    UNKNOWN (``stock=None``) and is never pushed as zero.
+    UNKNOWN (``stock=None``) and is never written as zero.
 
     ``since`` is accepted for protocol compatibility and ignored: a snapshot is
-    always the whole catalog, so the push always compares everything.
+    always the whole catalog, so every cycle compares everything.
     """
 
     def __init__(self, snapshot: CatalogSnapshot) -> None:

@@ -1,6 +1,7 @@
-"""do_reconcile: compare Shopify's REAL quantities with the snapshot and push
-every SKU that differs, ignoring the stored baseline. Same safety rules as the
-push: guard, unknown stays unknown, no usable snapshot -> decline."""
+"""do_reconcile: THE write path for stock. Compare Shopify's REAL quantities with
+the snapshot and write every SKU that differs. There is no stored "last pushed"
+baseline to drift away from Shopify. Safety rules: mass-zero guard, unknown
+stays unknown, no usable snapshot -> decline."""
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -9,7 +10,7 @@ import pytest
 
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.sync_state_repository import SqlAlchemySyncStateRepository
-from bims_shopify.ops.sync_workers import do_push, do_reconcile
+from bims_shopify.ops.sync_workers import do_reconcile
 from tests.sync_world import ShopifyWorld, land_snapshot
 
 
@@ -18,42 +19,24 @@ async def _reconcile(session_factory, tenant, **kwargs):
         return await do_reconcile(tenant, session, **kwargs)
 
 
-async def _push(session_factory, tenant, **kwargs):
-    async with session_factory() as session:
-        return await do_push(tenant, session, **kwargs)
-
-
 async def _state(session_factory, tenant_id):
     async with session_factory() as session:
         return await SqlAlchemySyncStateRepository(session).get_status(tenant_id)
 
 
-async def _hashes(session_factory, tenant_id):
-    async with session_factory() as session:
-        return await SqlAlchemySyncStateRepository(session).get_product_hashes(tenant_id)
+# -- the old frozen-SKU bug cannot exist ---------------------------------------
 
 
-async def _set_hashes(session_factory, tenant_id, hashes):
-    async with session_factory() as session:
-        await SqlAlchemySyncStateRepository(session).set_product_hashes(tenant_id, hashes)
-
-
-# -- the reported bug -------------------------------------------------------------
-
-
-async def test_reconcile_corrects_a_sku_the_baseline_wrongly_says_is_in_sync(migrated_db):
-    """Regression: the push diffs against what it LAST PUSHED, so a SKU that
-    drifted in Shopify (hand edit, half-failed push, ignored mutation) was
-    frozen forever. Reconcile compares against what Shopify actually holds."""
+async def test_a_drifted_sku_is_corrected_with_no_stored_state_to_mislead_it(migrated_db):
+    """Regression for the bug the baseline caused: a SKU that drifted in Shopify (hand
+    edit, half-failed write, ignored mutation) was frozen forever because the old
+    write path compared the snapshot with what it LAST SENT. Every cycle now compares
+    with what Shopify actually holds."""
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
     await land_snapshot(session_factory, tenant, {"A": 5, "B": 3})
-    await _set_hashes(session_factory, tenant.id, {"A": "5", "B": "3"})  # baseline: in sync
-    world = ShopifyWorld(["A", "B"], levels={"A": 2, "B": 3})  # but Shopify drifted on A
+    world = ShopifyWorld(["A", "B"], levels={"A": 2, "B": 3})
     with world:
-        pushed = await _push(session_factory, tenant, skip_unchanged=False)
-        assert pushed["synced_deltas"] == 0 and world.write_calls == 0  # the bug: frozen
-
         result = await _reconcile(session_factory, tenant)
 
     assert result["status"] == "ok"
@@ -63,21 +46,24 @@ async def test_reconcile_corrects_a_sku_the_baseline_wrongly_says_is_in_sync(mig
     assert world.bims_calls == 0
 
 
-async def test_reconcile_refreshes_the_baseline_from_what_shopify_now_holds(migrated_db):
+async def test_there_is_no_baseline_storage_left_to_resurrect(migrated_db):
+    from bims_shopify.adapters.persistence.models import SyncStateModel
+
+    assert not hasattr(SyncStateModel, "product_hashes")
+    assert not hasattr(SyncStateModel, "last_push_outcome")
+    assert not hasattr(SqlAlchemySyncStateRepository, "get_product_hashes")
+    assert not hasattr(SqlAlchemySyncStateRepository, "set_product_hashes")
+
+
+async def test_an_ignored_mutation_cannot_freeze_a_sku_it_is_retried_every_cycle(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
-    await land_snapshot(session_factory, tenant, {"A": 5, "B": 3, "C": 9})
-    # A: baseline right, Shopify wrong. B: baseline WRONG, Shopify right. C: unknown to baseline.
-    await _set_hashes(session_factory, tenant.id, {"A": "5", "B": "1", "OLD": "4"})
-    world = ShopifyWorld(["A", "B", "C"], levels={"A": 2, "B": 3, "C": 0})
+    await land_snapshot(session_factory, tenant, {"A": 5})
+    world = ShopifyWorld(["A"], levels={"A": 2}, ignore_writes=True)
     with world:
-        await _reconcile(session_factory, tenant)
-        # the cheap incremental push that follows now has nothing to do
-        follow_up = await _push(session_factory, tenant, skip_unchanged=False)
-
-    hashes = await _hashes(session_factory, tenant.id)
-    assert {k: float(v) for k, v in hashes.items()} == {"A": 5.0, "B": 3.0, "C": 9.0, "OLD": 4.0}
-    assert follow_up["synced_deltas"] == 0
+        for _ in range(3):
+            await _reconcile(session_factory, tenant)
+    assert world.write_calls == 3  # never "remembered as sent": it is written again each cycle
 
 
 # -- drift report -----------------------------------------------------------------
@@ -117,28 +103,44 @@ async def test_a_healthy_system_reconciles_to_zero_drift_and_writes_nothing(migr
     assert world.write_calls == 0
 
 
-async def test_the_outcome_is_recorded_apart_from_the_push_outcome(migrated_db):
+async def test_the_outcome_summary_and_duration_are_recorded_every_cycle(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
     await land_snapshot(session_factory, tenant, {"A": 5})
     world = ShopifyWorld(["A"], levels={"A": 1})
     with world:
-        await _push(session_factory, tenant, skip_unchanged=False)  # a push outcome exists
-        push_outcome = (await _state(session_factory, tenant.id))["last_push_outcome"]
-        world.levels["A"] = 1  # drift again after the push
         await _reconcile(session_factory, tenant)
 
     state = await _state(session_factory, tenant.id)
-    assert state["last_push_outcome"] == push_outcome  # untouched
     outcome = state["last_reconcile_outcome"]
     assert outcome["status"] == "ok" and outcome["trigger"] == "scheduled"
     assert outcome["drift"]["count"] == 1 and outcome["drift"]["sample"][0]["sku"] == "A"
     assert outcome["updated"] == 1 and outcome["snapshot_id"] is not None
+    # What the dashboard reads
+    assert state["last_run_at"] is not None
+    summary = state["last_run_summary"]
+    assert summary["status"] == "ok" and summary["updated"] == 1 and summary["ran_at"]
     async with session_factory() as session:
+        repo = SqlAlchemySyncStateRepository(session)
+        assert len(await repo.get_recent_durations(tenant.id, "reconcile")) == 1
+        assert await repo.get_recent_durations(tenant.id, "full") == []
         audits = await SqlAlchemyAuditLogger(session).list_recent_by_action(
             action="sync.reconcile_completed", tenant_id=tenant.id, limit=5
         )
-    assert audits and audits[0].payload["drift"]["count"] == 1
+    assert audits and audits[0].payload["drift"]["count"] == 1 and audits[0].payload["updated"] == 1
+
+
+async def test_drift_is_reported_every_cycle_and_returns_to_zero_once_written(migrated_db):
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant()
+    await land_snapshot(session_factory, tenant, {"A": 5, "B": 6})
+    world = ShopifyWorld(["A", "B"], levels={"A": 0, "B": 6})
+    with world:
+        first = await _reconcile(session_factory, tenant)
+        second = await _reconcile(session_factory, tenant)
+    assert first["drift"]["count"] == 1 and second["drift"]["count"] == 0
+    outcome = (await _state(session_factory, tenant.id))["last_reconcile_outcome"]
+    assert outcome["drift"]["count"] == 0  # the per-cycle health number is the latest one
 
 
 # -- no level vs zero, unknown stock ---------------------------------------------
@@ -188,6 +190,52 @@ async def test_absent_bims_stock_is_unknown_and_never_pushed_as_zero(migrated_db
     assert result["drift"]["count"] == 0
 
 
+async def test_a_sku_bims_reports_as_zero_is_pushed_as_zero(migrated_db):
+    """The operator's rule: BIMS is the source of truth. If BIMS says there is
+    nothing, Shopify is told there is nothing."""
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant()
+    live = {f"L{i}": 9 for i in range(9)}  # enough real changes to stay under the zero guard
+    await land_snapshot(session_factory, tenant, {**live, "SOLD_OUT": 0})
+    world = ShopifyWorld(
+        [*live, "SOLD_OUT"], levels={**{sku: 1 for sku in live}, "SOLD_OUT": 7}
+    )
+    with world:
+        result = await _reconcile(session_factory, tenant)
+    assert result["status"] == "ok"
+    assert world.pushed["SOLD_OUT"] == 0 and world.levels["SOLD_OUT"] == 0
+
+
+async def test_a_sku_bims_does_not_mention_is_never_pushed(migrated_db):
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant()
+    await land_snapshot(session_factory, tenant, {"A": 5}, no_stock=("NOT_MENTIONED",))
+    world = ShopifyWorld(["A", "NOT_MENTIONED"], levels={"A": 1, "NOT_MENTIONED": 12})
+    with world:
+        await _reconcile(session_factory, tenant)
+    assert world.pushed == {"A": 5} and world.levels["NOT_MENTIONED"] == 12
+
+
+async def test_absent_stock_means_zero_only_when_the_tenant_opts_in(migrated_db):
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant(field_mappings={"absent_stock_means_zero": True})
+    live = {f"A{i}": 5 for i in range(10)}  # enough live SKUs to stay under the zero guard
+    await land_snapshot(session_factory, tenant, live, no_stock=("GHOST",))
+    world = ShopifyWorld([*live, "GHOST"], levels={**{s: 1 for s in live}, "GHOST": 3})
+    with world:
+        await _reconcile(session_factory, tenant)
+    assert world.pushed == {**live, "GHOST": 0}
+
+
+async def test_an_unknown_completeness_snapshot_is_usable(migrated_db):
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant()
+    await land_snapshot(session_factory, tenant, {"A": 5}, complete=None)
+    world = ShopifyWorld(["A"], levels={"A": 1})
+    with world:
+        assert (await _reconcile(session_factory, tenant))["status"] == "ok"
+
+
 async def test_skus_bims_has_but_shopify_lacks_are_reported_not_pushed(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
@@ -219,7 +267,6 @@ async def test_the_mass_zero_guard_still_fires_and_nothing_is_written(migrated_d
     tenant = await make_tenant()
     skus = [f"S{i}" for i in range(10)]
     await land_snapshot(session_factory, tenant, {sku: 0 for sku in skus})  # a "bad" snapshot
-    await _set_hashes(session_factory, tenant.id, {"S0": "5"})
     world = ShopifyWorld(skus, levels={sku: 5 for sku in skus})
     with world:
         result = await _reconcile(session_factory, tenant)
@@ -229,9 +276,10 @@ async def test_the_mass_zero_guard_still_fires_and_nothing_is_written(migrated_d
     assert world.write_calls == 0 and world.levels == {sku: 5 for sku in skus}
     assert result["drift"]["count"] == 10  # the drift is still reported
     assert result["report"]["guard"]["fired"] is True
-    assert await _hashes(session_factory, tenant.id) == {"S0": "5"}  # baseline untouched
-    outcome = (await _state(session_factory, tenant.id))["last_reconcile_outcome"]
+    state = await _state(session_factory, tenant.id)
+    outcome = state["last_reconcile_outcome"]
     assert outcome["status"] == "needs_confirmation" and outcome["drift"]["count"] == 10
+    assert state["last_run_at"] is None  # nothing was written: the watermark did not advance
 
 
 async def test_the_max_changed_guard_fires_on_a_huge_drift(migrated_db):
@@ -317,17 +365,16 @@ async def test_a_snapshot_that_goes_stale_during_the_scan_is_not_pushed(migrated
 # -- dry run and failure -------------------------------------------------------------
 
 
-async def test_dry_run_reports_the_drift_without_writing_or_touching_the_baseline(migrated_db):
+async def test_dry_run_reports_the_drift_without_writing_or_advancing_anything(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
     await land_snapshot(session_factory, tenant, {"A": 5})
-    await _set_hashes(session_factory, tenant.id, {"A": "5"})
     world = ShopifyWorld(["A"], levels={"A": 2})
     with world:
         result = await _reconcile(session_factory, tenant, dry_run=True)
     assert result["dry_run"] is True and result["drift"]["count"] == 1
     assert world.write_calls == 0 and world.levels == {"A": 2}
-    assert await _hashes(session_factory, tenant.id) == {"A": "5"}
+    assert (await _state(session_factory, tenant.id))["last_run_at"] is None
 
 
 async def test_dry_run_still_reports_when_the_guard_would_have_fired(migrated_db):
@@ -341,17 +388,27 @@ async def test_dry_run_still_reports_when_the_guard_would_have_fired(migrated_db
     assert result["would_update"] == 2 and world.write_calls == 0
 
 
-async def test_a_failed_write_is_recorded_and_leaves_the_baseline_alone(migrated_db):
+async def test_a_failed_write_is_recorded_and_does_not_advance_the_watermark(
+    migrated_db, monkeypatch
+):
+    import asyncio
+
+    real_sleep = asyncio.sleep
+
+    async def no_backoff(_seconds):  # the Shopify client retries 5xx with backoff
+        await real_sleep(0)
+
+    monkeypatch.setattr("bims_shopify.adapters.shopify.client.asyncio.sleep", no_backoff)
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
     await land_snapshot(session_factory, tenant, {"A": 5})
-    await _set_hashes(session_factory, tenant.id, {"A": "1"})
     world = ShopifyWorld(["A"], levels={"A": 2}, fail_writes=True)
     with world, pytest.raises(Exception):  # noqa: B017 - any transport failure
         await _reconcile(session_factory, tenant)
-    assert await _hashes(session_factory, tenant.id) == {"A": "1"}
-    outcome = (await _state(session_factory, tenant.id))["last_reconcile_outcome"]
+    state = await _state(session_factory, tenant.id)
+    outcome = state["last_reconcile_outcome"]
     assert outcome["status"] == "failed" and "error" in outcome
+    assert state["last_error"].startswith("reconcile: ") and state["last_run_at"] is None
 
 
 async def test_a_mutation_shopify_ignores_shows_up_as_drift_again_next_run(migrated_db):

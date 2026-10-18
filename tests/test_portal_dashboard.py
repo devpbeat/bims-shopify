@@ -157,14 +157,14 @@ async def test_dashboard_returns_expected_shape_with_admin_token(app_and_tenant)
         )
         await audit.log(
             actor="system",
-            action="sync.completed",
+            action="sync.reconcile_completed",
             entity="sync_run",
             tenant_id=acme.id,
             payload={"matched": 0, "updated": 0},
         )
         await audit.log(
             actor="system",
-            action="sync.completed",
+            action="sync.reconcile_completed",
             entity="sync_run",
             tenant_id=acme.id,
             payload={"matched": 7, "updated": 7},

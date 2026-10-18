@@ -32,6 +32,7 @@ from bims_shopify.api import health, ops
 from bims_shopify.config import Settings
 from bims_shopify.domain.tenant import PaymentProvider, ReorderStrategy, Tenant
 from bims_shopify.ops.job_runner import JobRunner
+from tests.sync_world import inventory_response
 
 ADMIN_TOKEN = "test-admin-token"
 
@@ -211,12 +212,13 @@ def mock_bims_one_product_and_shopify_variant():
                 json={"status": "OK", "data": {"stockPorSku": [{"sku": "SKU1", "stock": 5}]}},
             )
         )
-        # Answer by operation, not by call order: a sync lists Shopify variants
-        # more than once (the pull's catalog stats, the push's SKU map) and
-        # writes only when something changed.
+        # Answer by operation, not by call order: a sync lists Shopify variants (the pull's
+        # catalog stats), reads their quantities (the reconcile) and writes what differs.
         def graphql(request: httpx.Request) -> httpx.Response:
             if b"inventorySetQuantities" in request.content:
                 return httpx.Response(200, json=set_quantities_response)
+            if b"ListVariantInventory" in request.content:
+                return httpx.Response(200, json=inventory_response(["SKU1"], {"SKU1": 1}))
             return httpx.Response(200, json=list_all_variants_response)
 
         mock.post(_graphql_url()).mock(side_effect=graphql)
@@ -241,11 +243,11 @@ async def test_sync_job_force_pushes_end_to_end(
 
     assert job.status == "succeeded", job.error
     assert job.result["status"] == "ok"
-    assert job.result["synced_deltas"] == 1
+    assert job.result["updated"] == 1 and job.result["drift"]["count"] == 1
     assert job.result["timings"]["catalog_pull_seconds"] > 0
     assert job.result["timings"]["stock_fetch_seconds"] > 0
 
-    # Same persistence as the HTTP path: last_run + product_hashes advance.
+    # Same persistence as the HTTP path: last_run and its summary advance.
     from bims_shopify.adapters.persistence.sync_state_repository import (
         SqlAlchemySyncStateRepository,
     )
@@ -273,7 +275,7 @@ async def test_sync_job_dry_run_reports(app_and_tenant, mock_bims_and_shopify_em
 
     assert job.status == "succeeded", job.error
     assert job.result["dry_run"] is True
-    assert job.result["report"]["total_products"] == 0
+    assert job.result["would_update"] == 0
 
 
 async def test_sync_job_default_options_are_dry_run_false(app_and_tenant, monkeypatch):
@@ -434,8 +436,8 @@ async def test_reconcile_job_default_options_and_validation(app_and_tenant, monk
 async def test_reconcile_job_waits_for_the_shared_reconcile_lock_not_the_sync_one(
     app_and_tenant, monkeypatch
 ):
-    """It serialises with the scheduled reconcile and the push (the lock the
-    scheduler hands out), and is NOT held up by the pull+push sync lock."""
+    """It serialises with the scheduled write cycle (the write lock the scheduler hands
+    out); the lock objects are independent here, so the sync lock is irrelevant to it."""
     app, _tenant, session_factory, job_runner = app_and_tenant
     reconcile_lock, sync_lock = asyncio.Lock(), asyncio.Lock()
     job_runner.set_reconcile_lock_provider(lambda _tenant_id: reconcile_lock)
@@ -452,7 +454,7 @@ async def test_reconcile_job_waits_for_the_shared_reconcile_lock_not_the_sync_on
         _runner,
     )
     await sync_lock.acquire()  # a one-shot sync in flight must not matter here
-    await reconcile_lock.acquire()  # a scheduled reconcile / push in flight must
+    await reconcile_lock.acquire()  # a scheduled write cycle in flight must
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post(

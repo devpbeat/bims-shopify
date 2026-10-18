@@ -269,19 +269,19 @@ async def test_it_declines_when_the_sku_is_not_the_code2_the_import_creates(migr
     assert world.total_calls == 0
 
 
-async def test_it_declines_when_the_push_guard_fired_on_this_very_snapshot(migrated_db):
+async def test_it_declines_when_the_stock_guard_fired_on_this_very_snapshot(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
     meta = await land_catalog(session_factory, tenant, JEANS)
     async with session_factory() as session:
-        await SqlAlchemySyncStateRepository(session).set_last_push_outcome(
+        await SqlAlchemySyncStateRepository(session).set_last_reconcile_outcome(
             tenant.id, {"status": "needs_confirmation", "snapshot_id": meta.id, "reason": "zero_ratio_exceeded"}
         )
     world = HealShopify()
     with world:
         result = await _create(session_factory, tenant)
 
-    assert result["status"] == "declined" and result["reason"] == "push_guard_fired"
+    assert result["status"] == "declined" and result["reason"] == "stock_guard_fired"
     assert world.total_calls == 0
 
 
