@@ -35,8 +35,8 @@ from bims_shopify.logging import configure_logging, get_logger
 from bims_shopify.ops.auto_import import AutoImportCoordinator
 from bims_shopify.ops.job_runner import JobRunner
 from bims_shopify.ops.sync_workers import (
+    do_cycle,
     do_pull,
-    do_push,
     do_reconcile,
     last_pull_at,
     last_reconcile_at,
@@ -113,15 +113,17 @@ def _make_pull_fn(session_factory):
 def _make_push_fn(session_factory):
     """Build the scheduler's per-tenant PUSH callback (snapshot -> Shopify).
 
-    The same ``do_push`` the manual one-shot runs. It never calls BIMS and
-    declines, with a recorded reason, when the snapshot is missing,
-    incomplete or older than the tenant's staleness limit.
+    ``do_cycle``: the same ``do_push`` the manual one-shot runs, followed by
+    the self-healing stages (create what BIMS has in stock and the store
+    lacks, publish what qualifies). It never calls BIMS and declines, with a
+    recorded reason, when the snapshot is missing, incomplete or older than
+    the tenant's staleness limit.
     """
 
     async def _push_tenant(tenant) -> None:
         async with session_factory() as session:
             try:
-                await do_push(tenant, session, trigger="scheduled")
+                await do_cycle(tenant, session, trigger="scheduled")
             except Exception as exc:  # one tenant's failure must not affect others
                 logger.error(
                     "scheduled_push_tenant_failed",

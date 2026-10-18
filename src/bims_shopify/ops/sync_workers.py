@@ -1277,6 +1277,96 @@ async def do_publish(
     return {"status": result.status, "report": result.report, "snapshot_id": meta.id}
 
 
+# -- THE SCHEDULED CYCLE -----------------------------------------------------------
+
+
+async def _isolated(stage: str, tenant: Tenant, call) -> dict[str, Any]:
+    """Run an optional stage so its failure is REPORTED and never stops the cycle.
+
+    The stage has already recorded and audited its own failure; a Shopify blip
+    in the create or publish stage must not take the stock push down with it.
+    """
+    try:
+        return await call()
+    except Exception as exc:
+        logger.error(
+            f"scheduled_{stage}_stage_failed",
+            tenant_slug=tenant.slug,
+            tenant_id=tenant.id,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _cycle_counts(create: dict[str, Any], publish: dict[str, Any]) -> dict[str, int]:
+    created = (create.get("report") or {}).get("created") or {}
+    added = (create.get("report") or {}).get("variants_added") or {}
+    conflicts = (create.get("report") or {}).get("conflicts") or {}
+    published = (publish.get("report") or {}).get("published") or {}
+    return {
+        "products_created": created.get("products", 0),
+        "variants_added": added.get("variants", 0),
+        "conflicts": conflicts.get("count", 0),
+        "published": published.get("count", 0),
+    }
+
+
+async def do_cycle(
+    tenant: Tenant, session: AsyncSession, *, trigger: str = "scheduled"
+) -> dict[str, Any]:
+    """The scheduled push cycle: stock, then close the gap between BIMS and the store.
+
+    1. ``do_push``: stock, exactly as before. It runs FIRST so its mass-zero /
+       max-changed guard has judged this snapshot before anything is created: a
+       snapshot the guard flagged creates and publishes nothing.
+    2. ``do_create_missing`` (switch ``auto_create_missing``): products and
+       variants BIMS has in stock and the store lacks. When it wrote anything, a
+       second push runs (never skipped as "unchanged") so the new variants
+       receive their stock, and only then...
+    3. ``do_publish`` (switch ``auto_publish``): drafts that pass the publish
+       gates go live. A product is therefore never public while it shows zero.
+
+    The optional stages are isolated: one failing is reported under its own key
+    and never stops the others or the stock push. A failing ``do_push`` still
+    raises, as it did when the push was the whole tick.
+
+    The caller holds the tenant's push lock for the whole cycle, so a reconcile
+    and a manual sync stand aside exactly as they do for a plain push. In a
+    healthy steady state the stages do nothing: same snapshot, no Shopify call;
+    new snapshot with nothing new, no create call and one draft listing.
+    """
+    push = await do_push(tenant, session, trigger=trigger)
+    create = await _isolated(
+        STAGE_CREATE, tenant, lambda: do_create_missing(tenant, session, trigger=trigger)
+    )
+    wrote = bool(create.get("written_skus"))
+    push_after_create: dict[str, Any] | None = None
+    if wrote:
+        push_after_create = await do_push(
+            tenant, session, trigger=trigger, skip_unchanged=False
+        )
+    publish = await _isolated(
+        STAGE_PUBLISH, tenant, lambda: do_publish(tenant, session, trigger=trigger, force=wrote)
+    )
+    counts = _cycle_counts(create, publish)
+    if any(counts.values()) or create.get("status") == "failed" or publish.get("status") == "failed":
+        logger.info(
+            "scheduled_cycle_healed",
+            tenant_slug=tenant.slug,
+            tenant_id=tenant.id,
+            create=create.get("status"),
+            publish=publish.get("status"),
+            **counts,
+        )
+    return {
+        "push": push,
+        "create": create,
+        "push_after_create": push_after_create,
+        "publish": publish,
+        "counts": counts,
+    }
+
+
 # -- ONE-SHOT -----------------------------------------------------------------
 
 
