@@ -18,16 +18,18 @@ from bims_shopify.adapters.bims.client import BIMSClient
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.adapters.persistence.models import AuditLogModel
 from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
-from bims_shopify.adapters.shopify.client import ShopifyClient
+from bims_shopify.adapters.shopify.client import ShopifyClient, ShopifyGraphQLError
 from bims_shopify.config import Settings
 from bims_shopify.ops import catalog as catalog_ops
 from bims_shopify.ops.catalog import (
     BimsRow,
+    ExistingCatalogIndex,
     apply_dedupe,
     apply_import,
     build_dedupe_report,
     build_product_set_input,
     compute_dedupe_plan,
+    fetch_existing_index,
     fetch_existing_skus,
     filter_and_dedupe_rows,
     group_rows,
@@ -246,6 +248,37 @@ async def test_fetch_existing_skus_pages_variants(tenant):
     assert skus == {"SKU-1"}
 
 
+@respx.mock
+async def test_fetch_existing_index_maps_skus_to_products_and_size_values(tenant):
+    respx.post(GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "productVariants": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [
+                            {
+                                "id": "v1", "sku": " SKU-S ",
+                                "product": {"id": "p1", "title": "A"},
+                                "selectedOptions": [{"name": "Size", "value": "S"}],
+                            },
+                            {
+                                "id": "v2", "sku": "",
+                                "product": {"id": "p1", "title": "A"},
+                                "selectedOptions": [{"name": "Size", "value": "M"}],
+                            },
+                        ],
+                    }
+                }
+            },
+        )
+    )
+    index = await fetch_existing_index(ShopifyClient(tenant))
+    assert index.sku_to_product == {"SKU-S": "p1"}
+    assert index.product_options == {"p1": {"Size": {"s", "m"}}}
+
+
 async def test_apply_import_skips_groups_whose_skus_all_exist():
     group = group_rows([BimsRow("1", "Mug", "SKU-MUG", 5000)]).groups[0]
 
@@ -260,13 +293,12 @@ async def test_apply_import_skips_groups_whose_skus_all_exist():
     assert result.created == []
 
 
-async def test_apply_import_skips_group_if_any_sku_already_exists():
+async def test_apply_import_never_recreates_a_partially_existing_group():
     """Regression test for the production duplicate-products incident.
 
-    The old rule skipped a group only when ALL its SKUs already existed.
-    Because which SKU "survives" per size can shift between runs (bugs
-    being fixed mid-rollout), a group could have some-but-not-all SKUs
-    present and get re-created as a brand new product, duplicating it.
+    A group with some-but-not-all SKUs in Shopify must never be re-created via
+    productSet (that duplicated products). Without a SKU -> product index the
+    import cannot target the existing product, so it leaves the group alone.
     """
     group = group_rows(
         [
@@ -277,15 +309,213 @@ async def test_apply_import_skips_group_if_any_sku_already_exists():
 
     class _NoCallShopifyClient:
         async def product_set(self, product_input):
-            raise AssertionError("product_set should not be called when any SKU already exists")
+            raise AssertionError("product_set must not be called when any SKU already exists")
 
-    # Only SKU-S exists in Shopify; SKU-M does not. The old subset rule would
-    # have re-created this product. The fixed rule must still skip it.
+        async def bulk_create_variants(self, product_id, variants):
+            raise AssertionError("no product id known: nothing may be written")
+
     result = await apply_import(
         _NoCallShopifyClient(), [group], existing_skus={"SKU-S"}, status="DRAFT"
     )
     assert result.skipped_existing == ["Shirt"]
     assert result.created == []
+    assert result.variants_added == []
+
+
+# -- adding missing variants to an existing product ---------------------------
+
+PRODUCT_1 = "gid://shopify/Product/1"
+
+
+def _shirt_group(*sizes: str):
+    rows = [BimsRow(str(i), f"Shirt ({s})", f"SKU-{s}", 1000 + i) for i, s in enumerate(sizes)]
+    return group_rows(rows).groups[0]
+
+
+def _index(*variants: tuple[str, str, str | None]) -> ExistingCatalogIndex:
+    """variants: (sku, product_id, size-or-None for a product without a Size option)."""
+    index = ExistingCatalogIndex()
+    for sku, product_id, size in variants:
+        index.add_variant(sku, product_id, {"Size": size} if size else {"Title": "Default Title"})
+    return index
+
+
+class _VariantClient:
+    def __init__(self, fail_products: frozenset[str] = frozenset()):
+        self.created_products: list[dict] = []
+        self.bulk_calls: list[tuple[str, list[dict]]] = []
+        self.fail_products = fail_products
+
+    async def product_set(self, product_input):
+        self.created_products.append(product_input)
+        return {"id": "gid://shopify/Product/new"}
+
+    async def bulk_create_variants(self, product_id, variants):
+        self.bulk_calls.append((product_id, variants))
+        if product_id in self.fail_products:
+            raise ShopifyGraphQLError("boom")
+        return [{"id": f"v{i}", "sku": v["inventoryItem"]["sku"]} for i, v in enumerate(variants)]
+
+
+async def test_all_new_group_still_created_via_product_set():
+    client = _VariantClient()
+    result = await apply_import(
+        client, [_shirt_group("S", "M")], existing_skus=set(),
+        existing_index=ExistingCatalogIndex(), status="DRAFT",
+    )
+    assert len(result.created) == 1 and len(client.created_products) == 1
+    assert client.bulk_calls == []
+    assert result.variants_added == [] and result.conflicts == []
+
+
+async def test_fully_existing_group_counts_as_skipped_existing():
+    client = _VariantClient()
+    index = _index(("SKU-S", PRODUCT_1, "S"), ("SKU-M", PRODUCT_1, "M"))
+    result = await apply_import(
+        client, [_shirt_group("S", "M")], existing_skus={"SKU-S", "SKU-M"},
+        existing_index=index, status="DRAFT",
+    )
+    assert result.skipped_existing == ["Shirt"]
+    assert client.bulk_calls == [] and client.created_products == []
+
+
+async def test_partial_group_adds_only_missing_skus_and_never_recreates_product():
+    client = _VariantClient()
+    index = _index(("SKU-S", PRODUCT_1, "S"), ("SKU-M", PRODUCT_1, "M"))
+    result = await apply_import(
+        client, [_shirt_group("S", "M", "L", "XL")], existing_skus={"SKU-S", "SKU-M"},
+        existing_index=index, status="DRAFT", location_id="gid://shopify/Location/9",
+    )
+    assert client.created_products == []
+    assert len(client.bulk_calls) == 1
+    product_id, variants = client.bulk_calls[0]
+    assert product_id == PRODUCT_1
+    assert [v["inventoryItem"]["sku"] for v in variants] == ["SKU-L", "SKU-XL"]
+    assert result.variants_added == [
+        {"title": "Shirt", "product_id": PRODUCT_1, "skus": ["SKU-L", "SKU-XL"]}
+    ]
+    assert result.skipped_existing == [] and result.created == []
+
+
+async def test_added_variants_are_tracked_activated_and_priced_like_product_set():
+    client = _VariantClient()
+    group = _shirt_group("S", "M")
+    index = _index(("SKU-S", PRODUCT_1, "S"))
+    location = "gid://shopify/Location/9"
+    await apply_import(
+        client, [group], existing_skus={"SKU-S"}, existing_index=index,
+        status="DRAFT", location_id=location,
+    )
+    (variant,) = client.bulk_calls[0][1]
+    reference = next(
+        v for v in build_product_set_input(group, status="DRAFT", location_id=location)["variants"]
+        if v["sku"] == "SKU-M"
+    )
+    assert variant["price"] == reference["price"] == "1001"
+    assert variant["optionValues"] == reference["optionValues"] == [
+        {"optionName": "Size", "name": "M"}
+    ]
+    assert variant["inventoryItem"] == {"sku": "SKU-M", "tracked": True}
+    assert variant["inventoryPolicy"] == "DENY"
+    assert variant["inventoryQuantities"] == [{"locationId": location, "availableQuantity": 0}]
+
+
+async def test_option_value_conflict_goes_to_conflicts_and_is_not_forced():
+    client = _VariantClient()
+    # Shopify already has a "M" variant under a different SKU; BIMS' SKU-M2 also maps to M.
+    group = group_rows(
+        [
+            BimsRow("1", "Shirt (S)", "SKU-S", 1000),
+            BimsRow("2", "Shirt (M)", "SKU-M2", 1000),
+            BimsRow("3", "Shirt (L)", "SKU-L", 1000),
+        ]
+    ).groups[0]
+    index = _index(("SKU-S", PRODUCT_1, "S"), ("SKU-OLD-M", PRODUCT_1, "m"))
+    result = await apply_import(
+        client, [group], existing_skus={"SKU-S", "SKU-OLD-M"}, existing_index=index,
+        status="DRAFT",
+    )
+    assert [v["inventoryItem"]["sku"] for v in client.bulk_calls[0][1]] == ["SKU-L"]
+    assert result.variants_added[0]["skus"] == ["SKU-L"]
+    assert len(result.conflicts) == 1
+    conflict = result.conflicts[0]
+    assert conflict["title"] == "Shirt" and conflict["product_id"] == PRODUCT_1
+    assert conflict["sku"] == "SKU-M2" and conflict["option_value"] == "M"
+    assert "already" in conflict["reason"]
+
+
+async def test_conflict_only_group_writes_nothing():
+    client = _VariantClient()
+    index = _index(("SKU-S", PRODUCT_1, "S"), ("SKU-OLD-M", PRODUCT_1, "M"))
+    result = await apply_import(
+        client, [_shirt_group("S", "M")], existing_skus={"SKU-S", "SKU-OLD-M"},
+        existing_index=index, status="DRAFT",
+    )
+    assert client.bulk_calls == [] and client.created_products == []
+    assert result.variants_added == []
+    assert len(result.conflicts) == 1
+
+
+async def test_product_without_size_option_is_a_conflict_not_a_forced_option():
+    client = _VariantClient()
+    index = _index(("SKU-S", PRODUCT_1, None))
+    result = await apply_import(
+        client, [_shirt_group("S", "M")], existing_skus={"SKU-S"}, existing_index=index,
+        status="DRAFT",
+    )
+    assert client.bulk_calls == []
+    assert len(result.conflicts) == 1 and "Size" in result.conflicts[0]["reason"]
+
+
+async def test_group_spread_over_several_products_is_a_conflict():
+    client = _VariantClient()
+    index = _index(("SKU-S", PRODUCT_1, "S"), ("SKU-M", "gid://shopify/Product/2", "M"))
+    result = await apply_import(
+        client, [_shirt_group("S", "M", "L")], existing_skus={"SKU-S", "SKU-M"},
+        existing_index=index, status="DRAFT",
+    )
+    assert client.bulk_calls == []
+    assert len(result.conflicts) == 1 and "several" in result.conflicts[0]["reason"]
+
+
+async def test_partial_group_failure_is_isolated():
+    client = _VariantClient(fail_products=frozenset({PRODUCT_1}))
+    ok = group_rows([BimsRow("9", "Mug", "SKU-MUG", 500)]).groups[0]
+    index = _index(("SKU-S", PRODUCT_1, "S"))
+    result = await apply_import(
+        client, [_shirt_group("S", "M"), ok], existing_skus={"SKU-S"}, existing_index=index,
+        status="DRAFT",
+    )
+    assert [f["title"] for f in result.failed] == ["Shirt"]
+    assert "ShopifyGraphQLError" in result.failed[0]["error"]
+    assert len(result.created) == 1 and result.variants_added == []
+
+
+async def test_summary_reports_variants_added_and_conflicts_with_bounded_samples():
+    client = _VariantClient()
+    groups = []
+    index = ExistingCatalogIndex()
+    for n in range(catalog_ops.VARIANTS_ADDED_SAMPLE_SIZE + 5):
+        groups.append(
+            group_rows(
+                [
+                    BimsRow(f"a{n}", f"P{n:03d} (S)", f"P{n}-S", 1000),
+                    BimsRow(f"b{n}", f"P{n:03d} (M)", f"P{n}-M", 1000),
+                ]
+            ).groups[0]
+        )
+        index.add_variant(f"P{n}-S", f"gid://shopify/Product/{n}", {"Size": "S"})
+    existing = {sku for sku in index.sku_to_product}
+    result = await apply_import(
+        client, groups, existing_skus=existing, existing_index=index, status="DRAFT"
+    )
+    summary = result.to_summary()
+    total = catalog_ops.VARIANTS_ADDED_SAMPLE_SIZE + 5
+    assert summary["variants_added"]["products"] == total
+    assert summary["variants_added"]["variants"] == total
+    assert len(summary["variants_added"]["sample"]) == catalog_ops.VARIANTS_ADDED_SAMPLE_SIZE
+    assert summary["conflicts"] == {"count": 0, "sample": []}
+    assert {"created", "skipped_existing", "failed"} <= summary.keys()
 
 
 async def test_apply_import_isolates_failure_per_product():

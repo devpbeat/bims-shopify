@@ -7,6 +7,7 @@ from bims_shopify.adapters.shopify.client import ShopifyGraphQLError
 from bims_shopify.ops.catalog import (
     DEFAULT_SHOPIFY_CONCURRENCY,
     BimsRow,
+    ExistingCatalogIndex,
     apply_import,
     apply_publish,
     group_rows,
@@ -169,3 +170,47 @@ async def test_publish_progress_monotonic_to_total():
     assert dones == sorted(dones) and len(set(dones)) == len(dones)
     assert dones[-1] == 100  # multiples of 50, last one below 120
     assert seen[-1][2] == "100/120 products processed"
+
+
+async def test_variant_additions_share_the_same_concurrency_bound():
+    in_flight = 0
+    max_in_flight = 0
+
+    async def _occupy():
+        nonlocal in_flight, max_in_flight
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            await asyncio.sleep(0.005)
+        finally:
+            in_flight -= 1
+
+    class _Client:
+        async def product_set(self, product_input):
+            await _occupy()
+            return {"id": "gid://new"}
+
+        async def bulk_create_variants(self, product_id, variants):
+            await _occupy()
+            return []
+
+    groups = []
+    index = ExistingCatalogIndex()
+    for i in range(40):
+        groups.append(
+            group_rows(
+                [
+                    BimsRow(f"a{i}", f"Item {i:03d} (S)", f"S-{i}", 1000),
+                    BimsRow(f"b{i}", f"Item {i:03d} (M)", f"M-{i}", 1000),
+                ]
+            ).groups[0]
+        )
+        index.add_variant(f"S-{i}", f"gid://p/{i}", {"Size": "S"})
+    # mixed workload: 40 additions + 40 creates must still share ONE bound of 4
+    groups += _groups(40)
+    result = await apply_import(
+        _Client(), groups, existing_skus=set(index.sku_to_product), existing_index=index,
+        status="DRAFT", concurrency=4,
+    )
+    assert len(result.variants_added) == 40 and len(result.created) == 40
+    assert max_in_flight == 4

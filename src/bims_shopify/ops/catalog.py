@@ -121,6 +121,8 @@ DEDUPE_PROGRESS_EVERY = 50
 FIX_TRACKING_PROGRESS_EVERY = 50
 SAMPLE_GROUP_COUNT = 5
 RECONCILIATION_SAMPLE_SIZE = 20
+VARIANTS_ADDED_SAMPLE_SIZE = 20
+IMPORT_CONFLICTS_SAMPLE_SIZE = 20
 DEDUPE_DUPLICATES_SAMPLE_SIZE = 20
 DEDUPE_PARTIAL_OVERLAP_SAMPLE_SIZE = 10
 DEDUPE_MAX_DELETE_RATIO = 0.6
@@ -547,6 +549,42 @@ async def fetch_existing_skus(shopify_client: ShopifyClient) -> set[str]:
     return skus
 
 
+@dataclass
+class ExistingCatalogIndex:
+    """What Shopify already holds, keyed for the import's add-missing-variants path.
+
+    ``sku_to_product`` maps every non-blank SKU to its product id;
+    ``product_options`` maps a product id to ``{option name: {casefolded values}}``
+    (built from each variant's ``selectedOptions``).
+    """
+
+    sku_to_product: dict[str, str] = field(default_factory=dict)
+    product_options: dict[str, dict[str, set[str]]] = field(default_factory=dict)
+
+    def add_variant(self, sku: str, product_id: str, options: dict[str, str]) -> None:
+        if sku:
+            self.sku_to_product[sku] = product_id
+        per_product = self.product_options.setdefault(product_id, {})
+        for name, value in options.items():
+            per_product.setdefault(name, set()).add(value.strip().casefold())
+
+
+async def fetch_existing_index(shopify_client: ShopifyClient) -> ExistingCatalogIndex:
+    """One full variant scan -> SKU/product/option index (same scan as ``fetch_existing_skus``)."""
+    index = ExistingCatalogIndex()
+    async for variant in shopify_client.iter_all_variants():
+        product_id = (variant.get("product") or {}).get("id")
+        if not product_id:
+            continue
+        options = {
+            o["name"]: o["value"]
+            for o in variant.get("selectedOptions") or []
+            if o.get("name") and o.get("value") is not None
+        }
+        index.add_variant((variant.get("sku") or "").strip(), product_id, options)
+    return index
+
+
 def group_skus(group: ProductGroup) -> set[str]:
     return {v.sku for v in group.variants}
 
@@ -630,13 +668,18 @@ def reconciliation_diff(bims_skus: set[str], shopify_skus: set[str]) -> dict[str
     }
 
 
-def _variant_inventory_fields(location_id: str) -> dict[str, Any]:
+def _variant_inventory_fields(location_id: str, *, bulk: bool = False) -> dict[str, Any]:
     """Fields every new variant needs to be tracked and land in inventory sync.
 
     Sets ``inventoryItem.tracked=true`` and ``inventoryPolicy=DENY`` (stop
     selling at 0). When a tenant location id is available, also activates the
     item at that location via ``inventoryQuantities`` (required before
     ``inventorySetQuantities`` can write stock during the regular sync).
+
+    ``bulk=True`` shapes the same setup for ``ProductVariantsBulkInput``
+    (productVariantsBulkCreate), whose ``InventoryLevelInput`` is
+    ``{locationId, availableQuantity}`` instead of productSet's
+    ``{locationId, name, quantity}``.
     """
     fields: dict[str, Any] = {
         "inventoryItem": {"tracked": True},
@@ -644,7 +687,9 @@ def _variant_inventory_fields(location_id: str) -> dict[str, Any]:
     }
     if location_id and location_id != "0":
         fields["inventoryQuantities"] = [
-            {"locationId": location_id, "name": "available", "quantity": 0}
+            {"locationId": location_id, "availableQuantity": 0}
+            if bulk
+            else {"locationId": location_id, "name": "available", "quantity": 0}
         ]
     else:
         logger.warning(
@@ -700,11 +745,34 @@ def build_product_set_input(
     return product_input
 
 
+def build_variants_bulk_create_input(
+    variants: list[VariantRow], *, location_id: str = ""
+) -> list[dict[str, Any]]:
+    """``ProductVariantsBulkInput`` list mirroring ``build_product_set_input``'s variants.
+
+    Same ``Size`` option, same price string, same tracking/policy/activation;
+    only the field shape differs (the SKU lives under ``inventoryItem``).
+    """
+    inventory_fields = _variant_inventory_fields(location_id, bulk=True)
+    inventory_item = inventory_fields.pop("inventoryItem")
+    return [
+        {
+            "price": str(v.price),
+            "optionValues": [{"optionName": "Size", "name": v.size or "Default"}],
+            "inventoryItem": {"sku": v.sku, **inventory_item},
+            **inventory_fields,
+        }
+        for v in variants
+    ]
+
+
 @dataclass
 class ImportResult:
     created: list[dict[str, Any]] = field(default_factory=list)
     skipped_existing: list[str] = field(default_factory=list)
     failed: list[dict[str, Any]] = field(default_factory=list)
+    variants_added: list[dict[str, Any]] = field(default_factory=list)
+    conflicts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_summary(self) -> dict[str, Any]:
         return {
@@ -712,7 +780,70 @@ class ImportResult:
             "skipped_existing": len(self.skipped_existing),
             "failed": len(self.failed),
             "failed_details": self.failed,
+            "variants_added": {
+                "products": len(self.variants_added),
+                "variants": sum(len(e["skus"]) for e in self.variants_added),
+                "sample": self.variants_added[:VARIANTS_ADDED_SAMPLE_SIZE],
+            },
+            "conflicts": {
+                "count": len(self.conflicts),
+                "sample": self.conflicts[:IMPORT_CONFLICTS_SAMPLE_SIZE],
+            },
         }
+
+
+def _plan_variant_additions(
+    group: ProductGroup, present: set[str], index: ExistingCatalogIndex
+) -> tuple[str | None, list[VariantRow], list[dict[str, Any]]]:
+    """Split a partially-existing group into ``(product_id, variants to add, conflicts)``.
+
+    Nothing is guessed: a missing SKU whose Size value the Shopify product
+    already has (or that repeats within the group), a product without a
+    ``Size`` option, or a group spread over several products all become
+    conflicts for a human instead of writes.
+    """
+    missing = [v for v in group.variants if v.sku not in present]
+    product_ids = sorted({index.sku_to_product[s] for s in present if s in index.sku_to_product})
+
+    def conflict(v: VariantRow, reason: str, product_id: str | None) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "title": group.title,
+            "product_id": product_id,
+            "sku": v.sku,
+            "option_value": v.size or "Default",
+            "reason": reason,
+        }
+        if len(product_ids) > 1:
+            entry["product_ids"] = product_ids
+        return entry
+
+    if len(product_ids) != 1:
+        reason = (
+            "SKUs of this group are spread over several Shopify products"
+            if product_ids
+            else "existing SKUs of this group are not in the Shopify index"
+        )
+        return None, [], [conflict(v, reason, None) for v in missing]
+
+    product_id = product_ids[0]
+    sizes = index.product_options.get(product_id, {}).get("Size")
+    if sizes is None:
+        reason = "existing Shopify product has no 'Size' option"
+        return product_id, [], [conflict(v, reason, product_id) for v in missing]
+
+    taken = set(sizes)
+    to_add: list[VariantRow] = []
+    conflicts: list[dict[str, Any]] = []
+    for v in missing:
+        key = (v.size or "Default").strip().casefold()
+        if key in taken:
+            conflicts.append(
+                conflict(v, "product already has this Size value under another SKU", product_id)
+            )
+        else:
+            taken.add(key)
+            to_add.append(v)
+    return product_id, to_add, conflicts
 
 
 async def apply_import(
@@ -720,26 +851,48 @@ async def apply_import(
     groups: list[ProductGroup],
     *,
     existing_skus: set[str],
+    existing_index: ExistingCatalogIndex | None = None,
     status: str,
     location_id: str = "",
     progress: ProgressFn | None = None,
     concurrency: int = DEFAULT_SHOPIFY_CONCURRENCY,
 ) -> ImportResult:
-    """Create each product group via productSet, isolating failures per product.
+    """Import each product group, isolating failures per product.
 
-    Up to ``concurrency`` productSet calls run at once; result lists keep input order.
+    - No SKU in Shopify: create the product via productSet.
+    - Every SKU in Shopify: nothing to do (``skipped_existing``).
+    - Some SKUs in Shopify: add ONLY the missing variants to the existing
+      product via productVariantsBulkCreate (``variants_added``); conflicts
+      go to ``conflicts`` untouched. Without ``existing_index`` the target
+      product is unknown, so such a group is left alone (never re-created).
+
+    Up to ``concurrency`` Shopify writes run at once -- creates and variant
+    additions share the same bound (one write per group); result lists keep
+    input order.
     """
 
-    async def import_one(group: ProductGroup) -> tuple[str, dict[str, Any] | str]:
+    async def import_one(group: ProductGroup) -> tuple[str, Any]:
         skus = group_skus(group)
-        if skus and (skus & existing_skus):
+        present = skus & existing_skus
+        if not skus or not present:
+            product_input = build_product_set_input(group, status=status, location_id=location_id)
+            try:
+                product = await shopify_client.product_set(product_input)
+            except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
+                return "failed", {"title": group.title, "error": f"{type(exc).__name__}: {exc}"}
+            return "created", {"title": group.title, "product_id": (product or {}).get("id")}
+        if present == skus or existing_index is None:
             return "skipped", group.title
-        product_input = build_product_set_input(group, status=status, location_id=location_id)
-        try:
-            product = await shopify_client.product_set(product_input)
-        except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
-            return "failed", {"title": group.title, "error": f"{type(exc).__name__}: {exc}"}
-        return "created", {"title": group.title, "product_id": (product or {}).get("id")}
+        product_id, to_add, conflicts = _plan_variant_additions(group, present, existing_index)
+        added: dict[str, Any] | None = None
+        if to_add and product_id:
+            payload = build_variants_bulk_create_input(to_add, location_id=location_id)
+            try:
+                await shopify_client.bulk_create_variants(product_id, payload)
+            except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
+                return "failed", {"title": group.title, "error": f"{type(exc).__name__}: {exc}"}
+            added = {"title": group.title, "product_id": product_id, "skus": [v.sku for v in to_add]}
+        return "partial", (added, conflicts)
 
     outcomes = await _run_bounded(
         groups,
@@ -751,11 +904,16 @@ async def apply_import(
     result = ImportResult()
     for kind, payload in outcomes:
         if kind == "skipped":
-            result.skipped_existing.append(payload)  # type: ignore[arg-type]
+            result.skipped_existing.append(payload)
         elif kind == "failed":
-            result.failed.append(payload)  # type: ignore[arg-type]
+            result.failed.append(payload)
+        elif kind == "partial":
+            added, conflicts = payload
+            if added:
+                result.variants_added.append(added)
+            result.conflicts.extend(conflicts)
         else:
-            result.created.append(payload)  # type: ignore[arg-type]
+            result.created.append(payload)
     return result
 
 
@@ -1987,12 +2145,14 @@ async def _run_import(
             return summary
 
         await _emit_progress(progress, 0, len(groups), "pulling existing Shopify SKUs")
-        existing_skus = await fetch_existing_skus(shopify_client)
+        existing_index = await fetch_existing_index(shopify_client)
+        existing_skus = set(existing_index.sku_to_product)
         status = "ACTIVE" if args.publish else "DRAFT"
         result = await apply_import(
             shopify_client,
             groups,
             existing_skus=existing_skus,
+            existing_index=existing_index,
             status=status,
             location_id=tenant.shopify_location_id,
             progress=progress,
