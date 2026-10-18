@@ -880,7 +880,11 @@ async def apply_import(
                 product = await shopify_client.product_set(product_input)
             except _TRANSIENT_SHOPIFY_EXCEPTIONS as exc:
                 return "failed", {"title": group.title, "error": f"{type(exc).__name__}: {exc}"}
-            return "created", {"title": group.title, "product_id": (product or {}).get("id")}
+            return "created", {
+                "title": group.title,
+                "product_id": (product or {}).get("id"),
+                "skus": [v.sku for v in group.variants],
+            }
         if present == skus or existing_index is None:
             return "skipped", group.title
         product_id, to_add, conflicts = _plan_variant_additions(group, present, existing_index)

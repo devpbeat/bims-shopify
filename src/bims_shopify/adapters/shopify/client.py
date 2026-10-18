@@ -145,8 +145,8 @@ query ListAllProducts($cursor: String) {
 """
 
 _LIST_ALL_PRODUCTS_WITH_SKUS = """
-query ListAllProductsWithSkus($cursor: String) {
-  products(first: 100, after: $cursor, sortKey: ID) {
+query ListAllProductsWithSkus($cursor: String, $query: String) {
+  products(first: 100, after: $cursor, sortKey: ID, query: $query) {
     pageInfo { hasNextPage endCursor }
     nodes {
       id
@@ -558,8 +558,13 @@ class ShopifyClient:
                 return
             cursor = page_info["endCursor"]
 
-    async def iter_all_products_with_skus(self) -> AsyncIterator[dict[str, Any]]:
+    async def iter_all_products_with_skus(
+        self, query: str | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
         """Page through every product, sorted by id ascending, with its variant SKUs.
+
+        ``query`` is an optional Shopify search filter (for example
+        ``status:draft``); ``None`` lists every product.
 
         Yields ``{id, title, skus}`` where ``skus`` is the list of non-blank
         variant SKUs (order preserved, not deduped). Used by the ``dedupe``
@@ -568,7 +573,10 @@ class ShopifyClient:
         """
         cursor: str | None = None
         while True:
-            data = await self._graphql(_LIST_ALL_PRODUCTS_WITH_SKUS, {"cursor": cursor})
+            variables: dict[str, Any] = {"cursor": cursor}
+            if query is not None:
+                variables["query"] = query
+            data = await self._graphql(_LIST_ALL_PRODUCTS_WITH_SKUS, variables)
             connection = data["products"]
             for node in connection["nodes"]:
                 skus = [

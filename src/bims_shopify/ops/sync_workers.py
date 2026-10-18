@@ -46,6 +46,12 @@ from bims_shopify.ops.catalog import (
     reconciliation_audit_payload,
     reconciliation_diff,
 )
+from bims_shopify.ops.self_heal import (
+    DECLINE_PUSH_GUARD,
+    create_missing,
+    eligible_groups,
+    sku_field_decline,
+)
 
 logger = get_logger(__name__)
 
@@ -935,6 +941,205 @@ async def do_reconcile(
         return {"status": "ok", "updated": len(result), **base}
     finally:
         await storefront.aclose()
+
+
+# -- SELF-HEALING STAGES -----------------------------------------------------------
+
+STAGE_CREATE = "create"
+STAGE_PUBLISH = "publish"
+
+
+async def _record_stage(
+    state: SqlAlchemySyncStateRepository, tenant_id: int, stage: str, outcome: dict[str, Any]
+) -> None:
+    """Store one stage's outcome without disturbing the other stage's."""
+    document = await state.get_last_heal_outcome(tenant_id) or {}
+    await state.set_last_heal_outcome(tenant_id, {**document, stage: outcome})
+
+
+async def _decline_stage(
+    tenant: Tenant,
+    state: SqlAlchemySyncStateRepository,
+    audit: SqlAlchemyAuditLogger,
+    stage: str,
+    prior: dict[str, Any] | None,
+    meta: SnapshotMeta | None,
+    verdict: tuple[str, dict[str, Any]],
+    trigger: str,
+) -> dict[str, Any]:
+    """Record that a stage refused to act, once: an identical refusal tick after
+    tick is neither re-stored nor re-audited (same rule as the push)."""
+    reason, detail = verdict
+    snapshot_id = meta.id if meta else None
+    repeated = (
+        prior is not None
+        and prior.get("status") == "declined"
+        and prior.get("reason") == reason
+        and prior.get("snapshot_id") == snapshot_id
+    )
+    if not repeated:
+        await _record_stage(
+            state,
+            tenant.id,
+            stage,
+            {
+                "status": "declined",
+                "reason": reason,
+                "detail": detail,
+                "snapshot_id": snapshot_id,
+                "at": _now().isoformat(),
+                "trigger": trigger,
+            },
+        )
+        logger.warning(
+            f"sync_{stage}_declined", tenant_slug=tenant.slug, tenant_id=tenant.id, reason=reason
+        )
+        await audit.log(
+            actor="system",
+            action=f"sync.{stage}_declined",
+            entity="sync_run",
+            tenant_id=tenant.id,
+            payload={"reason": reason, "detail": detail, "trigger": trigger},
+        )
+    return {"status": "declined", "reason": reason, "detail": detail}
+
+
+async def do_create_missing(
+    tenant: Tenant,
+    session: AsyncSession,
+    *,
+    trigger: str = "scheduled",
+) -> dict[str, Any]:
+    """Stage 1 of the scheduled cycle: create what BIMS has in stock and the store lacks.
+
+    Judged from the current snapshot only; never calls BIMS.
+
+    * ``disabled``: the tenant switched ``auto_create_missing`` off. Nothing is
+      read, written or recorded.
+    * ``declined``: no usable snapshot (missing, incomplete, stale), a SKU
+      field the import cannot name variants after, or the push's mass-zero
+      guard fired on this very snapshot (a snapshot that looks wrong creates
+      nothing). Shopify is not touched.
+    * ``unchanged``: this snapshot was already handled.
+    * ``noop``: nothing is missing. With a fresh SKU index this costs no
+      Shopify call.
+    * ``needs_confirmation``: most of what BIMS has in stock is "missing" from
+      a store that has a real catalog; nothing is written.
+    * ``ok``: products created / variants added, conflicts recorded.
+
+    The caller holds the tenant's push lock (the stage writes to the catalog
+    the push and the reconcile read).
+    """
+    if tenant.id is None:
+        raise ValueError("tenant must be persisted before creating products")
+    if not tenant.auto_create_missing:
+        return {"status": "disabled"}
+    state = SqlAlchemySyncStateRepository(session)
+    audit = SqlAlchemyAuditLogger(session)
+    snapshots = SqlAlchemySnapshotRepository(session)
+    now = _now()
+    meta = await snapshots.get_current_meta(tenant.id)
+    prior = (await state.get_last_heal_outcome(tenant.id) or {}).get(STAGE_CREATE)
+
+    verdict = snapshot_decline(meta, tenant, now) or sku_field_decline(tenant)
+    if verdict is None and meta is not None:
+        push = await state.get_last_push_outcome(tenant.id)
+        if (
+            push is not None
+            and push.get("status") == "needs_confirmation"
+            and push.get("snapshot_id") == meta.id
+        ):
+            verdict = (DECLINE_PUSH_GUARD, {"snapshot_id": meta.id, "push_reason": push.get("reason")})
+    if verdict is not None:
+        return await _decline_stage(tenant, state, audit, STAGE_CREATE, prior, meta, verdict, trigger)
+    if meta is None:  # unreachable: snapshot_decline reports a missing snapshot
+        raise RuntimeError("create stage reached the snapshot read without a snapshot")
+
+    if (
+        prior is not None
+        and prior.get("snapshot_id") == meta.id
+        and prior.get("status") in ("ok", "noop")
+        and not prior.get("deferred")
+    ):
+        return {"status": "unchanged", "snapshot_id": meta.id}
+
+    snapshot = await snapshots.load(meta)
+    groups = eligible_groups(snapshot)
+    index = await state.get_shopify_sku_index(tenant.id)
+    clock = time.perf_counter()
+    try:
+        result = await create_missing(
+            tenant, groups, index, lambda: ShopifyClient(tenant), now=now
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        logger.error("sync_create_failed", tenant_slug=tenant.slug, tenant_id=tenant.id, error=error)
+        await _record_stage(
+            state,
+            tenant.id,
+            STAGE_CREATE,
+            {
+                "status": "failed",
+                "error": error,
+                "snapshot_id": meta.id,
+                "at": _now().isoformat(),
+                "trigger": trigger,
+            },
+        )
+        await audit.log(
+            actor="system",
+            action="sync.create_error",
+            entity="sync_run",
+            tenant_id=tenant.id,
+            payload={"error": error, "snapshot_id": meta.id, "trigger": trigger},
+        )
+        raise
+
+    if result.new_index is not None:
+        await state.set_shopify_sku_index(tenant.id, result.new_index)
+    if result.written_skus:
+        # The push baseline remembers a stock for SKUs that were not in Shopify
+        # (the push records every delta, matched or not). A just-created variant
+        # starts at zero in Shopify, so it must look NEW to the next push or it
+        # would be judged "unchanged" and never receive its stock.
+        baseline = await state.get_product_hashes(tenant.id)
+        await state.set_product_hashes(
+            tenant.id, {k: v for k, v in baseline.items() if k not in result.written_skus}
+        )
+    outcome = {
+        "status": result.status,
+        "snapshot_id": meta.id,
+        "duration_seconds": time.perf_counter() - clock,
+        "at": _now().isoformat(),
+        "trigger": trigger,
+        **result.report,
+    }
+    await _record_stage(state, tenant.id, STAGE_CREATE, outcome)
+    wrote_or_flagged = result.status == "needs_confirmation" or any(
+        result.report.get(k, {}).get("count") or result.report.get(k, {}).get("products")
+        for k in ("created", "variants_added", "conflicts", "failed")
+    )
+    if wrote_or_flagged:
+        logger.info(
+            "sync_create_completed",
+            tenant_slug=tenant.slug,
+            tenant_id=tenant.id,
+            status=result.status,
+            snapshot_id=meta.id,
+        )
+        await audit.log(
+            actor="system",
+            action=f"sync.create_{result.status}",
+            entity="sync_run",
+            tenant_id=tenant.id,
+            payload={"snapshot_id": meta.id, "trigger": trigger, **result.report},
+        )
+    return {
+        "status": result.status,
+        "report": result.report,
+        "written_skus": len(result.written_skus),
+        "snapshot_id": meta.id,
+    }
 
 
 # -- ONE-SHOT -----------------------------------------------------------------
