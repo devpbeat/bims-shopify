@@ -11,7 +11,7 @@ returns immediately with a job_id, and progress/result/error are polled via
 
 This module wraps `bims_shopify.api.sync._do_run_sync` -- the exact same
 coroutine used by the manual HTTP endpoint, and itself just "pull now, then
-push now" over the two scheduled workers (`ops.sync_workers`) -- so sync
+reconcile now" over the two scheduled workers (`ops.sync_workers`) -- so sync
 behavior never diverges between the entry points.
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ async def run_sync(
     -- same semantics as the HTTP endpoint's query params.
 
     Concurrency: the caller (JobRunner._run) is responsible for acquiring the
-    tenant's shared sync lock (the combined pull+push lock returned by
+    tenant's shared sync lock (the combined pull+write lock returned by
     `TenantSyncScheduler.lock_for_tenant`, also used by the manual HTTP
     endpoint) before invoking this function, so a sync job can never overlap
     the scheduled sync or a concurrent manual HTTP run for the same tenant.
@@ -67,13 +67,13 @@ async def run_reconcile(
 ) -> dict[str, Any]:
     """Reconcile Shopify's real quantities against the snapshot, on demand.
 
-    The very same ``do_reconcile`` the scheduled tick runs (only the trigger
+    The very same ``do_reconcile`` the scheduled write cycle runs (only the trigger
     label differs). Options: ``dry_run`` (default False: report the drift,
     write nothing) and ``force`` (default False: bypass the safety guard).
 
-    Concurrency: the caller (JobRunner._run) holds the tenant's reconcile lock
-    and push lock (``TenantSyncScheduler.reconcile_lock_for_tenant``) for the
-    whole run; this function acquires no lock itself.
+    Concurrency: the caller (JobRunner._run) holds the tenant's write lock
+    (``TenantSyncScheduler.write_lock_for_tenant``) for the whole run, so it never
+    overlaps a scheduled write cycle; this function acquires no lock itself.
     """
     dry_run = bool(options.get("dry_run", False))
     force = bool(options.get("force", False))

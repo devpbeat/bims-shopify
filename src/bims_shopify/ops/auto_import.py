@@ -1,7 +1,7 @@
 """Scheduler coordinator that auto-enqueues catalog imports for tenants opted in.
 
 This is a *separate* ticking loop from `TenantSyncScheduler` (which keeps
-Shopify stock in sync from BIMS sales every `sync_interval_minutes`). This
+Shopify stock in sync from BIMS: a pull loop plus a write cycle per snapshot). This
 coordinator's only job is to notice new BIMS products and get them into
 Shopify without a manual `catalog import` run:
 

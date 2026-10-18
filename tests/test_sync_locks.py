@@ -1,18 +1,19 @@
-"""Per-tenant locks: the pull and the push each serialise with themselves only,
-the one-shot holds both."""
+"""Per-tenant locks: the pull and the write cycle each serialise with themselves only,
+the one-shot holds both. There is a single write lock: scheduled cycle, manual sync and
+the on-demand reconcile all hold it."""
 import asyncio
 import contextlib
 
 from bims_shopify.sync_locks import SyncLocks
 
 
-async def test_pull_and_push_locks_are_independent():
+async def test_pull_and_write_locks_are_independent():
     locks = SyncLocks()
     async with locks.pull(1):
         assert locks.pull(1).locked()
-        assert not locks.push(1).locked()  # a slow pull never blocks the push
-        async with locks.push(1):
-            assert locks.push(1).locked()
+        assert not locks.write(1).locked()  # a slow pull never blocks the write cycle
+        async with locks.write(1):
+            assert locks.write(1).locked()
 
 
 async def test_locks_are_per_tenant():
@@ -25,7 +26,7 @@ async def test_combined_lock_reports_busy_when_either_worker_is_running():
     locks = SyncLocks()
     combined = locks.combined(1)
     assert not combined.locked()
-    async with locks.push(1):
+    async with locks.write(1):
         assert combined.locked()
     async with locks.pull(1):
         assert combined.locked()
@@ -34,8 +35,8 @@ async def test_combined_lock_reports_busy_when_either_worker_is_running():
 async def test_combined_lock_holds_both_and_releases_both():
     locks = SyncLocks()
     async with locks.combined(1):
-        assert locks.pull(1).locked() and locks.push(1).locked()
-    assert not locks.pull(1).locked() and not locks.push(1).locked()
+        assert locks.pull(1).locked() and locks.write(1).locked()
+    assert not locks.pull(1).locked() and not locks.write(1).locked()
 
 
 async def test_combined_lock_waits_for_a_running_worker_instead_of_overlapping():
@@ -62,45 +63,18 @@ async def test_combined_lock_waits_for_a_running_worker_instead_of_overlapping()
 async def test_combined_lock_releases_the_first_lock_if_the_second_cannot_be_taken():
     locks = SyncLocks()
     combined = locks.combined(1)
-    await locks.push(1).acquire()
+    await locks.write(1).acquire()
     waiter = asyncio.create_task(combined.__aenter__())
     await asyncio.sleep(0.01)
     waiter.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await waiter
-    locks.push(1).release()
+    locks.write(1).release()
     assert not locks.pull(1).locked()  # the pull lock taken first was given back
 
 
-async def test_reconcile_holds_its_own_lock_and_the_push_lock_but_never_the_pull_lock():
+async def test_there_is_one_write_lock_and_no_separate_reconcile_lock():
     locks = SyncLocks()
-    reconcile = locks.reconcile_worker(1)
-    assert not reconcile.locked()
-    async with reconcile:
-        assert locks.reconcile(1).locked() and locks.push(1).locked()
-        assert not locks.pull(1).locked()  # a pull may still land a new snapshot
-    assert not locks.reconcile(1).locked() and not locks.push(1).locked()
-
-
-async def test_reconcile_waits_for_a_running_push_instead_of_overlapping():
-    locks = SyncLocks()
-    order: list[str] = []
-
-    async def push():
-        async with locks.push(1):
-            order.append("push-start")
-            await asyncio.sleep(0.05)
-            order.append("push-end")
-
-    task = asyncio.create_task(push())
-    await asyncio.sleep(0.01)
-    async with locks.reconcile_worker(1):
-        order.append("reconcile")
-    await task
-    assert order == ["push-start", "push-end", "reconcile"]
-
-
-async def test_the_reconcile_lock_is_per_tenant():
-    locks = SyncLocks()
-    async with locks.reconcile_worker(1):
-        assert not locks.reconcile(2).locked() and not locks.push(2).locked()
+    assert not hasattr(locks, "reconcile") and not hasattr(locks, "reconcile_worker")
+    assert not hasattr(locks, "push")
+    assert locks.write(1) is locks.write(1)

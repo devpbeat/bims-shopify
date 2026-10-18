@@ -1,14 +1,18 @@
-"""Tests for TenantSyncScheduler: two independent workers per tenant (pull and
-push), each with its own interval, its own non-overlap lock and live rescheduling."""
+"""TenantSyncScheduler: a continuous pull loop per tenant, and one write cycle per new snapshot.
+
+Time is virtual (a fake clock and sleep), so a ten-minute pull and a sixty-second gap cost
+nothing and every assertion is exact.
+"""
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 
-from bims_shopify.domain.tenant import SyncMode, Tenant
+from bims_shopify.domain.tenant import Tenant
 from bims_shopify.scheduler import TenantSyncScheduler
 
 
-def _make_tenant(tenant_id: int, active: bool = True) -> Tenant:
+def _make_tenant(tenant_id: int, active: bool = True, **overrides) -> Tenant:
     return Tenant(
         id=tenant_id,
         slug=f"tenant-{tenant_id}",
@@ -25,6 +29,7 @@ def _make_tenant(tenant_id: int, active: bool = True) -> Tenant:
         bims_payment_method_id=1,
         default_customer_contact_id=1,
         active=active,
+        **overrides,
     )
 
 
@@ -43,608 +48,416 @@ class FakeTenantRepository:
         self._tenants = [tenant if t.id == tenant.id else t for t in self._tenants]
 
 
-async def test_inactive_tenants_are_never_returned_by_list_active():
-    repo = FakeTenantRepository([_make_tenant(1, active=True), _make_tenant(2, active=False)])
-    calls: list[int] = []
+class VirtualTime:
+    """A clock the loop's sleeps advance, so waiting costs no real time."""
 
-    async def sync_fn(tenant: Tenant) -> None:
-        calls.append(tenant.id)
+    def __init__(self) -> None:
+        self.now = 1000.0
 
-    scheduler = TenantSyncScheduler(repo, sync_fn)
-    await scheduler.run_once()
-    await asyncio.sleep(0.05)
-    assert calls == [1]
+    def clock(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        await asyncio.sleep(0)
+
+    async def work(self, seconds: float) -> None:
+        """Time passing because a worker is busy (a pull answering slowly)."""
+        self.now += seconds
+        await asyncio.sleep(0)
 
 
-async def test_overlapping_runs_for_same_tenant_are_skipped():
-    repo = FakeTenantRepository([_make_tenant(1, active=True)])
-    started = asyncio.Event()
+def _scheduler(repo, pull_fn, time: VirtualTime, **kwargs) -> TenantSyncScheduler:
+    return TenantSyncScheduler(
+        repo, pull_fn, clock=time.clock, sleep=time.sleep, **kwargs
+    )
+
+
+async def _until(condition, *, spins: int = 2000) -> None:
+    for _ in range(spins):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never became true")
+
+
+async def _settle(spins: int = 50) -> None:
+    for _ in range(spins):
+        await asyncio.sleep(0)
+
+
+# -- pulls run back to back, paced by their own duration --------------------------
+
+
+async def test_pulls_run_back_to_back_separated_only_by_the_minimum_gap():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=60)])
+    starts: list[float] = []
+
+    async def pull(tenant: Tenant) -> bool:
+        starts.append(time.now)
+        return True  # answers instantly
+
+    scheduler = _scheduler(repo, pull, time)
+    scheduler.reschedule_tenant(repo._tenants[0])
+    await _until(lambda: len(starts) >= 4)
+    scheduler.remove_tenant(1)
+
+    gaps = [b - a for a, b in pairwise(starts)]
+    assert gaps[:3] == [60, 60, 60]  # never a hot loop, never a fixed cadence beyond the gap
+
+
+async def test_a_slow_pull_is_followed_by_the_gap_not_by_a_fixed_interval():
+    """There is no 30-minute tick: a ten-minute pull is followed by the next one a gap later."""
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=60)])
+    starts: list[float] = []
+
+    async def pull(tenant: Tenant) -> bool:
+        starts.append(time.now)
+        await time.work(600)
+        return True
+
+    scheduler = _scheduler(repo, pull, time)
+    scheduler.reschedule_tenant(repo._tenants[0])
+    await _until(lambda: len(starts) >= 3)
+    scheduler.remove_tenant(1)
+
+    assert [b - a for a, b in pairwise(starts)][:2] == [660, 660]
+
+
+async def test_a_pull_never_overlaps_itself():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=10)])
+    running = 0
+    peak = 0
+    done = 0
+
+    async def pull(tenant: Tenant) -> bool:
+        nonlocal running, peak, done
+        running += 1
+        peak = max(peak, running)
+        await time.work(5)
+        await asyncio.sleep(0)
+        running -= 1
+        done += 1
+        return True
+
+    scheduler = _scheduler(repo, pull, time)
+    # Poking the loop (a settings change) and re-aligning while a pull runs must not start
+    # a second loop or a second pull.
+    scheduler.reschedule_tenant(repo._tenants[0])
+    for _ in range(5):
+        scheduler.reschedule_tenant(repo._tenants[0])
+        await scheduler.align()
+        await asyncio.sleep(0)
+    await _until(lambda: done >= 5)
+    scheduler.remove_tenant(1)
+    assert peak == 1
+
+
+async def test_a_manual_sync_holding_the_pull_lock_makes_the_loop_stand_aside_once():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=30)])
+    pulls: list[float] = []
+    skips: list[str] = []
+
+    async def pull(tenant: Tenant) -> bool:
+        pulls.append(time.now)
+        return False
+
+    async def skip(kind: str, tenant: Tenant) -> None:
+        skips.append(kind)
+
+    scheduler = _scheduler(repo, pull, time, skip_fn=skip)
+    async with scheduler.lock_for_tenant(1):  # the one-shot sync owns both locks
+        scheduler.reschedule_tenant(repo._tenants[0])
+        await _settle()
+        assert pulls == []
+        assert skips == ["pull"]  # recorded ONCE for the streak, not once per gap
+    await _until(lambda: len(pulls) >= 1)
+    scheduler.remove_tenant(1)
+
+
+async def test_a_failing_pull_does_not_stop_the_loop_and_still_respects_the_gap():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=60)])
+    starts: list[float] = []
+
+    async def pull(tenant: Tenant) -> bool:
+        starts.append(time.now)
+        raise RuntimeError("BIMS answered 500")
+
+    scheduler = _scheduler(repo, pull, time)
+    scheduler.reschedule_tenant(repo._tenants[0])
+    await _until(lambda: len(starts) >= 3)
+    scheduler.remove_tenant(1)
+    assert [b - a for a, b in pairwise(starts)][:2] == [60, 60]
+
+
+async def test_the_gap_is_live_editable_and_applies_to_the_next_wait():
+    time = VirtualTime()
+    tenant = _make_tenant(1, pull_min_gap_seconds=600)
+    repo = FakeTenantRepository([tenant])
+    starts: list[float] = []
+
+    async def pull(t: Tenant) -> bool:
+        starts.append(time.now)
+        return True
+
+    scheduler = _scheduler(repo, pull, time)
+    scheduler.reschedule_tenant(tenant)
+    await _until(lambda: len(starts) >= 1)
+    await _settle(5)  # the loop is now waiting out a 600s gap
+    repo.set(replace(tenant, pull_min_gap_seconds=60))
+    scheduler.reschedule_tenant(repo._tenants[0])
+    await _until(lambda: len(starts) >= 3)
+    scheduler.remove_tenant(1)
+    # The wait in progress honoured the new, shorter gap instead of finishing the old one.
+    assert starts[1] - starts[0] < 600 and starts[2] - starts[1] == 60
+
+
+async def test_first_pull_after_a_restart_waits_out_the_gap_since_the_last_pull():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=60)])
+    starts: list[float] = []
+
+    async def pull(tenant: Tenant) -> bool:
+        starts.append(time.now)
+        return True
+
+    async def last_pull(tenant: Tenant):
+        return datetime.now(UTC) - timedelta(seconds=20)  # a pull finished 20s ago
+
+    scheduler = _scheduler(repo, pull, time, last_pull_fn=last_pull)
+    t0 = time.now
+    scheduler.reschedule_tenant(repo._tenants[0])
+    await _until(lambda: len(starts) >= 1)
+    scheduler.remove_tenant(1)
+    assert 39 <= starts[0] - t0 <= 41  # 60s gap - 20s already elapsed
+
+
+async def test_a_tenant_never_pulled_pulls_at_once():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1)])
+    starts: list[float] = []
+
+    async def pull(tenant: Tenant) -> bool:
+        starts.append(time.now)
+        return True
+
+    async def never(tenant: Tenant):
+        return None
+
+    scheduler = _scheduler(repo, pull, time, last_pull_fn=never)
+    t0 = time.now
+    scheduler.reschedule_tenant(repo._tenants[0])
+    await _until(lambda: len(starts) >= 1)
+    scheduler.remove_tenant(1)
+    assert starts[0] == t0
+
+
+# -- one write cycle per new snapshot -------------------------------------------------
+
+
+async def test_a_write_cycle_runs_once_per_new_snapshot_and_not_for_a_pull_that_landed_nothing():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=10)])
+    outcomes = iter([True, False, True, False, False, True])  # rejected / failed pulls: False
+    pulls = 0
+    cycles: list[int] = []
+
+    async def pull(tenant: Tenant) -> bool:
+        nonlocal pulls
+        pulls += 1
+        return next(outcomes, False)
+
+    async def cycle(tenant: Tenant) -> None:
+        cycles.append(pulls)
+
+    scheduler = _scheduler(repo, pull, time, cycle_fn=cycle)
+    scheduler.reschedule_tenant(repo._tenants[0])
+    await _until(lambda: pulls >= 8)
+    await _settle()
+    scheduler.remove_tenant(1)
+    assert cycles == [1, 3, 6]  # exactly the pulls that landed a snapshot
+
+
+async def test_with_no_new_snapshot_no_write_cycle_ever_runs():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=10)])
+    pulls = 0
+    cycles = 0
+
+    async def pull(tenant: Tenant) -> bool:
+        nonlocal pulls
+        pulls += 1
+        return False
+
+    async def cycle(tenant: Tenant) -> None:
+        nonlocal cycles
+        cycles += 1
+
+    scheduler = _scheduler(repo, pull, time, cycle_fn=cycle)
+    scheduler.reschedule_tenant(repo._tenants[0])
+    await _until(lambda: pulls >= 5)
+    await _settle()
+    scheduler.remove_tenant(1)
+    assert cycles == 0
+
+
+async def test_a_cycle_that_outlasts_the_next_snapshot_skips_it_instead_of_stacking():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=10)])
     release = asyncio.Event()
-    call_count = 0
+    cycles_started = 0
+    running = 0
+    peak = 0
+    pulls = 0
+    skips: list[str] = []
 
-    async def sync_fn(tenant: Tenant) -> None:
-        nonlocal call_count
-        call_count += 1
-        started.set()
+    async def pull(tenant: Tenant) -> bool:
+        nonlocal pulls
+        pulls += 1
+        await time.work(5)
+        return True
+
+    async def cycle(tenant: Tenant) -> None:
+        nonlocal cycles_started, running, peak
+        cycles_started += 1
+        running += 1
+        peak = max(peak, running)
         await release.wait()
+        running -= 1
 
-    scheduler = TenantSyncScheduler(repo, sync_fn)
-    await scheduler.run_once()
-    await started.wait()
+    async def skip(kind: str, tenant: Tenant) -> None:
+        skips.append(kind)
 
-    # Second tick while the first run is still in flight should be skipped.
-    await scheduler.run_once()
-    await asyncio.sleep(0.05)
-    assert call_count == 1
+    scheduler = _scheduler(repo, pull, time, cycle_fn=cycle, skip_fn=skip)
+    scheduler.reschedule_tenant(repo._tenants[0])
+    await _until(lambda: len(skips) >= 4)  # snapshots land while the first cycle is still reading
+
+    assert cycles_started == 1 and peak == 1  # nothing queued, nothing overlapping
+    assert set(skips) == {"cycle"}  # every snapshot that found it busy was recorded as skipped
+    assert pulls >= 5  # and the pull loop was never held up by the cycle
 
     release.set()
-    await asyncio.sleep(0.05)
+    await _until(lambda: running == 0)
+    await _until(lambda: cycles_started >= 2)  # the next snapshot after the cycle gets its own
+    release.set()
+    scheduler.remove_tenant(1)
+    assert peak == 1
 
 
-def _job_interval(
-    scheduler: TenantSyncScheduler, tenant_id: int, kind: str = "pull"
-) -> timedelta | None:
-    job = scheduler._scheduler.get_job(f"tenant-{kind}-{tenant_id}")
-    return job.trigger.interval if job is not None else None
+async def test_an_on_demand_write_holding_the_write_lock_makes_the_cycle_skip():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=10)])
+    cycles = 0
+    skips: list[str] = []
+    pulls = 0
+
+    async def pull(tenant: Tenant) -> bool:
+        nonlocal pulls
+        pulls += 1
+        return True
+
+    async def cycle(tenant: Tenant) -> None:
+        nonlocal cycles
+        cycles += 1
+
+    async def skip(kind: str, tenant: Tenant) -> None:
+        skips.append(kind)
+
+    scheduler = _scheduler(repo, pull, time, cycle_fn=cycle, skip_fn=skip)
+    async with scheduler.write_lock_for_tenant(1):  # e.g. the "reconcile" ops command
+        scheduler.reschedule_tenant(repo._tenants[0])
+        await _until(lambda: pulls >= 3)
+        await _settle()
+        assert cycles == 0 and skips[:3] == ["cycle"] * 3
+    await _until(lambda: cycles >= 1)
+    scheduler.remove_tenant(1)
 
 
-async def test_each_tenant_gets_its_own_job_with_its_own_interval():
+async def test_a_cycle_that_raises_releases_the_write_lock_so_the_next_snapshot_runs():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=10)])
+    cycles = 0
+
+    async def pull(tenant: Tenant) -> bool:
+        return True
+
+    async def cycle(tenant: Tenant) -> None:
+        nonlocal cycles
+        cycles += 1
+        raise RuntimeError("boom")
+
+    scheduler = _scheduler(repo, pull, time, cycle_fn=cycle)
+    scheduler.reschedule_tenant(repo._tenants[0])
+    await _until(lambda: cycles >= 3)  # each failed cycle let the next snapshot start a new one
+    scheduler.remove_tenant(1)
+    await _settle()
+    assert not scheduler.locks.write(1).locked()
+
+
+async def test_the_cycle_is_per_tenant_one_slow_tenant_does_not_skip_another():
+    time = VirtualTime()
     repo = FakeTenantRepository(
-        [
-            replace(_make_tenant(1), sync_interval_minutes=15),
-            replace(_make_tenant(2), sync_interval_minutes=45),
-        ]
+        [_make_tenant(1, pull_min_gap_seconds=10), _make_tenant(2, pull_min_gap_seconds=10)]
     )
-    scheduler = TenantSyncScheduler(repo, lambda t: None)
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1) == timedelta(minutes=15)
-        assert _job_interval(scheduler, 2) == timedelta(minutes=45)
-    finally:
-        scheduler.shutdown()
-
-
-async def test_interval_change_reschedules_without_restart():
-    tenant = replace(_make_tenant(1), sync_interval_minutes=30)
-    repo = FakeTenantRepository([tenant])
-    scheduler = TenantSyncScheduler(repo, lambda t: None)
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1) == timedelta(minutes=30)
-
-        # Picked up from the stored row by the periodic reconcile...
-        repo.set(replace(tenant, sync_interval_minutes=20))
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1) == timedelta(minutes=20)
-
-        # ...and immediately when the tenant API pushes the saved tenant.
-        saved = replace(tenant, sync_interval_minutes=12)
-        repo.set(saved)
-        scheduler.reschedule_tenant(saved)
-        assert _job_interval(scheduler, 1) == timedelta(minutes=12)
-    finally:
-        scheduler.shutdown()
-
-
-async def test_reconcile_leaves_unchanged_jobs_alone():
-    repo = FakeTenantRepository([_make_tenant(1)])
-    scheduler = TenantSyncScheduler(repo, lambda t: None, push_fn=lambda t: None)
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        before = {k: scheduler._scheduler.get_job(f"tenant-{k}-1").next_run_time for k in ("pull", "push")}
-        await scheduler.reconcile()
-        after = {k: scheduler._scheduler.get_job(f"tenant-{k}-1").next_run_time for k in ("pull", "push")}
-        assert after == before
-    finally:
-        scheduler.shutdown()
-
-
-async def test_deactivated_tenant_loses_its_job():
-    tenant = _make_tenant(1)
-    repo = FakeTenantRepository([tenant])
-    scheduler = TenantSyncScheduler(repo, lambda t: None)
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1) is not None
-        repo.set(replace(tenant, active=False))
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1) is None
-    finally:
-        scheduler.shutdown()
-
-
-async def test_tick_syncs_the_freshly_stored_tenant_not_a_startup_snapshot():
-    tenant = _make_tenant(1)
-    repo = FakeTenantRepository([tenant])
-    seen: list[str] = []
-
-    async def sync_fn(t: Tenant) -> None:
-        seen.append(t.sync_mode.value)
-
-    scheduler = TenantSyncScheduler(repo, sync_fn)
-    await scheduler.reconcile()
-    repo.set(replace(tenant, sync_mode=SyncMode.INCREMENTAL))
-    await scheduler.run_tenant(1)
-    await asyncio.sleep(0.05)
-    assert seen == ["incremental"]
-
-
-# -- two workers per tenant -------------------------------------------------------
-
-
-async def _noop(tenant: Tenant) -> None:
-    return None
-
-
-async def test_each_tenant_gets_a_pull_job_and_a_push_job_with_their_own_intervals():
-    tenant = replace(_make_tenant(1), sync_interval_minutes=30, push_interval_minutes=5)
-    scheduler = TenantSyncScheduler(FakeTenantRepository([tenant]), _noop, push_fn=_noop)
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1, "pull") == timedelta(minutes=30)
-        assert _job_interval(scheduler, 1, "push") == timedelta(minutes=5)
-    finally:
-        scheduler.shutdown()
-
-
-async def test_push_interval_reschedules_live_without_touching_the_pull_job():
-    tenant = replace(_make_tenant(1), sync_interval_minutes=30, push_interval_minutes=5)
-    repo = FakeTenantRepository([tenant])
-    scheduler = TenantSyncScheduler(repo, _noop, push_fn=_noop)
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        pull_next = scheduler._scheduler.get_job("tenant-pull-1").next_run_time
-
-        # picked up from storage by the periodic reconcile...
-        repo.set(replace(tenant, push_interval_minutes=2))
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1, "push") == timedelta(minutes=2)
-
-        # ...and immediately when the tenant API pushes the saved tenant.
-        saved = replace(tenant, push_interval_minutes=1)
-        repo.set(saved)
-        scheduler.reschedule_tenant(saved)
-        assert _job_interval(scheduler, 1, "push") == timedelta(minutes=1)
-
-        assert _job_interval(scheduler, 1, "pull") == timedelta(minutes=30)
-        assert scheduler._scheduler.get_job("tenant-pull-1").next_run_time == pull_next
-    finally:
-        scheduler.shutdown()
-
-
-async def test_pull_interval_reschedules_live_without_touching_the_push_job():
-    tenant = replace(_make_tenant(1), sync_interval_minutes=30, push_interval_minutes=5)
-    repo = FakeTenantRepository([tenant])
-    scheduler = TenantSyncScheduler(repo, _noop, push_fn=_noop)
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        push_next = scheduler._scheduler.get_job("tenant-push-1").next_run_time
-        saved = replace(tenant, sync_interval_minutes=45)
-        repo.set(saved)
-        scheduler.reschedule_tenant(saved)
-        assert _job_interval(scheduler, 1, "pull") == timedelta(minutes=45)
-        assert scheduler._scheduler.get_job("tenant-push-1").next_run_time == push_next
-    finally:
-        scheduler.shutdown()
-
-
-async def test_deactivated_tenant_loses_both_jobs():
-    tenant = _make_tenant(1)
-    repo = FakeTenantRepository([tenant])
-    scheduler = TenantSyncScheduler(repo, _noop, push_fn=_noop)
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        repo.set(replace(tenant, active=False))
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1, "pull") is None
-        assert _job_interval(scheduler, 1, "push") is None
-    finally:
-        scheduler.shutdown()
-
-
-async def test_a_pull_tick_that_finds_the_previous_pull_running_is_skipped_and_recorded():
-    repo = FakeTenantRepository([_make_tenant(1)])
-    started, release = asyncio.Event(), asyncio.Event()
-    runs, skips = [], []
-
-    async def slow_pull(tenant: Tenant) -> None:
-        runs.append(tenant.id)
-        started.set()
-        await release.wait()
-
-    async def on_skip(kind: str, tenant: Tenant) -> None:
-        skips.append((kind, tenant.id))
-
-    scheduler = TenantSyncScheduler(repo, slow_pull, push_fn=_noop, skip_fn=on_skip)
-    await scheduler.run_tenant(1)
-    await started.wait()
-
-    await scheduler.run_tenant(1)  # next interval fires while the pull is still going
-    await scheduler.run_tenant(1)
-    assert runs == [1]  # never queued, never overlapped
-    assert skips == [("pull", 1), ("pull", 1)]
-
-    release.set()
-    await asyncio.sleep(0.02)
-    await scheduler.run_tenant(1)  # free again: runs normally
-    await asyncio.sleep(0.02)
-    assert runs == [1, 1]
-
-
-async def test_two_simultaneous_pull_ticks_start_only_one_pull():
-    repo = FakeTenantRepository([_make_tenant(1)])
     release = asyncio.Event()
-    runs = []
+    cycles: dict[int, int] = {1: 0, 2: 0}
 
-    async def slow_pull(tenant: Tenant) -> None:
-        runs.append(tenant.id)
-        await release.wait()
+    async def pull(tenant: Tenant) -> bool:
+        return True
 
-    scheduler = TenantSyncScheduler(repo, slow_pull, push_fn=_noop)
-    await asyncio.gather(scheduler.run_tenant(1), scheduler.run_tenant(1))
-    await asyncio.sleep(0.02)
-    assert runs == [1]
+    async def cycle(tenant: Tenant) -> None:
+        cycles[tenant.id] += 1
+        if tenant.id == 1:
+            await release.wait()
+
+    scheduler = _scheduler(repo, pull, time, cycle_fn=cycle)
+    await scheduler.align()
+    await _until(lambda: cycles[2] >= 3)
+    assert cycles[1] == 1
     release.set()
-    await asyncio.sleep(0.02)
+    scheduler.remove_tenant(1)
+    scheduler.remove_tenant(2)
 
 
-async def test_a_slow_pull_never_blocks_the_push():
-    repo = FakeTenantRepository([_make_tenant(1)])
-    started, release = asyncio.Event(), asyncio.Event()
-    pushes, skips = [], []
+# -- loop management --------------------------------------------------------------
 
-    async def slow_pull(tenant: Tenant) -> None:
-        started.set()
-        await release.wait()
 
-    async def push(tenant: Tenant) -> None:
-        pushes.append(tenant.id)
+async def test_inactive_tenants_get_no_loop_and_a_deactivated_one_stops():
+    time = VirtualTime()
+    active = _make_tenant(1, pull_min_gap_seconds=10)
+    repo = FakeTenantRepository([active, _make_tenant(2, active=False)])
+    pulled: set[int] = set()
 
-    async def on_skip(kind: str, tenant: Tenant) -> None:
-        skips.append(kind)
+    async def pull(tenant: Tenant) -> bool:
+        pulled.add(tenant.id)
+        return True
 
-    scheduler = TenantSyncScheduler(repo, slow_pull, push_fn=push, skip_fn=on_skip)
-    await scheduler.run_tenant(1)
-    await started.wait()
+    scheduler = _scheduler(repo, pull, time)
+    await scheduler.align()
+    await _until(lambda: 1 in pulled)
+    assert set(scheduler._loops) == {1} and pulled == {1}
 
-    for _ in range(3):  # three push ticks while BIMS is still being pulled
-        await scheduler.run_push_tenant(1)
-        await asyncio.sleep(0.02)
-    assert pushes == [1, 1, 1]
-    assert skips == []
-    release.set()
-    await asyncio.sleep(0.02)
+    repo.set(replace(active, active=False))  # deactivated through the API
+    await _until(lambda: not scheduler._loops or scheduler._loops[1].done())
+    await scheduler.align()
+    assert scheduler._loops == {}
 
 
-async def test_a_push_tick_that_finds_the_previous_push_running_is_skipped_and_recorded():
-    repo = FakeTenantRepository([_make_tenant(1)])
-    started, release = asyncio.Event(), asyncio.Event()
-    pushes, skips = [], []
+async def test_align_drops_the_loop_of_a_tenant_that_no_longer_exists():
+    time = VirtualTime()
+    repo = FakeTenantRepository([_make_tenant(1, pull_min_gap_seconds=10)])
 
-    async def slow_push(tenant: Tenant) -> None:
-        pushes.append(tenant.id)
-        started.set()
-        await release.wait()
+    async def pull(tenant: Tenant) -> bool:
+        return True
 
-    async def on_skip(kind: str, tenant: Tenant) -> None:
-        skips.append(kind)
-
-    scheduler = TenantSyncScheduler(repo, _noop, push_fn=slow_push, skip_fn=on_skip)
-    await scheduler.run_push_tenant(1)
-    await started.wait()
-    await scheduler.run_push_tenant(1)
-    assert pushes == [1] and skips == ["push"]
-    release.set()
-    await asyncio.sleep(0.02)
-
-
-async def test_the_shared_lock_makes_scheduled_ticks_stand_aside_for_a_one_shot():
-    repo = FakeTenantRepository([_make_tenant(1)])
-    runs, skips = [], []
-
-    async def work(tenant: Tenant) -> None:
-        runs.append(tenant.id)
-
-    async def on_skip(kind: str, tenant: Tenant) -> None:
-        skips.append(kind)
-
-    scheduler = TenantSyncScheduler(repo, work, push_fn=work, skip_fn=on_skip)
-    async with scheduler.lock_for_tenant(1):  # an operator's pull-now-then-push-now
-        await scheduler.run_tenant(1)
-        await scheduler.run_push_tenant(1)
-    assert runs == [] and sorted(skips) == ["pull", "push"]
-
-
-async def test_a_failing_skip_recorder_does_not_break_the_tick():
-    repo = FakeTenantRepository([_make_tenant(1)])
-    release = asyncio.Event()
-
-    async def slow(tenant: Tenant) -> None:
-        await release.wait()
-
-    async def broken_skip(kind: str, tenant: Tenant) -> None:
-        raise RuntimeError("db blip")
-
-    scheduler = TenantSyncScheduler(repo, slow, push_fn=_noop, skip_fn=broken_skip)
-    await scheduler.run_tenant(1)
-    await scheduler.run_tenant(1)  # skip recording explodes; the tick must survive
-    release.set()
-    await asyncio.sleep(0.02)
-
-
-async def test_first_pull_runs_at_boot_when_there_is_no_snapshot_history():
-    tenant = replace(_make_tenant(1), sync_interval_minutes=30)
-
-    async def never_pulled(t: Tenant):
-        return None
-
-    scheduler = TenantSyncScheduler(
-        FakeTenantRepository([tenant]), _noop, push_fn=_noop, last_pull_fn=never_pulled
-    )
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        next_pull = scheduler._scheduler.get_job("tenant-pull-1").next_run_time
-        assert next_pull - datetime.now(UTC) < timedelta(seconds=5)
-    finally:
-        scheduler.shutdown()
-
-
-async def test_a_restart_does_not_repull_a_fresh_snapshot_nor_starve_an_old_one():
-    fresh = replace(_make_tenant(1), sync_interval_minutes=30)
-    old = replace(_make_tenant(2), sync_interval_minutes=30)
-    now = datetime.now(UTC)
-    last = {1: now - timedelta(minutes=5), 2: now - timedelta(hours=3)}
-
-    async def last_pull(t: Tenant):
-        return last[t.id]
-
-    scheduler = TenantSyncScheduler(
-        FakeTenantRepository([fresh, old]), _noop, push_fn=_noop, last_pull_fn=last_pull
-    )
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        fresh_next = scheduler._scheduler.get_job("tenant-pull-1").next_run_time
-        old_next = scheduler._scheduler.get_job("tenant-pull-2").next_run_time
-        assert timedelta(minutes=24) < fresh_next - now < timedelta(minutes=26)  # 30 - 5
-        assert old_next - datetime.now(UTC) < timedelta(seconds=5)  # overdue: now
-    finally:
-        scheduler.shutdown()
-
-
-# -- reconcile worker: a third, slow, per-tenant job -------------------------------
-
-
-async def test_each_tenant_also_gets_a_reconcile_job_on_its_own_interval():
-    tenant = replace(
-        _make_tenant(1), sync_interval_minutes=30, push_interval_minutes=5, reconcile_interval_minutes=480
-    )
-    scheduler = TenantSyncScheduler(
-        FakeTenantRepository([tenant]), _noop, push_fn=_noop, reconcile_fn=_noop
-    )
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1, "reconcile") == timedelta(minutes=480)
-        assert _job_interval(scheduler, 1, "pull") == timedelta(minutes=30)
-        assert _job_interval(scheduler, 1, "push") == timedelta(minutes=5)
-    finally:
-        scheduler.shutdown()
-
-
-async def test_reconcile_interval_reschedules_live_without_touching_the_other_jobs():
-    tenant = replace(_make_tenant(1), reconcile_interval_minutes=480)
-    repo = FakeTenantRepository([tenant])
-    scheduler = TenantSyncScheduler(repo, _noop, push_fn=_noop, reconcile_fn=_noop)
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        push_next = scheduler._scheduler.get_job("tenant-push-1").next_run_time
-
-        repo.set(replace(tenant, reconcile_interval_minutes=240))  # picked up from storage
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1, "reconcile") == timedelta(minutes=240)
-
-        saved = replace(tenant, reconcile_interval_minutes=120)  # and by the tenant API at once
-        repo.set(saved)
-        scheduler.reschedule_tenant(saved)
-        assert _job_interval(scheduler, 1, "reconcile") == timedelta(minutes=120)
-        assert scheduler._scheduler.get_job("tenant-push-1").next_run_time == push_next
-    finally:
-        scheduler.shutdown()
-
-
-async def test_a_deactivated_or_removed_tenant_loses_its_reconcile_job_too():
-    tenant = _make_tenant(1)
-    repo = FakeTenantRepository([tenant])
-    scheduler = TenantSyncScheduler(repo, _noop, push_fn=_noop, reconcile_fn=_noop)
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        repo.set(replace(tenant, active=False))
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1, "reconcile") is None
-        repo.set(tenant)
-        await scheduler.reconcile()
-        assert _job_interval(scheduler, 1, "reconcile") is not None
-        scheduler.remove_tenant(1)
-        assert _job_interval(scheduler, 1, "reconcile") is None
-    finally:
-        scheduler.shutdown()
-
-
-async def test_a_reconcile_tick_waits_for_a_running_push_and_never_overlaps_it():
-    repo = FakeTenantRepository([_make_tenant(1)])
-    push_started, release_push = asyncio.Event(), asyncio.Event()
-    events: list[str] = []
-
-    async def slow_push(tenant: Tenant) -> None:
-        events.append("push-start")
-        push_started.set()
-        await release_push.wait()
-        events.append("push-end")
-
-    async def reconcile(tenant: Tenant) -> None:
-        events.append("reconcile")
-
-    scheduler = TenantSyncScheduler(repo, _noop, push_fn=slow_push, reconcile_fn=reconcile)
-    await scheduler.run_push_tenant(1)
-    await push_started.wait()
-
-    await scheduler.run_reconcile_tenant(1)
-    await asyncio.sleep(0.03)
-    assert events == ["push-start"]  # waiting, not running beside the push
-
-    release_push.set()
-    await asyncio.sleep(0.03)
-    assert events == ["push-start", "push-end", "reconcile"]
-
-
-async def test_a_push_tick_stands_aside_while_a_reconcile_is_running():
-    repo = FakeTenantRepository([_make_tenant(1)])
-    started, release = asyncio.Event(), asyncio.Event()
-    pushes, skips = [], []
-
-    async def slow_reconcile(tenant: Tenant) -> None:
-        started.set()
-        await release.wait()
-
-    async def push(tenant: Tenant) -> None:
-        pushes.append(tenant.id)
-
-    async def on_skip(kind: str, tenant: Tenant) -> None:
-        skips.append(kind)
-
-    scheduler = TenantSyncScheduler(
-        repo, _noop, push_fn=push, reconcile_fn=slow_reconcile, skip_fn=on_skip
-    )
-    await scheduler.run_reconcile_tenant(1)
-    await started.wait()
-    await scheduler.run_push_tenant(1)
-    assert pushes == [] and skips == ["push"]
-    release.set()
-    await asyncio.sleep(0.03)
-    await scheduler.run_push_tenant(1)
-    await asyncio.sleep(0.03)
-    assert pushes == [1]
-
-
-async def test_a_reconcile_tick_that_finds_the_previous_reconcile_running_is_skipped_and_recorded():
-    repo = FakeTenantRepository([_make_tenant(1)])
-    started, release = asyncio.Event(), asyncio.Event()
-    runs, skips = [], []
-
-    async def slow_reconcile(tenant: Tenant) -> None:
-        runs.append(tenant.id)
-        started.set()
-        await release.wait()
-
-    async def on_skip(kind: str, tenant: Tenant) -> None:
-        skips.append(kind)
-
-    scheduler = TenantSyncScheduler(
-        repo, _noop, push_fn=_noop, reconcile_fn=slow_reconcile, skip_fn=on_skip
-    )
-    await scheduler.run_reconcile_tenant(1)
-    await started.wait()
-    await scheduler.run_reconcile_tenant(1)
-    assert runs == [1] and skips == ["reconcile"]
-    release.set()
-    await asyncio.sleep(0.03)
-
-
-async def test_a_reconcile_does_not_block_the_pull():
-    repo = FakeTenantRepository([_make_tenant(1)])
-    started, release = asyncio.Event(), asyncio.Event()
-    pulls = []
-
-    async def slow_reconcile(tenant: Tenant) -> None:
-        started.set()
-        await release.wait()
-
-    async def pull(tenant: Tenant) -> None:
-        pulls.append(tenant.id)
-
-    scheduler = TenantSyncScheduler(repo, pull, push_fn=_noop, reconcile_fn=slow_reconcile)
-    await scheduler.run_reconcile_tenant(1)
-    await started.wait()
-    await scheduler.run_tenant(1)
-    await asyncio.sleep(0.03)
-    assert pulls == [1]
-    release.set()
-    await asyncio.sleep(0.03)
-
-
-async def test_the_one_shot_lock_and_the_reconcile_exclude_each_other():
-    repo = FakeTenantRepository([_make_tenant(1)])
-    runs, skips = [], []
-
-    async def reconcile(tenant: Tenant) -> None:
-        runs.append("reconcile")
-
-    scheduler = TenantSyncScheduler(repo, _noop, push_fn=_noop, reconcile_fn=reconcile)
-    async with scheduler.lock_for_tenant(1):  # pull-now-then-push-now holds the push lock
-        await scheduler.run_reconcile_tenant(1)
-        await asyncio.sleep(0.03)
-        assert runs == []  # the reconcile waits for the one-shot
-    await asyncio.sleep(0.03)
-    assert runs == ["reconcile"]
-    assert skips == []
-
-
-async def test_first_reconcile_waits_a_grace_period_when_there_is_no_history():
-    tenant = replace(_make_tenant(1), reconcile_interval_minutes=480)
-
-    async def never(t: Tenant):
-        return None
-
-    scheduler = TenantSyncScheduler(
-        FakeTenantRepository([tenant]),
-        _noop,
-        push_fn=_noop,
-        reconcile_fn=_noop,
-        last_reconcile_fn=never,
-    )
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        nxt = scheduler._scheduler.get_job("tenant-reconcile-1").next_run_time
-        assert timedelta(minutes=4) < nxt - datetime.now(UTC) < timedelta(minutes=6)
-    finally:
-        scheduler.shutdown()
-
-
-async def test_a_restart_does_not_starve_the_reconcile_nor_repeat_a_recent_one():
-    recent = replace(_make_tenant(1), reconcile_interval_minutes=480)
-    overdue = replace(_make_tenant(2), reconcile_interval_minutes=480)
-    now = datetime.now(UTC)
-    last = {1: now - timedelta(hours=1), 2: now - timedelta(hours=20)}
-
-    async def last_reconcile(t: Tenant):
-        return last[t.id]
-
-    scheduler = TenantSyncScheduler(
-        FakeTenantRepository([recent, overdue]),
-        _noop,
-        push_fn=_noop,
-        reconcile_fn=_noop,
-        last_reconcile_fn=last_reconcile,
-    )
-    scheduler.start()
-    try:
-        await scheduler.reconcile()
-        recent_next = scheduler._scheduler.get_job("tenant-reconcile-1").next_run_time
-        overdue_next = scheduler._scheduler.get_job("tenant-reconcile-2").next_run_time
-        assert timedelta(hours=6) < recent_next - now < timedelta(hours=7, minutes=1)  # 8h - 1h
-        assert overdue_next - now < timedelta(minutes=6)  # overdue: after the grace only
-    finally:
-        scheduler.shutdown()
+    scheduler = _scheduler(repo, pull, time)
+    await scheduler.align()
+    assert set(scheduler._loops) == {1}
+    repo._tenants = []
+    await scheduler.align()
+    assert scheduler._loops == {}

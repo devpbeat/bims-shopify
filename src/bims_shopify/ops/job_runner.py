@@ -72,8 +72,8 @@ class JobRunner:
         # (`POST /sync/{slug}/run`) for the same tenant -- all three share
         # the exact same lock object. See `set_sync_lock_provider`.
         self._tenant_sync_lock_provider: Callable[[int], asyncio.Lock] | None = None
-        # Same idea for "reconcile": the scheduler's reconcile lock + push lock,
-        # so an on-demand reconcile never runs beside a scheduled one or a push.
+        # Same idea for "reconcile": the scheduler's write lock, so an on-demand
+        # reconcile never runs beside a scheduled write cycle or a manual sync.
         self._tenant_reconcile_lock_provider: Callable[[int], asyncio.Lock] | None = None
 
     def set_sync_lock_provider(self, provider: Callable[[int], asyncio.Lock]) -> None:

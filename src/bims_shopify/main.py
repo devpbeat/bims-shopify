@@ -37,9 +37,7 @@ from bims_shopify.ops.job_runner import JobRunner
 from bims_shopify.ops.sync_workers import (
     do_cycle,
     do_pull,
-    do_reconcile,
     last_pull_at,
-    last_reconcile_at,
     record_skip,
 )
 from bims_shopify.scheduler import TenantSyncScheduler
@@ -88,17 +86,19 @@ def _run_migrations(database_url: str) -> None:
 
 
 def _make_pull_fn(session_factory):
-    """Build the scheduler's per-tenant PULL callback (BIMS -> snapshot).
+    """Build the pull loop's per-tenant PULL callback (BIMS -> snapshot).
 
     The same ``do_pull`` the manual one-shot runs, so a scheduled pull and a
     manual one never diverge: the sanity guard, the atomic snapshot write, the
-    catalog stats and the outcome bookkeeping are all inside it.
+    catalog stats and the outcome bookkeeping are all inside it. Returns True
+    when a new snapshot landed (a write cycle is then due), False when the pull
+    was rejected by the sanity guard or failed (nothing new landed).
     """
 
-    async def _pull_tenant(tenant) -> None:
+    async def _pull_tenant(tenant) -> bool:
         async with session_factory() as session:
             try:
-                await do_pull(tenant, session, trigger="scheduled")
+                result = await do_pull(tenant, session, trigger="scheduled")
             except Exception as exc:  # one tenant's failure must not affect others
                 logger.error(
                     "scheduled_pull_tenant_failed",
@@ -106,58 +106,36 @@ def _make_pull_fn(session_factory):
                     tenant_id=tenant.id,
                     error=str(exc),
                 )
+                return False
+            return result["status"] == "ok"
 
     return _pull_tenant
 
 
-def _make_push_fn(session_factory):
-    """Build the scheduler's per-tenant PUSH callback (snapshot -> Shopify).
+def _make_cycle_fn(session_factory):
+    """Build the per-tenant WRITE CYCLE callback (snapshot -> Shopify), run once per
+    new snapshot.
 
-    ``do_cycle``: the same ``do_push`` the manual one-shot runs, followed by
-    the self-healing stages (create what BIMS has in stock and the store
-    lacks, publish what qualifies). It never calls BIMS and declines, with a
-    recorded reason, when the snapshot is missing, incomplete or older than
+    ``do_cycle``: the stock reconciliation against Shopify's real quantities,
+    followed by the self-healing stages (create what BIMS has in stock and the
+    store lacks, publish what qualifies). It never calls BIMS and declines, with
+    a recorded reason, when the snapshot is missing, incomplete or older than
     the tenant's staleness limit.
     """
 
-    async def _push_tenant(tenant) -> None:
+    async def _cycle_tenant(tenant) -> None:
         async with session_factory() as session:
             try:
                 await do_cycle(tenant, session, trigger="scheduled")
             except Exception as exc:  # one tenant's failure must not affect others
                 logger.error(
-                    "scheduled_push_tenant_failed",
+                    "scheduled_cycle_tenant_failed",
                     tenant_slug=tenant.slug,
                     tenant_id=tenant.id,
                     error=str(exc),
                 )
 
-    return _push_tenant
-
-
-def _make_reconcile_fn(session_factory):
-    """Build the scheduler's per-tenant RECONCILE callback (Shopify's real
-    quantities vs the snapshot).
-
-    The same ``do_reconcile`` the ``reconcile`` ops command runs. The
-    scheduler runs it holding the tenant's push lock, so it never overlaps a
-    push; it declines, with a recorded reason, on a missing, incomplete or
-    stale snapshot, exactly as the push does.
-    """
-
-    async def _reconcile_tenant(tenant) -> None:
-        async with session_factory() as session:
-            try:
-                await do_reconcile(tenant, session, trigger="scheduled")
-            except Exception as exc:  # one tenant's failure must not affect others
-                logger.error(
-                    "scheduled_reconcile_tenant_failed",
-                    tenant_slug=tenant.slug,
-                    tenant_id=tenant.id,
-                    error=str(exc),
-                )
-
-    return _reconcile_tenant
+    return _cycle_tenant
 
 
 def create_app() -> FastAPI:
@@ -188,21 +166,19 @@ def create_app() -> FastAPI:
                 repo,
                 _make_pull_fn(session_factory),
                 repository_scope=tenant_repository_scope,
-                push_fn=_make_push_fn(session_factory),
-                reconcile_fn=_make_reconcile_fn(session_factory),
-                last_reconcile_fn=functools.partial(last_reconcile_at, session_factory),
+                cycle_fn=_make_cycle_fn(session_factory),
                 skip_fn=functools.partial(record_skip, session_factory),
                 last_pull_fn=functools.partial(last_pull_at, session_factory),
             )
         app.state.scheduler = scheduler
         # Share this scheduler's per-tenant locks with the "sync" ops job
-        # (see JobRunner._run): the combined pull+push lock, so a background
-        # sync job, the scheduled pull and push ticks, and a manual HTTP sync
-        # can never overlap for the same tenant.
+        # (see JobRunner._run): the combined pull+write lock, so a background
+        # sync job, the scheduled pull loop and write cycles, and a manual HTTP
+        # sync can never overlap for the same tenant.
         job_runner.set_sync_lock_provider(scheduler.lock_for_tenant)
-        # The "reconcile" ops job holds the reconcile lock and the push lock,
-        # like the scheduled reconcile, so neither overlaps a push.
-        job_runner.set_reconcile_lock_provider(scheduler.reconcile_lock_for_tenant)
+        # The "reconcile" ops job holds the write lock, like the scheduled write
+        # cycle, so the two never overlap.
+        job_runner.set_reconcile_lock_provider(scheduler.write_lock_for_tenant)
         scheduler.start()
 
         # Separate ticking loop from the inventory-sync scheduler above: this
