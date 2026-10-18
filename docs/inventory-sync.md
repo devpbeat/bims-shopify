@@ -344,6 +344,79 @@ and recorded. It does not take the pull lock: a pull may still land a new snapsh
 the reconcile keeps using the one it started from. The one-shot `sync` holds the push
 lock too, so it excludes the reconcile.
 
+## The self-healing cycle: the store follows BIMS by itself
+
+The push tick is a cycle. Besides stock, it closes the gap between what BIMS
+has in stock and what the store holds, with nobody running anything by hand.
+Everything is judged from the persisted snapshot; BIMS is never called.
+
+1. **Push stock** (`do_push`), exactly as before. It goes first on purpose: its
+   mass-zero / max-changed guard judges the snapshot before anything is
+   created, and a snapshot the guard flagged creates and publishes nothing.
+2. **Create what is missing** (`auto_create_missing`). A group (product) with
+   confirmed stock in BIMS and no SKU in the store is created through
+   `productSet`, as a DRAFT. A size added in BIMS to a product already in the
+   store is added to THAT product through `productVariantsBulkCreate`, tracked
+   and activated at the tenant location. A size value the product already has
+   under another SKU is a **conflict**: it is recorded and never forced. If it
+   created anything, a second push runs (never skipped as "unchanged") so the
+   new variants receive their stock.
+3. **Publish what qualifies** (`auto_publish`). Drafts that pass the manual
+   `publish` gates, unchanged (an image unless the tenant sets
+   `field_mappings.publish_require_images=false`, confirmed stock above zero on
+   some SKU, every SKU known to BIMS) are activated and put on the Online Store
+   channel. This runs after the stock push, so a product is never public while
+   it shows zero.
+
+Both stages default ON per tenant and can be switched off with
+`PATCH /tenants/{slug}` (`{"auto_create_missing": false}` /
+`{"auto_publish": false}`): no deploy, no restart. The stock push is not a stage
+and always runs.
+
+### What it refuses to do
+
+* No usable snapshot (missing, incomplete, stale): both stages decline, same
+  rule as the push, and Shopify is not touched.
+* The push guard fired on this snapshot: both stages decline (`push_guard_fired`).
+* A SKU that is not `code2` (`field_mappings.product_sku_field`): the create
+  stage declines, because the import names variants after `code2`.
+* Stock absent from the BIMS answer is UNKNOWN, never zero: such a product is
+  not created and not published. Stock comes from the snapshot, which was
+  consolidated with `consolidate_sellable_stock` at pull time.
+* Most of what BIMS has in stock "missing" from a store that has a real catalog
+  (more than `field_mappings.max_create_ratio`, default 0.5, once at least 50
+  SKUs match) is `needs_confirmation`: nothing is written. Use the manual
+  `import` after looking at why.
+* At most `field_mappings.max_create_per_cycle` (default 300) product groups are
+  written per cycle; the rest continue on the next tick.
+* The pull, push and reconcile locks are untouched: the cycle runs under the
+  push lock, so a reconcile or a manual sync stands aside exactly as for a push.
+
+### Cost
+
+A healthy steady state does almost nothing. The create stage remembers which SKUs
+Shopify held at its last scan (`sync_states.shopify_sku_index`):
+
+| Situation | Shopify calls from the stages |
+| --- | --- |
+| Same snapshot as the last cycle | 0 |
+| New snapshot, every wanted SKU already known | create: 0; publish: 1 draft listing (a page per 100 drafts) |
+| New BIMS SKU or a failed creation to retry | one full variant scan, then one write per product group |
+| Every 6 hours | one full variant scan (picks up products deleted in the admin) |
+| A cycle that created something | + a second push (one more variant scan) and the publish writes |
+
+Conflicts are parked in the index so they do not trigger a scan on every pull.
+
+### Reading what it did
+
+`GET /sync/{slug}/snapshot` returns `last_heal` with one entry per stage, each
+with the snapshot it judged and when: `create` (`created`, `variants_added`,
+`conflicts`, `failed`, `deferred`) and `publish` (`published`, `skipped_no_images`,
+`skipped_no_stock`, `unknown`). `GET /sync/{slug}/status` carries the same under
+`last_heal_outcome`. Each action is also audited (`sync.create_ok`,
+`sync.create_needs_confirmation`, `sync.publish_completed`, ...) and a cycle that
+healed something logs `scheduled_cycle_healed` with the counts.
+
 ## Intervals
 
 `sync_interval_minutes` is the **pull** interval (default 30, the name predates the

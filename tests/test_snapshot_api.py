@@ -147,6 +147,8 @@ async def test_snapshot_endpoint_exposes_metadata_age_history_and_worker_outcome
         "reconcile_interval_minutes": 480,
         "snapshot_max_age_minutes": 120,
         "pull_max_drop_ratio": 0.3,
+        "auto_create_missing": True,
+        "auto_publish": True,
     }
 
 
@@ -225,3 +227,26 @@ async def test_sync_status_carries_the_reconcile_outcome_and_interval(ctx):
     assert body["last_reconcile_outcome"]["drift"]["count"] == 800
     interval = body["reconcile_interval"]
     assert interval["configured_minutes"] == 480 and interval["min_safe_minutes"] == 60
+
+
+async def test_snapshot_endpoint_reports_what_each_self_healing_stage_did(ctx):
+    app, session_factory, acme = ctx
+    body = (await _get(app, "/sync/acme/snapshot")).json()
+    assert body["last_heal"] is None
+    assert body["settings"]["auto_create_missing"] is True
+    assert body["settings"]["auto_publish"] is True
+
+    async with session_factory() as session:
+        await SqlAlchemySyncStateRepository(session).set_last_heal_outcome(
+            acme.id,
+            {
+                "create": {"status": "ok", "created": {"products": 2, "variants": 6, "sample": []}},
+                "publish": {"status": "ok", "published": {"count": 2, "sample": []}},
+            },
+        )
+    body = (await _get(app, "/sync/acme/snapshot")).json()
+    assert body["last_heal"]["create"]["created"]["products"] == 2
+    assert body["last_heal"]["publish"]["published"]["count"] == 2
+
+    status = (await _get(app, "/sync/acme/status")).json()
+    assert status["last_heal_outcome"]["create"]["status"] == "ok"

@@ -178,6 +178,11 @@ async def get_snapshot(
         # Apart from the push on purpose: "the push had nothing to do" and
         # "the reconcile found N silently wrong SKUs" must never look alike.
         "last_reconcile": status["last_reconcile_outcome"],
+        # What the scheduled cycle's stages last did, one entry per stage
+        # (``create``: products created, variants added, conflicts, failures;
+        # ``publish``: drafts published and the gates' skips), each with the
+        # snapshot it judged and when.
+        "last_heal": status["last_heal_outcome"],
         "max_age_minutes": tenant.snapshot_max_age_minutes,
         "usable_for_push": verdict is None,
         "decline": {"reason": verdict[0], **verdict[1]} if verdict else None,
@@ -187,6 +192,8 @@ async def get_snapshot(
             "reconcile_interval_minutes": tenant.reconcile_interval_minutes,
             "snapshot_max_age_minutes": tenant.snapshot_max_age_minutes,
             "pull_max_drop_ratio": tenant.pull_max_drop_ratio,
+            "auto_create_missing": tenant.auto_create_missing,
+            "auto_publish": tenant.auto_publish,
         },
     }
 
