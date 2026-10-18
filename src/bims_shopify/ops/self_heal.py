@@ -225,12 +225,13 @@ async def publish_qualifying(
             drafts.append(node)
         # Draft products can never be "already done", so the publication id is
         # only needed once there is something to publish.
-        plan = compute_publish_plan(
-            drafts, stock, publication_id="", limit=MAX_PUBLISH_PER_CYCLE, require_images=require_images
-        )
+        plan = compute_publish_plan(drafts, stock, publication_id="", require_images=require_images)
+        deferred = max(0, len(plan.targets) - MAX_PUBLISH_PER_CYCLE)
+        plan.targets = plan.targets[:MAX_PUBLISH_PER_CYCLE]
         report = build_publish_report(plan)
         report["require_images"] = require_images
         report["drafts_scanned"] = len(drafts)
+        report["deferred"] = deferred
         if not plan.targets:
             return PublishStageResult("noop", report)
 

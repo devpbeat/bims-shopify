@@ -50,6 +50,7 @@ from bims_shopify.ops.self_heal import (
     DECLINE_PUSH_GUARD,
     create_missing,
     eligible_groups,
+    publish_qualifying,
     sku_field_decline,
 )
 
@@ -1004,6 +1005,35 @@ async def _decline_stage(
     return {"status": "declined", "reason": reason, "detail": detail}
 
 
+async def _stage_verdict(
+    tenant: Tenant,
+    state: SqlAlchemySyncStateRepository,
+    meta: SnapshotMeta | None,
+    now: datetime,
+    *,
+    sku_field: bool = False,
+) -> tuple[str, dict[str, Any]] | None:
+    """Why a catalog-writing stage must not act now, or ``None`` when it may.
+
+    The same snapshot rules the push applies (missing, incomplete, stale), plus:
+    the push's mass-zero / max-changed guard having fired on this very
+    snapshot (a snapshot that looks wrong must not create or publish anything),
+    and, for the create stage, a SKU field the import cannot name variants after.
+    """
+    verdict = snapshot_decline(meta, tenant, now)
+    if verdict is None and sku_field:
+        verdict = sku_field_decline(tenant)
+    if verdict is None and meta is not None:
+        push = await state.get_last_push_outcome(tenant.id)
+        if (
+            push is not None
+            and push.get("status") == "needs_confirmation"
+            and push.get("snapshot_id") == meta.id
+        ):
+            verdict = (DECLINE_PUSH_GUARD, {"snapshot_id": meta.id, "push_reason": push.get("reason")})
+    return verdict
+
+
 async def do_create_missing(
     tenant: Tenant,
     session: AsyncSession,
@@ -1041,15 +1071,7 @@ async def do_create_missing(
     meta = await snapshots.get_current_meta(tenant.id)
     prior = (await state.get_last_heal_outcome(tenant.id) or {}).get(STAGE_CREATE)
 
-    verdict = snapshot_decline(meta, tenant, now) or sku_field_decline(tenant)
-    if verdict is None and meta is not None:
-        push = await state.get_last_push_outcome(tenant.id)
-        if (
-            push is not None
-            and push.get("status") == "needs_confirmation"
-            and push.get("snapshot_id") == meta.id
-        ):
-            verdict = (DECLINE_PUSH_GUARD, {"snapshot_id": meta.id, "push_reason": push.get("reason")})
+    verdict = await _stage_verdict(tenant, state, meta, now, sku_field=True)
     if verdict is not None:
         return await _decline_stage(tenant, state, audit, STAGE_CREATE, prior, meta, verdict, trigger)
     if meta is None:  # unreachable: snapshot_decline reports a missing snapshot
@@ -1140,6 +1162,119 @@ async def do_create_missing(
         "written_skus": len(result.written_skus),
         "snapshot_id": meta.id,
     }
+
+
+async def do_publish(
+    tenant: Tenant,
+    session: AsyncSession,
+    *,
+    trigger: str = "scheduled",
+    force: bool = False,
+) -> dict[str, Any]:
+    """Stage 3 of the scheduled cycle: publish the drafts that pass the publish gates.
+
+    The gates are the manual ``publish`` command's, unchanged (see
+    ``ops.self_heal.publish_qualifying``); the stock is the snapshot's.
+
+    * ``disabled``: the tenant switched ``auto_publish`` off. Nothing is read,
+      written or recorded.
+    * ``declined``: same refusals as the create stage (no usable snapshot, or
+      the push guard fired on this snapshot). Shopify is not touched.
+    * ``unchanged``: this snapshot was already handled and ``force`` is not set.
+      The caller forces a run when a stage just created products, because new
+      products are drafts waiting for exactly this.
+    * ``noop``: no draft qualifies. Costs the draft listing and nothing else.
+    * ``ok``: drafts activated and put on the Online Store channel.
+
+    The caller holds the tenant's push lock.
+    """
+    if tenant.id is None:
+        raise ValueError("tenant must be persisted before publishing")
+    if not tenant.auto_publish:
+        return {"status": "disabled"}
+    state = SqlAlchemySyncStateRepository(session)
+    audit = SqlAlchemyAuditLogger(session)
+    snapshots = SqlAlchemySnapshotRepository(session)
+    now = _now()
+    meta = await snapshots.get_current_meta(tenant.id)
+    prior = (await state.get_last_heal_outcome(tenant.id) or {}).get(STAGE_PUBLISH)
+
+    verdict = await _stage_verdict(tenant, state, meta, now)
+    if verdict is not None:
+        return await _decline_stage(tenant, state, audit, STAGE_PUBLISH, prior, meta, verdict, trigger)
+    if meta is None:  # unreachable: snapshot_decline reports a missing snapshot
+        raise RuntimeError("publish stage reached the snapshot read without a snapshot")
+
+    if (
+        not force
+        and prior is not None
+        and prior.get("snapshot_id") == meta.id
+        and prior.get("status") in ("ok", "noop")
+        and not prior.get("deferred")
+        and not (prior.get("failed") or {}).get("count")
+    ):
+        return {"status": "unchanged", "snapshot_id": meta.id}
+
+    snapshot = await snapshots.load(meta)
+    require_images = bool(tenant.field_mappings.get("publish_require_images", True))
+    clock = time.perf_counter()
+    try:
+        result = await publish_qualifying(
+            tenant, snapshot, lambda: ShopifyClient(tenant), require_images=require_images
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        logger.error("sync_publish_failed", tenant_slug=tenant.slug, tenant_id=tenant.id, error=error)
+        await _record_stage(
+            state,
+            tenant.id,
+            STAGE_PUBLISH,
+            {
+                "status": "failed",
+                "error": error,
+                "snapshot_id": meta.id,
+                "at": _now().isoformat(),
+                "trigger": trigger,
+            },
+        )
+        await audit.log(
+            actor="system",
+            action="sync.publish_error",
+            entity="sync_run",
+            tenant_id=tenant.id,
+            payload={"error": error, "snapshot_id": meta.id, "trigger": trigger},
+        )
+        raise
+
+    await _record_stage(
+        state,
+        tenant.id,
+        STAGE_PUBLISH,
+        {
+            "status": result.status,
+            "snapshot_id": meta.id,
+            "duration_seconds": time.perf_counter() - clock,
+            "at": _now().isoformat(),
+            "trigger": trigger,
+            **result.report,
+        },
+    )
+    if result.status == "ok":
+        logger.info(
+            "sync_publish_completed",
+            tenant_slug=tenant.slug,
+            tenant_id=tenant.id,
+            published=result.report["published"]["count"],
+            snapshot_id=meta.id,
+        )
+        await audit.log(
+            actor="system",
+            action="sync.publish_completed",
+            entity="sync_run",
+            tenant_id=tenant.id,
+            payload={"snapshot_id": meta.id, "trigger": trigger, **result.report},
+        )
+    return {"status": result.status, "report": result.report, "snapshot_id": meta.id}
 
 
 # -- ONE-SHOT -----------------------------------------------------------------
