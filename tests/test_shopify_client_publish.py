@@ -135,3 +135,78 @@ async def test_publish_product_raises_on_user_errors(shopify_client, tenant):
         await shopify_client.publish_product(
             "gid://shopify/Product/1", ["gid://shopify/Publication/1"]
         )
+
+
+@respx.mock
+async def test_iter_all_variants_selects_the_option_values(shopify_client, tenant):
+    route = respx.post(
+        f"https://{tenant.shopify_shop_domain}/admin/api/2025-07/graphql.json/"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "productVariants": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [
+                            {
+                                "id": "v1",
+                                "sku": "A",
+                                "product": {"id": "p1", "title": "T"},
+                                "selectedOptions": [{"name": "Size", "value": "M"}],
+                            }
+                        ],
+                    }
+                }
+            },
+        )
+    )
+    nodes = [n async for n in shopify_client.iter_all_variants()]
+    assert nodes[0]["selectedOptions"] == [{"name": "Size", "value": "M"}]
+    assert "selectedOptions" in route.calls[0].request.content.decode()
+
+
+@respx.mock
+async def test_bulk_create_variants_sends_product_id_and_checks_user_errors(
+    shopify_client, tenant
+):
+    import json
+
+    from bims_shopify.adapters.shopify.client import ShopifyGraphQLError
+
+    url = f"https://{tenant.shopify_shop_domain}/admin/api/2025-07/graphql.json/"
+    route = respx.post(url).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "productVariantsBulkCreate": {
+                        "productVariants": [{"id": "v9", "sku": "A"}],
+                        "userErrors": [],
+                    }
+                }
+            },
+        )
+    )
+    variants = [{"price": "10", "inventoryItem": {"sku": "A", "tracked": True}}]
+    created = await shopify_client.bulk_create_variants("gid://shopify/Product/1", variants)
+    assert created == [{"id": "v9", "sku": "A"}]
+    sent = json.loads(route.calls[0].request.content)
+    assert "productVariantsBulkCreate" in sent["query"]
+    assert sent["variables"] == {"productId": "gid://shopify/Product/1", "variants": variants}
+
+    respx.post(url).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "productVariantsBulkCreate": {
+                        "productVariants": [],
+                        "userErrors": [{"field": ["variants", "0"], "message": "taken"}],
+                    }
+                }
+            },
+        )
+    )
+    with pytest.raises(ShopifyGraphQLError):
+        await shopify_client.bulk_create_variants("gid://shopify/Product/1", variants)

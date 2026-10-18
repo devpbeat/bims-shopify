@@ -64,6 +64,7 @@ query ListAllVariants($cursor: String) {
       sku
       product { id title }
       inventoryItem { id tracked }
+      selectedOptions { name value }
     }
   }
 }
@@ -102,6 +103,19 @@ mutation ProductVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsB
   productVariantsBulkUpdate(productId: $productId, variants: $variants) {
     productVariants { id sku }
     userErrors { field message }
+  }
+}
+"""
+
+# ProductVariantsBulkInput carries the SKU inside `inventoryItem` and activates
+# stock locations through `inventoryQuantities: [InventoryLevelInput]`
+# (`locationId`, `availableQuantity`) -- unlike ProductSetInput's variants.
+# https://shopify.dev/docs/api/admin-graphql/2025-07/mutations/productVariantsBulkCreate
+_VARIANTS_BULK_CREATE = """
+mutation ProductVariantsBulkCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+  productVariantsBulkCreate(productId: $productId, variants: $variants) {
+    productVariants { id sku }
+    userErrors { field message code }
   }
 }
 """
@@ -496,6 +510,21 @@ class ShopifyClient:
             _VARIANTS_BULK_UPDATE, {"productId": product_id, "variants": variants}
         )
         self._check_user_errors(data.get("productVariantsBulkUpdate"))
+
+    async def bulk_create_variants(
+        self, product_id: str, variants: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Add variants to an EXISTING product via productVariantsBulkCreate.
+
+        Returns the created ``{id, sku}`` nodes. Business-validation failures
+        (``userErrors``) raise ``ShopifyGraphQLError``.
+        """
+        data = await self._graphql(
+            _VARIANTS_BULK_CREATE, {"productId": product_id, "variants": variants}
+        )
+        result = data.get("productVariantsBulkCreate")
+        self._check_user_errors(result)
+        return (result or {}).get("productVariants") or []
 
     async def bulk_delete_variants(self, product_id: str, variant_ids: list[str]) -> None:
         """Delete multiple variants of a single product via productVariantsBulkDelete."""
