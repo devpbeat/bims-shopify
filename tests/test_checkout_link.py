@@ -90,7 +90,7 @@ def test_signature_is_checked_before_payload_is_parsed(monkeypatch):
 
 def test_forged_payload_with_valid_looking_signature_is_rejected():
     token = _nav()
-    body, sig = token.split(".")
+    _body, sig = token.split(".")
     forged = sign_navigation_token(SECRET, "acme", "9999", ttl=TTL, now=NOW).split(".")[0]
     with pytest.raises(CheckoutTokenError):
         verify_token(SECRET, f"{forged}.{sig}", "acme", now=NOW)
