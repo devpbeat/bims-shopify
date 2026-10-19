@@ -11,6 +11,7 @@ import { HelpModal } from './components/HelpModal'
 import { LoginCard } from './components/LoginCard'
 import { NameMismatchTab } from './components/NameMismatchTab'
 import { OperationsTab } from './components/OperationsTab'
+import { PaymentsTab } from './components/PaymentsTab'
 import { OperatorGate } from './components/OperatorGate'
 import { PortalHeader } from './components/PortalHeader'
 import { TokenGate } from './components/TokenGate'
@@ -19,7 +20,7 @@ import { useT } from './i18n'
 import { clearAdminToken, loadAdminToken, saveAdminToken } from './adminSession'
 import { clearToken, loadToken, saveToken } from './session'
 
-type Tab = 'dashboard' | 'duplicates' | 'unresolved' | 'mismatches' | 'activity' | 'operations'
+type Tab = 'dashboard' | 'duplicates' | 'unresolved' | 'mismatches' | 'activity' | 'payments' | 'operations'
 
 function tokenFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get('token')
@@ -289,6 +290,9 @@ export function PortalPage() {
         <button type="button" className={tab === 'activity' ? 'tab active' : 'tab'} onClick={() => setTab('activity')}>
           {t.tabs.activity}
         </button>
+        <button type="button" className={tab === 'payments' ? 'tab active' : 'tab'} onClick={() => setTab('payments')}>
+          {t.tabs.payments}
+        </button>
         {adminToken && (
           <button
             type="button"
@@ -339,6 +343,7 @@ export function PortalPage() {
           />
         )}
         {tab === 'activity' && <ActivityTab slug={slug} token={token} />}
+        {tab === 'payments' && <PaymentsTab slug={slug} token={token} />}
         {tab === 'operations' && adminToken && (
           <OperationsTab slug={slug} adminToken={adminToken} onUnauthorized={handleOperatorUnauthorized} />
         )}
