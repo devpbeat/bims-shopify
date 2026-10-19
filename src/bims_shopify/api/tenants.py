@@ -59,6 +59,25 @@ def _reject_removed_settings(data: object) -> object:
     return data
 
 
+#: Bancard vPOS environments a tenant may select; each maps to its own host.
+VPOS_ENVIRONMENTS = ("staging", "production")
+
+
+def _validate_vpos_config(tenant: Tenant) -> None:
+    """Reject (422) a vPOS tenant whose ``provider_config.environment`` is not a known one."""
+    if tenant.payment_provider is not PaymentProvider.BANCARD_VPOS:
+        return
+    environment = tenant.provider_config.get("environment")
+    if environment is not None and environment not in VPOS_ENVIRONMENTS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": f"environment must be one of {list(VPOS_ENVIRONMENTS)}",
+                "field": "provider_config.environment",
+            },
+        )
+
+
 router = APIRouter(prefix="/tenants", tags=["tenants"], dependencies=[Depends(require_admin)])
 
 
@@ -143,6 +162,8 @@ class TenantCreate(BaseModel):
     bims_timezone: str = "America/Asuncion"
     payment_provider: PaymentProvider | None = None
     provider_config: dict = {}
+    #: Write-only. Omitted or null on PUT keeps the stored key (see ``update_tenant``).
+    bancard_vpos_private_key: str | None = None
     field_mappings: dict = {}
     active: bool = True
     push_orders_to_bims: bool = True
@@ -198,6 +219,7 @@ class TenantPatch(BaseModel):
     bims_timezone: str | None = None
     payment_provider: PaymentProvider | None = None
     provider_config: dict | None = None
+    bancard_vpos_private_key: str | None = None
     field_mappings: dict | None = None
     active: bool | None = None
     push_orders_to_bims: bool | None = None
@@ -221,7 +243,12 @@ class TenantPatch(BaseModel):
     def _no_removed_settings(cls, data: object) -> object:
         return _reject_removed_settings(data)
 
-    @field_validator("bims_api_key", "shopify_access_token", "shopify_webhook_secret")
+    @field_validator(
+        "bims_api_key",
+        "shopify_access_token",
+        "shopify_webhook_secret",
+        "bancard_vpos_private_key",
+    )
     @classmethod
     def _reject_empty_secret(cls, value: str | None) -> str | None:
         if value == "":
@@ -252,6 +279,8 @@ class TenantOut(BaseModel):
     reorder_strategy: ReorderStrategy
     bims_timezone: str
     payment_provider: PaymentProvider | None
+    #: Whether a vPOS private key is stored. The key itself is never returned in any form.
+    bancard_vpos_private_key_configured: bool
     active: bool
     push_orders_to_bims: bool
     auto_import_products: bool
@@ -279,6 +308,7 @@ class TenantOut(BaseModel):
             reorder_strategy=tenant.reorder_strategy,
             bims_timezone=tenant.bims_timezone,
             payment_provider=tenant.payment_provider,
+            bancard_vpos_private_key_configured=bool(tenant.bancard_vpos_private_key),
             active=tenant.active,
             push_orders_to_bims=tenant.push_orders_to_bims,
             auto_import_products=tenant.auto_import_products,
@@ -309,6 +339,7 @@ async def create_tenant(
     session: AsyncSession = Depends(get_db_session),
 ):
     tenant = Tenant(id=None, **body.model_dump())
+    _validate_vpos_config(tenant)
     await _enforce_staleness_limit(session, None, tenant)
     created = await repo.create(tenant)
     await audit.log(
@@ -343,7 +374,12 @@ async def update_tenant(
     existing = await repo.get_by_slug(slug)
     if existing is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
-    updated = Tenant(id=existing.id, **body.model_dump())
+    values = body.model_dump()
+    if values["bancard_vpos_private_key"] is None:
+        # Write-only secret: a full replace that omits it must not erase the stored key.
+        values["bancard_vpos_private_key"] = existing.bancard_vpos_private_key
+    updated = Tenant(id=existing.id, **values)
+    _validate_vpos_config(updated)
     await _enforce_staleness_limit(session, existing, updated)
     saved = await repo.update(updated)
     await audit.log(
@@ -377,7 +413,11 @@ async def patch_tenant(
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     changes = body.model_dump(exclude_unset=True)
+    if changes.get("bancard_vpos_private_key", "") is None:
+        # An explicit null means "no change", never "erase the stored key".
+        del changes["bancard_vpos_private_key"]
     updated = replace(existing, **changes)
+    _validate_vpos_config(updated)
     await _enforce_staleness_limit(session, existing, updated)
     saved = await repo.update(updated)
     await audit.log(
