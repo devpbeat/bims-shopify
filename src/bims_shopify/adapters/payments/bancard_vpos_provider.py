@@ -7,6 +7,7 @@ taken from the callback body: it comes only from the out-of-band
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Protocol
@@ -27,6 +28,7 @@ from bims_shopify.domain.bancard_vpos import (
     classify_response_code,
     get_confirmation_token,
     CURRENCY,
+    PROBE_SHOP_PROCESS_ID,
     VposAmount,
     VposApiError,
     VposInvalidAmountError,
@@ -62,6 +64,18 @@ CONFIGURATION_KEYS = frozenset(
         "ApplicationNotFoundError",
     }
 )
+
+
+@dataclass(frozen=True)
+class CredentialCheck:
+    """Outcome of a credentials probe; ``message`` never holds secret material."""
+
+    ok: bool
+    reason: str
+    message: str
+
+
+_APPLICATION_KEYS = frozenset({"UnauthorizedOperationError", "ApplicationNotFoundError"})
 
 
 class VposCallbackTokenError(VposError):
@@ -192,6 +206,45 @@ class BancardVposProvider:
             checkout_url=f"{public_base}/pay/bancard_vpos/{slug}/{checkout_token}",
             provider_reference=str(spid),
         )
+
+    async def check_credentials(self, tenant: Tenant) -> CredentialCheck:
+        """Probe the keys with a read-only ``get_confirmation`` on a reserved id.
+
+        A signed, well-formed answer, even "not found", proves the public key,
+        private key and environment work. No payment is created or rolled back.
+        """
+        try:
+            public_key, private_key = self._credentials(tenant)
+            base_url = self._base_url(tenant)
+        except VposConfigurationError:
+            return CredentialCheck(False, "not_configured", "Public key, private key and environment must be saved first.")
+        body = {
+            "public_key": public_key,
+            "operation": {
+                "token": get_confirmation_token(private_key, PROBE_SHOP_PROCESS_ID),
+                "shop_process_id": PROBE_SHOP_PROCESS_ID,
+            },
+        }
+        try:
+            response = await self._post(f"{base_url}{CONFIRMATIONS_PATH}", body)
+            if response.status_code >= 500:
+                raise httpx.HTTPStatusError("server error", request=response.request, response=response)
+            data = response.json()
+        except (httpx.HTTPError, ValueError):
+            return CredentialCheck(False, "unreachable", "Bancard could not be reached. Try again later.")
+        if not isinstance(data, dict):
+            return CredentialCheck(False, "unexpected", "Bancard returned an unexpected response.")
+        if data.get("status") == "success":
+            return CredentialCheck(True, "ok", "Credentials accepted by Bancard.")
+        key, _, _ = self._first_message(data)
+        if key in NOT_FOUND_KEYS:
+            return CredentialCheck(True, "ok", "Credentials accepted by Bancard.")
+        if key in _APPLICATION_KEYS:
+            return CredentialCheck(False, "application_not_enabled", "Bancard rejected the application; check that it is enabled for this environment.")
+        if key in CONFIGURATION_KEYS:
+            return CredentialCheck(False, "invalid_credentials", "Bancard rejected the public or private key.")
+        logger.warning("vpos_probe_unexpected_key", tenant=tenant.slug, key=key)
+        return CredentialCheck(False, "unexpected", "Bancard returned an unexpected response.")
 
     async def abandon_attempt(self, tenant: Tenant, intent: PaymentIntent) -> None:
         """Best-effort ``rollback`` of an abandoned attempt; never raises.
