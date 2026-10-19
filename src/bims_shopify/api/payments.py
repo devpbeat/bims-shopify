@@ -23,6 +23,7 @@ from bims_shopify.application.payments import CreatePaymentLink, HandlePaymentCa
 from bims_shopify.config import Settings
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
+from bims_shopify.ports.payment import callback_response_for
 
 from .deps import get_db_session, get_settings, get_tenant_repository
 
@@ -103,13 +104,22 @@ async def _handle_payment_callback(
     tenant = await repo.get_by_slug(tenant_slug)
     if tenant is None:
         raise HTTPException(status_code=404, detail="Unknown tenant")
-    payload = await _extract_callback_payload(request)
+    extraction_error: Exception | None = None
+    try:
+        payload = await _extract_callback_payload(request)
+    except Exception as exc:
+        extraction_error, payload = exc, {}
     storefront = ShopifyClient(tenant)
     processed_events = SqlAlchemySyncStateRepository(session)
     intents = SqlAlchemyPaymentIntentRepository(session)
     audit = SqlAlchemyAuditLogger(session)
     provider_impl = _build_provider(provider, tenant, settings, audit)
     use_case = HandlePaymentCallback(provider_impl, storefront, processed_events, intents)
+    always_ack = bool(getattr(provider_impl, "always_ack_callback", False))
+    if extraction_error is not None:
+        if not always_ack:
+            raise extraction_error
+        logger.warning("payment_callback_unreadable_body", provider=provider, tenant=tenant_slug)
 
     await audit.log(
         actor=provider,
@@ -128,6 +138,9 @@ async def _handle_payment_callback(
             tenant_id=tenant.id,
             payload={"error": type(exc).__name__},
         )
+        if always_ack:
+            # The gateway reads a non-200 as "ask again", never as a denial.
+            return callback_response_for(provider_impl, None)
         raise
 
     await audit.log(
@@ -138,7 +151,7 @@ async def _handle_payment_callback(
         entity_id=intent.order_id or None,
         payload={"status": intent.status},
     )
-    return {"status": intent.status}
+    return callback_response_for(provider_impl, intent)
 
 
 @router.post("/{provider}/{tenant_slug}/callback")

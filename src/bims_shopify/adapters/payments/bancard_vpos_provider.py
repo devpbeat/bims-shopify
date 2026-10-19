@@ -77,6 +77,7 @@ class BancardVposProvider:
 
     name = "bancard_vpos"
     supports_attempts = True
+    always_ack_callback = True
 
     def __init__(
         self,
@@ -134,6 +135,10 @@ class BancardVposProvider:
         raise VposApiError(key, level, dsc)
 
     # -- port ---------------------------------------------------------------
+
+    def callback_response(self, intent: PaymentIntent | None) -> dict[str, Any]:
+        """vPOS expects this exact body for every confirm call (PDF p.45/p.51)."""
+        return {"status": "success"}
 
     async def create_checkout(
         self,
