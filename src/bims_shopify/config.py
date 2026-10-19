@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     # session signing independently of the encryption key.
     portal_session_secret: str = ""
 
+    # Signing secret for the buyer-facing payment links (checkout_link.py).
+    # Blank means "derive from fernet_key", like the portal session secret.
+    checkout_link_secret: str = ""
+
 
 def get_settings() -> Settings:
     return Settings()
