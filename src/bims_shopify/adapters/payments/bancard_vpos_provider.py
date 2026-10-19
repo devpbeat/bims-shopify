@@ -8,6 +8,7 @@ taken from the callback body: it comes only from the out-of-band
 from __future__ import annotations
 
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any, Protocol
 
 import httpx
@@ -19,9 +20,13 @@ from bims_shopify.checkout_link import (
 )
 from bims_shopify.config import Settings
 from bims_shopify.domain.bancard_vpos import (
+    ConfirmationOutcome,
+    classify_response_code,
+    get_confirmation_token,
     CURRENCY,
     VposAmount,
     VposApiError,
+    VposInvalidAmountError,
     VposConfigurationError,
     VposError,
     build_shop_process_id,
@@ -32,13 +37,15 @@ from bims_shopify.domain.bancard_vpos import (
     vpos_base_url,
     vpos_description,
 )
-from bims_shopify.domain.payment import PaymentIntent
+from bims_shopify.domain.payment import PaymentIntent, PaymentStatus
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
 logger = get_logger(__name__)
 
 SINGLE_BUY_PATH = "/vpos/api/0.3/single_buy"
+CONFIRMATIONS_PATH = "/vpos/api/0.3/single_buy/confirmations"
+NOT_FOUND_KEYS = frozenset({"BuyNotFoundError", "PaymentNotFoundError"})
 LINK_TTL = timedelta(hours=24)
 REQUEST_TIMEOUT_SECONDS = 20.0
 
@@ -192,3 +199,100 @@ class BancardVposProvider:
             provider_reference=str(callback.shop_process_id),
             status="pending",
         )
+
+    async def verify_payment(self, tenant: Tenant, intent: PaymentIntent) -> PaymentStatus:
+        """Ask vPOS (get_confirmation) whether the payment was approved.
+
+        Paid only for ``response_code == "00"`` with a matching amount and
+        currency. Transport problems and unknown outcomes leave the intent
+        pending; credential problems raise ``VposConfigurationError`` so they
+        are never recorded as a customer failure.
+        """
+        public_key, private_key = self._credentials(tenant)
+        base_url = self._base_url(tenant)
+        try:
+            spid = int(intent.provider_reference or "")
+        except ValueError as exc:
+            raise VposConfigurationError("intent has no valid shop_process_id") from exc
+        body = {
+            "public_key": public_key,
+            "operation": {
+                "token": get_confirmation_token(private_key, spid),
+                "shop_process_id": spid,
+            },
+        }
+        try:
+            response = await self._post(f"{base_url}{CONFIRMATIONS_PATH}", body)
+            if response.status_code >= 500:
+                raise httpx.HTTPStatusError(
+                    "server error", request=response.request, response=response
+                )
+            data = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning(
+                "vpos_get_confirmation_unavailable",
+                tenant=tenant.slug,
+                shop_process_id=spid,
+                error=type(exc).__name__,
+            )
+            return PaymentStatus.PENDING
+        if not isinstance(data, dict):
+            logger.warning("vpos_get_confirmation_bad_shape", tenant=tenant.slug, shop_process_id=spid)
+            return PaymentStatus.PENDING
+        if data.get("status") != "success":
+            return self._error_status(tenant, spid, data)
+        confirmation = data.get("confirmation")
+        if not isinstance(confirmation, dict):
+            logger.warning("vpos_get_confirmation_missing", tenant=tenant.slug, shop_process_id=spid)
+            return PaymentStatus.PENDING
+        code = confirmation.get("response_code")
+        outcome = classify_response_code(code)
+        if outcome is ConfirmationOutcome.DECLINED:
+            logger.info("vpos_payment_declined", tenant=tenant.slug, shop_process_id=spid, response_code=code)
+            return PaymentStatus.FAILED
+        if outcome is ConfirmationOutcome.UNKNOWN:
+            logger.warning("vpos_unknown_response_code", tenant=tenant.slug, shop_process_id=spid, response_code=code)
+            return PaymentStatus.PENDING
+        if not await self._matches_intent(tenant, spid, intent, confirmation):
+            return PaymentStatus.FAILED
+        logger.info("vpos_payment_confirmed", tenant=tenant.slug, shop_process_id=spid)
+        return PaymentStatus.CONFIRMED
+
+    def _error_status(self, tenant: Tenant, spid: int, data: dict[str, Any]) -> PaymentStatus:
+        key, _, _ = self._first_message(data)
+        if key in CONFIGURATION_KEYS:
+            raise VposConfigurationError(f"vPOS rejected the credentials: {key}")
+        if key in NOT_FOUND_KEYS:
+            logger.info("vpos_payment_not_found", tenant=tenant.slug, shop_process_id=spid, key=key)
+            return PaymentStatus.FAILED
+        logger.warning("vpos_get_confirmation_error", tenant=tenant.slug, shop_process_id=spid, key=key)
+        return PaymentStatus.PENDING
+
+    async def _matches_intent(
+        self, tenant: Tenant, spid: int, intent: PaymentIntent, confirmation: dict[str, Any]
+    ) -> bool:
+        try:
+            confirmed = VposAmount.from_vpos_payload(confirmation.get("amount")).value
+            expected = VposAmount.from_order_total(Decimal(str(intent.amount))).value
+        except VposInvalidAmountError:
+            confirmed = expected = None
+        currency_ok = confirmation.get("currency") == intent.currency
+        if confirmed is not None and confirmed == expected and currency_ok:
+            return True
+        logger.error(
+            "vpos_amount_mismatch",
+            tenant=tenant.slug,
+            shop_process_id=spid,
+            expected=str(expected),
+            confirmed=str(confirmed),
+        )
+        if self._audit is not None:
+            await self._audit.log(
+                actor="system",
+                action="payment.amount_mismatch",
+                entity="payment_intent",
+                tenant_id=tenant.id,
+                entity_id=str(spid),
+                payload={"order_id": intent.order_id, "shop_process_id": spid},
+            )
+        return False
