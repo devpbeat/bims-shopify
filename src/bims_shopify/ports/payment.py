@@ -49,3 +49,25 @@ class AttemptAwarePaymentProviderPort(PaymentProviderPort, Protocol):
     async def abandon_attempt(self, tenant: Tenant, intent: PaymentIntent) -> None:
         """Best-effort retirement of an abandoned attempt; must never raise."""
         ...
+
+
+class CallbackAckPaymentProviderPort(PaymentProviderPort, Protocol):
+    """Optional extension for gateways that dictate the callback acknowledgement.
+
+    vPOS requires HTTP 200 ``{"status": "success"}`` for every confirm call and
+    treats a non-200 as "ask me again", never as a denial. Such a provider sets
+    ``always_ack_callback`` so verification problems are logged instead of
+    surfacing as an error status, and overrides ``callback_response``.
+    """
+
+    always_ack_callback: bool
+
+    def callback_response(self, intent: PaymentIntent | None) -> dict[str, Any]: ...
+
+
+def callback_response_for(provider: object, intent: PaymentIntent | None) -> dict[str, Any]:
+    """Body to answer a callback with: the provider's hook, else the intent status."""
+    hook = getattr(provider, "callback_response", None)
+    if hook is not None:
+        return hook(intent)
+    return {"status": intent.status if intent is not None else "pending"}
