@@ -417,7 +417,9 @@ class ShopifyClient:
             return
 
     async def mark_order_as_paid(self, tenant: Tenant, order_id: str) -> None:
-        data = await self._graphql(_ORDER_MARK_AS_PAID, {"input": {"id": order_id}})
+        # Payment intents carry the numeric order id; Shopify's GraphQL needs a gid.
+        gid = order_id if order_id.startswith("gid://") else f"gid://shopify/Order/{order_id}"
+        data = await self._graphql(_ORDER_MARK_AS_PAID, {"input": {"id": gid}})
         self._check_user_errors(data.get("orderMarkAsPaid"))
 
     async def get_order(self, tenant: Tenant, order_id: str) -> dict[str, Any] | None:
