@@ -11,7 +11,11 @@ No I/O lives here. The module owns the three things that must never drift:
 from __future__ import annotations
 
 import hashlib
+import hmac
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 CURRENCY = "PYG"
@@ -44,6 +48,24 @@ class VposConfigurationError(VposError):
     """Tenant-level vPOS configuration is missing or invalid."""
 
 
+class VposCallbackShapeError(VposError):
+    """The inbound confirm callback is malformed."""
+
+
+class VposAttemptsExhaustedError(VposError):
+    """No attempt numbers (00..99) are left for this order."""
+
+
+class VposApiError(VposError):
+    """Bancard answered with an error message."""
+
+    def __init__(self, key: str, level: str, dsc: str) -> None:
+        super().__init__(f"{key}: {dsc}")
+        self.key = key
+        self.level = level
+        self.dsc = dsc
+
+
 @dataclass(frozen=True)
 class VposAmount:
     """One amount for one operation.
@@ -60,6 +82,11 @@ class VposAmount:
     def from_order_total(cls, raw: object) -> VposAmount:
         """Build an outbound amount (rounded half-up to two decimals)."""
         return cls._build(_to_decimal(raw), strict=False)
+
+    @classmethod
+    def from_vpos_payload(cls, raw: object) -> VposAmount:
+        """Build an inbound amount; rejects sub-cent precision instead of rounding."""
+        return cls._build(_to_decimal(raw), strict=True)
 
     @classmethod
     def _build(cls, number: Decimal, *, strict: bool) -> VposAmount:
@@ -169,3 +196,131 @@ def vpos_base_url(environment: object) -> str:
     if not isinstance(environment, str) or environment not in _VPOS_BASE_URLS:
         raise VposConfigurationError("unknown vPOS environment")
     return _VPOS_BASE_URLS[environment]
+
+
+# --- Inbound confirm callback (string-or-number tolerant, BVP-9) ------------
+
+_DIGITS = re.compile(r"[0-9]+")
+_DECIMAL_TEXT = re.compile(r"[0-9]+(\.[0-9]+)?")
+
+
+@dataclass(frozen=True)
+class VposConfirmCallback:
+    shop_process_id: int
+    amount: VposAmount
+    iva_amount: Decimal
+    ticket_number: int
+    currency: str
+    token: object
+
+
+def _coerce_int(raw: object, field: str) -> int:
+    if isinstance(raw, bool) or raw is None:
+        raise VposCallbackShapeError(f"{field} must be an integer")
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str) and _DIGITS.fullmatch(raw):
+        value = int(raw)
+    elif isinstance(raw, (float, Decimal)):
+        number = Decimal(str(raw))
+        if not number.is_finite() or number != number.to_integral_value():
+            raise VposCallbackShapeError(f"{field} must be an integer")
+        value = int(number)
+    else:
+        raise VposCallbackShapeError(f"{field} must be an integer")
+    if value < 0:
+        raise VposCallbackShapeError(f"{field} must not be negative")
+    return value
+
+
+def _coerce_decimal(raw: object, field: str) -> Decimal:
+    if isinstance(raw, bool) or raw is None:
+        raise VposCallbackShapeError(f"{field} must be a number")
+    if isinstance(raw, str):
+        if not _DECIMAL_TEXT.fullmatch(raw):
+            raise VposCallbackShapeError(f"{field} must be a number")
+        return Decimal(raw)
+    if isinstance(raw, (int, float, Decimal)):
+        number = Decimal(str(raw))
+        if not number.is_finite() or number < 0:
+            raise VposCallbackShapeError(f"{field} must be a non-negative number")
+        return number
+    raise VposCallbackShapeError(f"{field} must be a number")
+
+
+def parse_confirm_operation(payload: object) -> VposConfirmCallback:
+    """Coerce the callback ``operation`` object; numbers may be strings or numbers."""
+    if not isinstance(payload, Mapping):
+        raise VposCallbackShapeError("operation must be an object")
+    for field in ("token", "shop_process_id", "amount", "iva_amount", "ticket_number", "currency"):
+        if field not in payload:
+            raise VposCallbackShapeError(f"missing field: {field}")
+    currency = payload["currency"]
+    if not isinstance(currency, str) or not currency:
+        raise VposCallbackShapeError("currency must be a string")
+    amount_number = _coerce_decimal(payload["amount"], "amount")
+    try:
+        amount = VposAmount.from_vpos_payload(amount_number)
+    except VposInvalidAmountError as exc:
+        raise VposCallbackShapeError("amount is not a valid vPOS amount") from exc
+    return VposConfirmCallback(
+        shop_process_id=_coerce_int(payload["shop_process_id"], "shop_process_id"),
+        amount=amount,
+        iva_amount=_coerce_decimal(payload["iva_amount"], "iva_amount"),
+        ticket_number=_coerce_int(payload["ticket_number"], "ticket_number"),
+        currency=currency,
+        token=payload["token"],
+    )
+
+
+def verify_confirm_token(private_key: str, callback: VposConfirmCallback) -> bool:
+    """Constant-time check of the callback token over the normalised amount."""
+    if not isinstance(callback.token, str):
+        return False
+    expected = confirm_token(
+        private_key, callback.shop_process_id, callback.amount, callback.currency
+    )
+    return hmac.compare_digest(expected.encode("utf-8"), callback.token.encode("utf-8"))
+
+
+# --- Result classification ---------------------------------------------------
+
+
+class ConfirmationOutcome(Enum):
+    APPROVED = "approved"
+    DECLINED = "declined"
+    UNKNOWN = "unknown"
+
+
+_DECLINED_CODES = frozenset({"05", "12", "15", "51"})
+
+
+def classify_response_code(code: object) -> ConfirmationOutcome:
+    """Only ``"00"`` approves; unknown or absent codes are never paid."""
+    if code == "00":
+        return ConfirmationOutcome.APPROVED
+    if isinstance(code, str) and code in _DECLINED_CODES:
+        return ConfirmationOutcome.DECLINED
+    return ConfirmationOutcome.UNKNOWN
+
+
+class RollbackOutcome(Enum):
+    BENIGN = "benign"
+    OPERATOR_ACTION = "operator_action"
+    OTHER = "other"
+
+
+_BENIGN_ROLLBACK_KEYS = frozenset(
+    {"RollbackSuccessful", "PaymentNotFoundError", "AlreadyRollbackedError"}
+)
+
+
+def classify_rollback_key(key: object) -> RollbackOutcome:
+    """Classify by message key, never by the envelope status."""
+    if not isinstance(key, str):
+        return RollbackOutcome.OTHER
+    if key in _BENIGN_ROLLBACK_KEYS:
+        return RollbackOutcome.BENIGN
+    if key == "TransactionAlreadyConfirmed":
+        return RollbackOutcome.OPERATOR_ACTION
+    return RollbackOutcome.OTHER
