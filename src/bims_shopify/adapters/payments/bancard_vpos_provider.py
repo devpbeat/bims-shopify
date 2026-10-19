@@ -21,6 +21,9 @@ from bims_shopify.checkout_link import (
 from bims_shopify.config import Settings
 from bims_shopify.domain.bancard_vpos import (
     ConfirmationOutcome,
+    RollbackOutcome,
+    classify_rollback_key,
+    rollback_token,
     classify_response_code,
     get_confirmation_token,
     CURRENCY,
@@ -45,6 +48,7 @@ logger = get_logger(__name__)
 
 SINGLE_BUY_PATH = "/vpos/api/0.3/single_buy"
 CONFIRMATIONS_PATH = "/vpos/api/0.3/single_buy/confirmations"
+ROLLBACK_PATH = "/vpos/api/0.3/single_buy/rollback"
 NOT_FOUND_KEYS = frozenset({"BuyNotFoundError", "PaymentNotFoundError"})
 LINK_TTL = timedelta(hours=24)
 REQUEST_TIMEOUT_SECONDS = 20.0
@@ -72,6 +76,7 @@ class BancardVposProvider:
     """PaymentProviderPort implementation for the direct Bancard vPOS 2.0 API."""
 
     name = "bancard_vpos"
+    supports_attempts = True
 
     def __init__(
         self,
@@ -182,6 +187,71 @@ class BancardVposProvider:
             checkout_url=f"{public_base}/pay/bancard_vpos/{slug}/{checkout_token}",
             provider_reference=str(spid),
         )
+
+    async def abandon_attempt(self, tenant: Tenant, intent: PaymentIntent) -> None:
+        """Best-effort ``rollback`` of an abandoned attempt; never raises.
+
+        ``PaymentNotFoundError`` is the expected answer for a cart nobody paid,
+        so benign outcomes stay silent. ``TransactionAlreadyConfirmed`` means
+        the charge settled and only a manual annulment in the Bancard comercios
+        portal can reverse it, so it is an error plus an audit entry.
+        """
+        try:
+            await self._rollback(tenant, intent)
+        except Exception as exc:
+            logger.warning(
+                "vpos_rollback_failed",
+                tenant=tenant.slug,
+                order_id=intent.order_id,
+                shop_process_id=intent.provider_reference,
+                error=type(exc).__name__,
+            )
+
+    async def _rollback(self, tenant: Tenant, intent: PaymentIntent) -> None:
+        public_key, private_key = self._credentials(tenant)
+        spid = int(intent.provider_reference or "")
+        body = {
+            "public_key": public_key,
+            "elements": {},
+            "operation": {
+                "token": rollback_token(private_key, spid),
+                # Rollback is the one operation that takes the id as a string.
+                "shop_process_id": str(spid),
+            },
+        }
+        response = await self._post(f"{self._base_url(tenant)}{ROLLBACK_PATH}", body)
+        if response.status_code >= 500:
+            raise httpx.HTTPStatusError("server error", request=response.request, response=response)
+        data = response.json()
+        key, _, _ = self._first_message(data if isinstance(data, dict) else {})
+        outcome = classify_rollback_key(key)
+        if outcome is RollbackOutcome.BENIGN:
+            logger.debug("vpos_rollback_done", tenant=tenant.slug, shop_process_id=spid, key=key)
+        elif outcome is RollbackOutcome.OPERATOR_ACTION:
+            logger.error(
+                "vpos_rollback_requires_manual_annulment",
+                tenant=tenant.slug,
+                order_id=intent.order_id,
+                shop_process_id=spid,
+                action="request the annulment in the Bancard comercios portal",
+            )
+            if self._audit is not None:
+                await self._audit.log(
+                    actor="system",
+                    action="payment.rollback_conflict",
+                    entity="payment_intent",
+                    tenant_id=tenant.id,
+                    entity_id=str(spid),
+                    payload={"order_id": intent.order_id, "shop_process_id": spid},
+                )
+        else:
+            logger.warning(
+                "vpos_rollback_unexpected_outcome",
+                tenant=tenant.slug,
+                order_id=intent.order_id,
+                shop_process_id=spid,
+                key=key,
+            )
 
     async def parse_callback(self, tenant: Tenant, payload: dict[str, Any]) -> PaymentIntent:
         """Authenticate and coerce a confirm callback; never decides the paid state."""

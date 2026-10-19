@@ -4,11 +4,10 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bims_shopify.adapters.bims.client import BIMSClient
-from bims_shopify.adapters.payments.bancard_via_bims_provider import (
-    BancardViaBIMSProvider,
+from bims_shopify.adapters.payments.factory import (
+    UnknownPaymentProviderError,
+    build_provider,
 )
-from bims_shopify.adapters.payments.pagopar_provider import PagoparProvider
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.payment_intent_repository import (
     SqlAlchemyPaymentIntentRepository,
@@ -21,22 +20,22 @@ from bims_shopify.adapters.persistence.tenant_repository import (
 )
 from bims_shopify.adapters.shopify.client import ShopifyClient
 from bims_shopify.application.payments import CreatePaymentLink, HandlePaymentCallback
-from bims_shopify.domain.tenant import PaymentProvider, Tenant
+from bims_shopify.config import Settings
+from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
-from .deps import get_db_session, get_tenant_repository
+from .deps import get_db_session, get_settings, get_tenant_repository
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
 
-def _build_provider(provider_name: str, tenant: Tenant):
-    if provider_name == PaymentProvider.PAGOPAR.value:
-        return PagoparProvider()
-    if provider_name == PaymentProvider.BANCARD.value:
-        return BancardViaBIMSProvider(BIMSClient(tenant))
-    raise HTTPException(status_code=404, detail=f"Unknown payment provider: {provider_name}")
+def _build_provider(provider_name: str, tenant: Tenant, settings: Settings, audit=None):
+    try:
+        return build_provider(provider_name, tenant, settings=settings, audit=audit)
+    except UnknownPaymentProviderError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/{provider}/{tenant_slug}/checkout")
@@ -46,16 +45,17 @@ async def create_checkout(
     request: Request,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     session: AsyncSession = Depends(get_db_session),
+    settings: Settings = Depends(get_settings),
 ):
     tenant = await repo.get_by_slug(tenant_slug)
     if tenant is None:
         raise HTTPException(status_code=404, detail="Unknown tenant")
     body = await request.json()
     order_id = str(body.get("order_id"))
-    provider_impl = _build_provider(provider, tenant)
-    intents = SqlAlchemyPaymentIntentRepository(session)
     audit = SqlAlchemyAuditLogger(session)
-    use_case = CreatePaymentLink(provider_impl, intents)
+    provider_impl = _build_provider(provider, tenant, settings, audit)
+    intents = SqlAlchemyPaymentIntentRepository(session)
+    use_case = CreatePaymentLink(provider_impl, intents, audit)
     intent = await use_case.run(
         tenant, order_id, float(body.get("amount", 0)), body.get("currency", "PYG")
     )
@@ -98,16 +98,17 @@ async def _handle_payment_callback(
     request: Request,
     repo: SqlAlchemyTenantRepository,
     session: AsyncSession,
+    settings: Settings,
 ):
     tenant = await repo.get_by_slug(tenant_slug)
     if tenant is None:
         raise HTTPException(status_code=404, detail="Unknown tenant")
     payload = await _extract_callback_payload(request)
-    provider_impl = _build_provider(provider, tenant)
     storefront = ShopifyClient(tenant)
     processed_events = SqlAlchemySyncStateRepository(session)
     intents = SqlAlchemyPaymentIntentRepository(session)
     audit = SqlAlchemyAuditLogger(session)
+    provider_impl = _build_provider(provider, tenant, settings, audit)
     use_case = HandlePaymentCallback(provider_impl, storefront, processed_events, intents)
 
     await audit.log(
@@ -147,8 +148,9 @@ async def payment_callback(
     request: Request,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     session: AsyncSession = Depends(get_db_session),
+    settings: Settings = Depends(get_settings),
 ):
-    return await _handle_payment_callback(provider, tenant_slug, request, repo, session)
+    return await _handle_payment_callback(provider, tenant_slug, request, repo, session, settings)
 
 
 @router.get("/{provider}/{tenant_slug}/callback")
@@ -158,5 +160,6 @@ async def payment_callback_get(
     request: Request,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
     session: AsyncSession = Depends(get_db_session),
+    settings: Settings = Depends(get_settings),
 ):
-    return await _handle_payment_callback(provider, tenant_slug, request, repo, session)
+    return await _handle_payment_callback(provider, tenant_slug, request, repo, session, settings)

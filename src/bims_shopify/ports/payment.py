@@ -28,3 +28,24 @@ class PaymentProviderPort(Protocol):
         URL); this makes an authenticated out-of-band call to the provider.
         """
         ...
+
+
+class AttemptAwarePaymentProviderPort(PaymentProviderPort, Protocol):
+    """Optional extension for providers whose gateway ids cannot be reused.
+
+    Some gateways bind a checkout to an id derived from the order and reject
+    reuse after a failure or cancellation. Such a provider sets
+    ``supports_attempts = True`` so the use case can mint a fresh attempt and
+    retire the abandoned one. Providers without it keep the single-attempt
+    behaviour.
+    """
+
+    supports_attempts: bool
+
+    async def create_checkout(  # type: ignore[override]
+        self, tenant: Tenant, order_id: str, amount: float, currency: str, *, attempt: int = 0
+    ) -> PaymentIntent: ...
+
+    async def abandon_attempt(self, tenant: Tenant, intent: PaymentIntent) -> None:
+        """Best-effort retirement of an abandoned attempt; must never raise."""
+        ...

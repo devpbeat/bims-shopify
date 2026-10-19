@@ -5,10 +5,14 @@ import hashlib
 import json
 from typing import Any, Protocol
 
+from bims_shopify.domain.bancard_vpos import MAX_ATTEMPT, VposAttemptsExhaustedError
 from bims_shopify.domain.payment import PaymentIntent, PaymentStatus
 from bims_shopify.domain.tenant import Tenant
+from bims_shopify.logging import get_logger
 from bims_shopify.ports.payment import PaymentProviderPort
 from bims_shopify.ports.storefront import StorefrontPort
+
+logger = get_logger(__name__)
 
 
 class PaymentIntentRepositoryPort(Protocol):
@@ -35,6 +39,10 @@ class PaymentIntentRepositoryPort(Protocol):
     ) -> None: ...
 
 
+class AuditLogPort(Protocol):
+    async def log(self, **kwargs: Any) -> None: ...
+
+
 class CreatePaymentLink:
     """Create (or reuse) a hosted-checkout link for a Shopify order.
 
@@ -42,20 +50,92 @@ class CreatePaymentLink:
     or a merchant re-opening the portal must not mint a second Pagopar
     transaction for the same order, so an existing persisted intent with a
     checkout_url is returned as-is instead of calling the provider again.
+
+    Providers that set ``supports_attempts`` (vPOS) follow a stricter policy:
+    the existing intent is reused while it is ``pending`` or ``paid``; only a
+    ``failed`` or ``cancelled`` one mints the next attempt, after a
+    best-effort ``abandon_attempt`` on the old one that never blocks the retry.
     """
 
-    def __init__(self, provider: PaymentProviderPort, intents: PaymentIntentRepositoryPort) -> None:
+    def __init__(
+        self,
+        provider: PaymentProviderPort,
+        intents: PaymentIntentRepositoryPort,
+        audit: AuditLogPort | None = None,
+    ) -> None:
         self._provider = provider
         self._intents = intents
+        self._audit = audit
 
     async def run(self, tenant: Tenant, order_id: str, amount: float, currency: str) -> PaymentIntent:
         existing = await self._intents.get_by_order_id(tenant.id, self._provider.name, order_id)
-        if existing is not None and existing.checkout_url:
-            return existing
+        if not getattr(self._provider, "supports_attempts", False):
+            if existing is not None and existing.checkout_url:
+                return existing
+            intent = await self._provider.create_checkout(tenant, order_id, amount, currency)
+            await self._intents.save(tenant.id, self._provider.name, intent)
+            return intent
+        return await self._run_with_attempts(tenant, order_id, amount, currency, existing)
 
-        intent = await self._provider.create_checkout(tenant, order_id, amount, currency)
+    async def _run_with_attempts(
+        self,
+        tenant: Tenant,
+        order_id: str,
+        amount: float,
+        currency: str,
+        existing: PaymentIntent | None,
+    ) -> PaymentIntent:
+        provider: Any = self._provider
+        attempt = 0
+        abandoned: PaymentIntent | None = None
+        if existing is not None:
+            attempt = _attempt_of(existing)
+            if existing.status == "paid" or (
+                existing.status == "pending" and existing.checkout_url
+            ):
+                return existing
+            if existing.status in _RETRYABLE_STATUSES:
+                if attempt >= MAX_ATTEMPT:
+                    raise VposAttemptsExhaustedError("no attempts left for this order")
+                attempt += 1
+                abandoned = existing
+        if abandoned is not None:
+            try:
+                await provider.abandon_attempt(tenant, abandoned)
+            except Exception as exc:  # a rollback outcome must never block the retry
+                logger.warning(
+                    "payment_abandon_failed",
+                    tenant=tenant.slug,
+                    order_id=order_id,
+                    error=type(exc).__name__,
+                )
+        intent = await provider.create_checkout(tenant, order_id, amount, currency, attempt=attempt)
         await self._intents.save(tenant.id, self._provider.name, intent)
+        if abandoned is not None and self._audit is not None:
+            await self._audit.log(
+                actor="system",
+                action="payment.retry_minted",
+                entity="order",
+                tenant_id=tenant.id,
+                entity_id=order_id,
+                payload={
+                    "attempt": attempt,
+                    "previous_status": abandoned.status,
+                    "previous_reference": abandoned.provider_reference,
+                },
+            )
         return intent
+
+
+_RETRYABLE_STATUSES = frozenset({"failed", "cancelled"})
+
+
+def _attempt_of(intent: PaymentIntent) -> int:
+    """Attempt number encoded in the last two digits of the stored reference."""
+    try:
+        return int(intent.provider_reference or "0") % 100
+    except ValueError:
+        return 0
 
 
 class ProcessedEventRepositoryPort(Protocol):

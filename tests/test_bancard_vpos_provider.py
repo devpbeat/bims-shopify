@@ -475,3 +475,98 @@ async def test_verify_payment_logs_never_contain_secrets(provider, vpos_tenant):
     dumped = json.dumps(logs, default=str)
     assert PRIVATE_KEY not in dumped
     assert "123456" not in dumped
+
+
+# --- abandon_attempt (rollback) ----------------------------------------------
+
+ROLLBACK = f"{STAGING}/vpos/api/0.3/single_buy/rollback"
+
+
+def _rollback_reply(key: str, status: str = "error", level: str = "error") -> httpx.Response:
+    return httpx.Response(
+        200, json={"status": status, "messages": [{"key": key, "level": level, "dsc": "d"}]}
+    )
+
+
+@respx.mock
+async def test_rollback_envelope_and_token(provider, vpos_tenant):
+    route = respx.post(ROLLBACK).mock(
+        return_value=_rollback_reply("RollbackSuccessful", "success", "info")
+    )
+
+    await provider.abandon_attempt(vpos_tenant, _intent("12313"))
+
+    body = json.loads(route.calls.last.request.content)
+    assert set(body) == {"public_key", "elements", "operation"}
+    assert body["elements"] == {}
+    assert set(body["operation"]) == {"token", "shop_process_id"}
+    assert body["operation"]["shop_process_id"] == "12313"
+    assert body["operation"]["token"] == _md5(PRIVATE_KEY + "12313" + "rollback" + "0.00")
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("key", "status"),
+    [
+        ("RollbackSuccessful", "success"),
+        ("PaymentNotFoundError", "error"),
+        ("AlreadyRollbackedError", "error"),
+    ],
+)
+async def test_benign_rollback_outcomes_emit_no_alarm(provider, vpos_tenant, audit, key, status):
+    respx.post(ROLLBACK).mock(return_value=_rollback_reply(key, status))
+
+    with structlog.testing.capture_logs() as logs:
+        await provider.abandon_attempt(vpos_tenant, _intent())
+
+    assert not [e for e in logs if e["log_level"] in {"warning", "error", "critical"}]
+    assert audit.entries == []
+
+
+@respx.mock
+async def test_already_confirmed_rollback_logs_error_and_audits(provider, vpos_tenant, audit):
+    respx.post(ROLLBACK).mock(return_value=_rollback_reply("TransactionAlreadyConfirmed"))
+
+    with structlog.testing.capture_logs() as logs:
+        await provider.abandon_attempt(vpos_tenant, _intent())
+
+    errors = [e for e in logs if e["log_level"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["shop_process_id"] == 100000000000100
+    assert errors[0]["tenant"] == "acme"
+    assert [e["action"] for e in audit.entries] == ["payment.rollback_conflict"]
+    assert audit.entries[0]["tenant_id"] == vpos_tenant.id
+    assert audit.entries[0]["payload"]["order_id"] == "1000000000001"
+    assert PRIVATE_KEY not in json.dumps([logs, audit.entries], default=str)
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "reply",
+    [
+        httpx.Response(500, text="boom"),
+        httpx.Response(200, text="not json"),
+        _rollback_reply("PosCommunicationError"),
+        _rollback_reply("SomethingNew"),
+        httpx.ConnectTimeout("slow"),
+    ],
+)
+async def test_other_rollback_failures_warn_and_never_raise(provider, vpos_tenant, audit, reply):
+    respx.post(ROLLBACK).mock(side_effect=[reply])
+
+    with structlog.testing.capture_logs() as logs:
+        await provider.abandon_attempt(vpos_tenant, _intent())
+
+    assert [e for e in logs if e["log_level"] == "warning"]
+    assert not [e for e in logs if e["log_level"] == "error"]
+    assert audit.entries == []
+
+
+@respx.mock
+async def test_rollback_without_credentials_never_raises(provider, vpos_tenant):
+    vpos_tenant.bancard_vpos_private_key = None
+
+    with structlog.testing.capture_logs() as logs:
+        await provider.abandon_attempt(vpos_tenant, _intent())
+
+    assert [e for e in logs if e["log_level"] == "warning"]
