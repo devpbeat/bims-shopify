@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from bims_shopify.adapters.payments.factory import build_provider
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
 from bims_shopify.api.portal import get_portal_tenant
@@ -117,3 +118,26 @@ async def put_payments_config(
             payload={"fields": changed},
         )
     return _to_out(tenant, settings)
+
+
+@router.post("/test-connection", response_model=PaymentsTestOut)
+async def test_payments_connection(
+    tenant: Tenant = Depends(get_portal_tenant),
+    audit: SqlAlchemyAuditLogger = Depends(get_audit_logger),
+    settings: Settings = Depends(get_settings),
+) -> PaymentsTestOut:
+    if tenant.payment_provider is not PaymentProvider.BANCARD_VPOS:
+        return PaymentsTestOut(
+            ok=False, reason="not_configured", message="Bancard vPOS is not enabled for this store."
+        )
+    provider = build_provider("bancard_vpos", tenant, settings=settings, audit=audit)
+    result = await provider.check_credentials(tenant)
+    await audit.log(
+        actor="portal",
+        action="payments.config_tested",
+        entity="tenant",
+        tenant_id=tenant.id,
+        entity_id=tenant.slug,
+        payload={"ok": result.ok, "reason": result.reason},
+    )
+    return PaymentsTestOut(ok=result.ok, reason=result.reason, message=result.message)

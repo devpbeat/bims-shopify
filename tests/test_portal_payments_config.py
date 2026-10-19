@@ -8,7 +8,9 @@ import os
 import tempfile
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 from cryptography.fernet import Fernet
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -20,6 +22,7 @@ from bims_shopify.adapters.persistence.models import AuditLogModel
 from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
 from bims_shopify.api import portal, portal_payments
 from bims_shopify.config import Settings
+from bims_shopify.domain.bancard_vpos import PROBE_SHOP_PROCESS_ID
 from bims_shopify.domain.tenant import PaymentProvider, Tenant
 
 ADMIN = {"Authorization": "Bearer test-admin-token"}
@@ -173,3 +176,55 @@ async def test_requires_authentication_and_blocks_cross_tenant(app):
     assert response.status_code == 401
     assert (await _load(app, "acme")).provider_config["public_key"] == "pub"
     assert (await _call(app, "GET", "other/payments-config", headers=other)).status_code == 200
+
+
+@respx.mock
+async def test_test_connection_without_key_makes_no_http_call(app):
+    response = await _call(app, "POST", "nokey/payments-config/test-connection")
+    assert response.json()["ok"] is False and response.json()["reason"] == "not_configured"
+    assert not respx.calls
+
+
+@respx.mock
+@pytest.mark.parametrize("key", ["BuyNotFoundError", "PaymentNotFoundError"])
+async def test_test_connection_ok_on_signed_not_found_and_only_probes(app, key):
+    route = respx.post(CONFIRMATIONS).mock(
+        return_value=httpx.Response(200, json={"status": "error", "messages": [{"key": key, "level": "error", "dsc": "x"}]})
+    )
+    response = await _call(app, "POST", "acme/payments-config/test-connection")
+    assert response.json()["ok"] is True
+    assert len(respx.calls) == 1
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["operation"]["shop_process_id"] == PROBE_SHOP_PROCESS_ID
+    assert SECRET not in response.text
+    (entry,) = await _audit(app, "payments.config_tested")
+    assert entry.payload["ok"] is True and SECRET not in json.dumps(entry.payload)
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "key,reason",
+    [
+        ("InvalidTokenError", "invalid_credentials"),
+        ("InvalidPublicKeyError", "invalid_credentials"),
+        ("ApplicationNotFoundError", "application_not_enabled"),
+        ("UnauthorizedOperationError", "application_not_enabled"),
+        ("SomethingNew", "unexpected"),
+    ],
+)
+async def test_test_connection_maps_credential_failures(app, key, reason):
+    respx.post(CONFIRMATIONS).mock(
+        return_value=httpx.Response(200, json={"status": "error", "messages": [{"key": key, "level": "error", "dsc": "x"}]})
+    )
+    body = (await _call(app, "POST", "acme/payments-config/test-connection")).json()
+    assert body["ok"] is False and body["reason"] == reason and SECRET not in body["message"]
+
+
+@respx.mock
+@pytest.mark.parametrize("effect", [httpx.ConnectError("boom"), httpx.Response(503)])
+async def test_test_connection_reports_unreachable(app, effect):
+    respx.post(CONFIRMATIONS).mock(side_effect=effect) if isinstance(effect, Exception) else respx.post(
+        CONFIRMATIONS
+    ).mock(return_value=effect)
+    body = (await _call(app, "POST", "acme/payments-config/test-connection")).json()
+    assert body["ok"] is False and body["reason"] == "unreachable"
