@@ -15,6 +15,12 @@ class SqlAlchemyTenantRepository:
         self._session = session
         self._secrets = secret_box
 
+    def _decrypt_optional(self, ciphertext: str | None) -> str | None:
+        return None if ciphertext is None else self._secrets.decrypt(ciphertext)
+
+    def _encrypt_optional(self, plaintext: str | None) -> str | None:
+        return None if plaintext is None else self._secrets.encrypt(plaintext)
+
     def _to_domain(self, model: TenantModel) -> Tenant:
         return Tenant(
             id=model.id,
@@ -37,6 +43,9 @@ class SqlAlchemyTenantRepository:
             bims_timezone=model.bims_timezone,
             payment_provider=PaymentProvider(model.payment_provider) if model.payment_provider else None,
             provider_config=model.provider_config or {},
+            bancard_vpos_private_key=self._decrypt_optional(
+                model.bancard_vpos_private_key_encrypted
+            ),
             field_mappings=model.field_mappings or {},
             active=model.active,
             push_orders_to_bims=model.push_orders_to_bims,
@@ -72,6 +81,9 @@ class SqlAlchemyTenantRepository:
         model.bims_timezone = tenant.bims_timezone
         model.payment_provider = tenant.payment_provider.value if tenant.payment_provider else None
         model.provider_config = tenant.provider_config
+        model.bancard_vpos_private_key_encrypted = self._encrypt_optional(
+            tenant.bancard_vpos_private_key
+        )
         model.field_mappings = tenant.field_mappings
         model.active = tenant.active
         model.push_orders_to_bims = tenant.push_orders_to_bims

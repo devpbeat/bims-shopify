@@ -47,6 +47,9 @@ class TenantModel(Base):
     shopify_shop_domain: Mapped[str] = mapped_column(String(255))
     shopify_access_token_encrypted: Mapped[str] = mapped_column(String(1024))
     shopify_webhook_secret: Mapped[str] = mapped_column(String(255))
+    bancard_vpos_private_key_encrypted: Mapped[str | None] = mapped_column(
+        String(1024), nullable=True, default=None
+    )
     shopify_location_id: Mapped[str] = mapped_column(String(120), default="")
     bims_posale_id: Mapped[int] = mapped_column(Integer, default=0)
     bims_warehouse_id: Mapped[int] = mapped_column(Integer, default=0)

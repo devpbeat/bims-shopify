@@ -38,13 +38,14 @@ class SyncMode(str, Enum):
 class PaymentProvider(str, Enum):
     PAGOPAR = "pagopar"
     BANCARD = "bancard"
+    BANCARD_VPOS = "bancard_vpos"
 
 
 @dataclass
 class Tenant:
     """A single merchant configuration.
 
-    Secrets (bims_api_key, shopify_access_token) are stored encrypted at the
+    Secrets (bims_api_key, shopify_access_token, bancard_vpos_private_key) are stored encrypted at the
     persistence layer; this domain object carries plaintext values once decrypted.
     """
 
@@ -68,6 +69,9 @@ class Tenant:
     bims_timezone: str = "America/Asuncion"
     payment_provider: PaymentProvider | None = None
     provider_config: dict[str, Any] = field(default_factory=dict)
+    #: Bancard vPOS private key (plaintext in memory only; Fernet-encrypted at rest). Kept out
+    #: of ``provider_config`` on purpose so it can never be serialized with the plain settings.
+    bancard_vpos_private_key: str | None = None
     field_mappings: dict[str, Any] = field(default_factory=dict)
     active: bool = True
     push_orders_to_bims: bool = True
