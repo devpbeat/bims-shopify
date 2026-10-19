@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from bims_shopify.adapters.bims.client import BIMSClient
 from bims_shopify.adapters.bims.erp_adapter import BIMSERPAdapter
-from bims_shopify.adapters.payments.pagopar_provider import PagoparProvider
+from bims_shopify.adapters.payments.factory import build_provider
 from bims_shopify.adapters.persistence.audit_repository import SqlAlchemyAuditLogger
 from bims_shopify.adapters.persistence.payment_intent_repository import (
     SqlAlchemyPaymentIntentRepository,
@@ -192,35 +192,50 @@ def _order_gateway_matches(payload: dict, gateway_name: str) -> bool:
 
     Shopify's order payload lists ``payment_gateway_names`` (list[str]);
     matched case-insensitively so the merchant can name the Shopify Manual
-    Payment Method "Pagopar", "pagopar", etc. without a config change.
+    Payment Method "Pagopar", "Bancard", etc. without a config change.
     """
     names = payload.get("payment_gateway_names") or []
     gateway_name = gateway_name.strip().lower()
     return any(str(name).strip().lower() == gateway_name for name in names)
 
 
-async def _maybe_create_pagopar_payment_link(
+# Providers whose hosted checkout is created from `orders/create`, mapped to
+# the default Shopify Manual Payment Method name that triggers a link.
+_LINK_BRIDGE_PROVIDERS = {
+    PaymentProvider.PAGOPAR: "Pagopar",
+    PaymentProvider.BANCARD_VPOS: "Bancard",
+}
+
+
+async def _maybe_create_payment_link(
     tenant: Tenant,
     order_id: str,
     payload: dict,
     sync_state_repo: SqlAlchemySyncStateRepository,
     audit: SqlAlchemyAuditLogger,
     session,
+    settings: Settings,
 ) -> None:
-    """On `orders/create`, create a Pagopar hosted-checkout link for tenants using
-    the "manual payment" model: a Shopify Manual Payment Method named to match
-    `provider_config["gateway_name"]` (default "Pagopar") triggers a link so
+    """On `orders/create`, create a hosted-checkout link for tenants using the
+    "manual payment" model: a Shopify Manual Payment Method named to match
+    `provider_config["gateway_name"]` (default per provider) triggers a link so
     staff can paste it into the order confirmation email.
+
+    The idempotency source is `payment_link:{provider.name}`; for Pagopar that
+    is the literal `payment_link:pagopar` and must never change, or in-flight
+    claims would be orphaned.
     """
-    if tenant.payment_provider != PaymentProvider.PAGOPAR:
+    default_gateway = _LINK_BRIDGE_PROVIDERS.get(tenant.payment_provider)
+    if default_gateway is None:
         return
 
     config = tenant.provider_config or {}
-    gateway_name = config.get("gateway_name", "Pagopar")
+    gateway_name = config.get("gateway_name", default_gateway)
     if not _order_gateway_matches(payload, gateway_name):
         return
 
-    source = "payment_link:pagopar"
+    provider = build_provider(tenant.payment_provider.value, tenant, settings=settings, audit=audit)
+    source = f"payment_link:{provider.name}"
     claimed = await sync_state_repo.try_claim_event(
         tenant.id, source, order_id, hash_payload(json.dumps(payload, sort_keys=True, default=str).encode())
     )
@@ -232,11 +247,12 @@ async def _maybe_create_pagopar_payment_link(
 
     try:
         intents = SqlAlchemyPaymentIntentRepository(session)
-        use_case = CreatePaymentLink(PagoparProvider(), intents)
+        use_case = CreatePaymentLink(provider, intents, audit)
         intent = await use_case.run(tenant, order_id, amount, currency)
     except Exception as exc:
         logger.warning(
-            "pagopar_link_creation_failed",
+            "payment_link_creation_failed",
+            provider=provider.name,
             tenant=tenant.slug,
             order_id=order_id,
             error=str(exc),
@@ -259,7 +275,7 @@ async def _maybe_create_pagopar_payment_link(
         entity="order",
         tenant_id=tenant.id,
         entity_id=order_id,
-        payload={"provider": "pagopar", "status": intent.status, "amount": amount, "currency": currency},
+        payload={"provider": provider.name, "status": intent.status, "amount": amount, "currency": currency},
     )
 
 
@@ -310,15 +326,15 @@ async def _process_order_webhook(
         )
 
         if topic == "orders/create":
-            # orders/create additionally drives the Pagopar hosted-checkout
-            # "manual payment" flow: a pending order placed against a
+            # orders/create additionally drives the hosted-checkout "manual
+            # payment" flow (Pagopar, Bancard vPOS): a pending order placed against a
             # Shopify Manual Payment Method is matched by gateway name and
             # gets a payment link. This runs alongside (not instead of) the
             # existing generic order-received handling below, keyed by its
             # own idempotency source so it never interferes with the
             # `shopify_webhook`-sourced claim used for the BIMS Sale push.
-            await _maybe_create_pagopar_payment_link(
-                tenant, order_id, payload, sync_state_repo, audit, session
+            await _maybe_create_payment_link(
+                tenant, order_id, payload, sync_state_repo, audit, session, settings
             )
 
         # Atomically claim this (tenant, source, external_id) via the DB
