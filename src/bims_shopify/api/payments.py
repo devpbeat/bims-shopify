@@ -19,9 +19,14 @@ from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
 from bims_shopify.adapters.shopify.client import ShopifyClient
-from bims_shopify.application.payments import CreatePaymentLink, HandlePaymentCallback
+from bims_shopify.application.payments import (
+    CreatePaymentLink,
+    HandlePaymentCallback,
+    OrderAmountError,
+    resolve_order_amount,
+)
 from bims_shopify.config import Settings
-from bims_shopify.domain.tenant import Tenant
+from bims_shopify.domain.tenant import PaymentProvider, Tenant
 from bims_shopify.logging import get_logger
 from bims_shopify.ports.payment import callback_response_for
 
@@ -57,9 +62,19 @@ async def create_checkout(
     provider_impl = _build_provider(provider, tenant, settings, audit)
     intents = SqlAlchemyPaymentIntentRepository(session)
     use_case = CreatePaymentLink(provider_impl, intents, audit)
-    intent = await use_case.run(
-        tenant, order_id, float(body.get("amount", 0)), body.get("currency", "PYG")
-    )
+    amount, currency = float(body.get("amount", 0)), body.get("currency", "PYG")
+    if provider == PaymentProvider.BANCARD_VPOS.value:
+        # This route is unauthenticated, so a client-supplied amount is never charged.
+        try:
+            amount = await resolve_order_amount(tenant, order_id, ShopifyClient(tenant))
+        except OrderAmountError as exc:
+            status = 404 if exc.not_found else 422
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.warning("checkout_order_lookup_failed", tenant=tenant_slug, error=type(exc).__name__)
+            raise HTTPException(status_code=502, detail="Order lookup failed") from exc
+        currency = "PYG"
+    intent = await use_case.run(tenant, order_id, amount, currency)
     await audit.log(
         actor="portal",
         action="payment.link_created",

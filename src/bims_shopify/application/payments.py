@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
 from bims_shopify.domain.bancard_vpos import MAX_ATTEMPT, VposAttemptsExhaustedError
@@ -13,6 +14,38 @@ from bims_shopify.ports.payment import PaymentProviderPort
 from bims_shopify.ports.storefront import StorefrontPort
 
 logger = get_logger(__name__)
+
+
+class OrderAmountError(Exception):
+    """The Shopify order cannot be charged (missing, unreadable total, or wrong currency)."""
+
+    def __init__(self, message: str, *, not_found: bool = False) -> None:
+        super().__init__(message)
+        self.not_found = not_found
+
+
+async def resolve_order_amount(
+    tenant: Tenant, order_id: str, storefront: StorefrontPort, *, currency: str = "PYG"
+) -> float:
+    """Charge amount read from the Shopify order itself, never from a request body.
+
+    Raises ``OrderAmountError`` if the order is missing or not priced in
+    ``currency``; storefront transport errors propagate to the caller.
+    """
+    gid = order_id if order_id.startswith("gid://") else f"gid://shopify/Order/{order_id}"
+    order = await storefront.get_order(tenant, gid)
+    if order is None:
+        raise OrderAmountError("order not found", not_found=True)
+    money = (order.get("totalPriceSet") or {}).get("shopMoney") or {}
+    if money.get("currencyCode") != currency:
+        raise OrderAmountError(f"order is not priced in {currency}")
+    try:
+        total = Decimal(str(money.get("amount")))
+    except InvalidOperation as exc:
+        raise OrderAmountError("order total is unreadable") from exc
+    if not total.is_finite() or total <= 0:
+        raise OrderAmountError("order total is not chargeable")
+    return float(total)
 
 
 class PaymentIntentRepositoryPort(Protocol):
