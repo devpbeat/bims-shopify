@@ -66,6 +66,7 @@ export interface Messages {
     unresolved: string
     mismatches: string
     activity: string
+    payments: string
   }
   dashboard: {
     syncStatus: string
@@ -226,5 +227,36 @@ export interface Messages {
       status: string
       time: string
     }
+  }
+  payments: {
+    title: string
+    intro: string
+    readOnlyNotice: string
+    publicKeyLabel: string
+    privateKeyLabel: string
+    privateKeyConfiguredBadge: string
+    privateKeyNotConfiguredBadge: string
+    privateKeyHelp: string
+    privateKeyPlaceholder: string
+    environmentLabel: string
+    environmentStaging: string
+    environmentProduction: string
+    gatewayNameLabel: string
+    gatewayNameHelp: string
+    confirmUrlLabel: string
+    confirmUrlHelp: string
+    copy: string
+    copied: string
+    save: string
+    saving: string
+    saved: string
+    saveFailed: string
+    testConnection: string
+    testing: string
+    testHelp: string
+    testOk: string
+    testFailed: string
+    loadFailed: string
+    loading: string
   }
 }

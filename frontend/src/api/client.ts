@@ -1,6 +1,9 @@
 import type {
   AuditLog,
   DashboardData,
+  PaymentsConfig,
+  PaymentsConfigUpdate,
+  PaymentsTestResult,
   RekeyReport,
   ResolutionRequest,
   ResolutionResult,
@@ -91,5 +94,26 @@ export function postRekeyResolutions(
   return portalFetch<{ results: ResolutionResult[] }>(slug, token, '/rekey-resolutions', {
     method: 'POST',
     body: JSON.stringify({ resolutions }),
+  })
+}
+
+export function getPaymentsConfig(slug: string, token: string): Promise<PaymentsConfig> {
+  return portalFetch<PaymentsConfig>(slug, token, '/payments-config')
+}
+
+export function putPaymentsConfig(
+  slug: string,
+  token: string,
+  update: PaymentsConfigUpdate,
+): Promise<PaymentsConfig> {
+  return portalFetch<PaymentsConfig>(slug, token, '/payments-config', {
+    method: 'PUT',
+    body: JSON.stringify({ provider: 'bancard_vpos', ...update }),
+  })
+}
+
+export function testPaymentsConnection(slug: string, token: string): Promise<PaymentsTestResult> {
+  return portalFetch<PaymentsTestResult>(slug, token, '/payments-config/test-connection', {
+    method: 'POST',
   })
 }

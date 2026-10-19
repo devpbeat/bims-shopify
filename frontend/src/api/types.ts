@@ -133,3 +133,27 @@ export interface AuditLog {
   entries: AuditEntry[]
 }
 
+
+export interface PaymentsConfig {
+  provider: string | null
+  editable: boolean
+  public_key: string | null
+  environment: string | null
+  gateway_name: string | null
+  private_key_configured: boolean
+  confirm_url: string
+}
+
+export interface PaymentsConfigUpdate {
+  public_key: string
+  environment: string
+  gateway_name: string
+  // Omitted when blank so the stored private key is left unchanged.
+  private_key?: string
+}
+
+export interface PaymentsTestResult {
+  ok: boolean
+  reason: string
+  message: string
+}
