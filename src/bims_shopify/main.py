@@ -23,6 +23,7 @@ from bims_shopify.api import (
     audit,
     health,
     ops,
+    pay,
     payments,
     portal,
     shopify_oauth,
@@ -218,6 +219,7 @@ def create_app() -> FastAPI:
     app.include_router(tenants.router)
     app.include_router(webhooks.router)
     app.include_router(payments.router)
+    app.include_router(pay.router)
     app.include_router(sync.router)
     app.include_router(shopify_oauth.router)
     app.include_router(portal.router)
