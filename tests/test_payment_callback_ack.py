@@ -75,6 +75,10 @@ def _shopify_ok() -> httpx.Response:
     )
 
 
+def _operation_count(route, operation: str) -> int:
+    return sum(1 for call in route.calls if operation in call.request.content.decode())
+
+
 async def _post(app, provider: str, **kwargs) -> httpx.Response:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         return await client.post(f"/payments/{provider}/acme/callback", **kwargs)
@@ -93,7 +97,10 @@ async def test_verified_callback_is_acked_and_paid_once_even_on_replay(vpos_app)
 
     assert first.status_code == replay.status_code == 200
     assert first.json() == replay.json() == ACK
-    assert shopify.call_count == 1
+    # Count by operation: the callback also writes reconciliation metafields, so the
+    # route's raw call count is not the "paid once" signal. The mutation count is.
+    assert _operation_count(shopify, "orderMarkAsPaid") == 1
+    assert _operation_count(shopify, "metafieldsSet") == 1
 
 
 @respx.mock
