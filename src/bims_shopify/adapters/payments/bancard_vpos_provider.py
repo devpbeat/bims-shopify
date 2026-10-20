@@ -16,7 +16,6 @@ import httpx
 
 from bims_shopify.checkout_link import (
     derive_link_secret,
-    sign_checkout_token,
     sign_navigation_token,
 )
 from bims_shopify.config import Settings
@@ -53,6 +52,7 @@ CONFIRMATIONS_PATH = "/vpos/api/0.3/single_buy/confirmations"
 ROLLBACK_PATH = "/vpos/api/0.3/single_buy/rollback"
 NOT_FOUND_KEYS = frozenset({"BuyNotFoundError", "PaymentNotFoundError"})
 LINK_TTL = timedelta(hours=24)
+PAY_LINK_TTL = timedelta(days=7)
 REQUEST_TIMEOUT_SECONDS = 20.0
 
 # Message keys that mean the tenant's credentials or application are wrong.
@@ -154,6 +154,11 @@ class BancardVposProvider:
         """vPOS expects this exact body for every confirm call (PDF p.45/p.51)."""
         return {"status": "success"}
 
+    def pay_link(self, tenant: Tenant, order_id: str) -> str:
+        """The buyer-facing URL: it carries the signed order id, never a process_id."""
+        token = sign_navigation_token(self._link_secret(), tenant.slug, str(order_id), ttl=PAY_LINK_TTL)
+        return f"{self._settings.public_base_url.rstrip('/')}/pay/bancard_vpos/{tenant.slug}/{token}"
+
     async def create_checkout(
         self,
         tenant: Tenant,
@@ -194,16 +199,13 @@ class BancardVposProvider:
         process_id = data.get("process_id")
         if not process_id:
             raise VposApiError("MissingProcessId", "error", "single_buy returned no process_id")
-        checkout_token = sign_checkout_token(
-            secret, slug, str(order_id), str(process_id), ttl=LINK_TTL
-        )
         logger.info("vpos_single_buy_created", tenant=slug, order_id=order_id, shop_process_id=spid)
         return PaymentIntent(
             tenant_slug=slug,
             order_id=str(order_id),
             amount=float(vpos_amount.value),
             currency=currency,
-            checkout_url=f"{public_base}/pay/bancard_vpos/{slug}/{checkout_token}",
+            checkout_url=self.pay_link(tenant, order_id),
             provider_reference=str(spid),
             process_id=str(process_id),
         )

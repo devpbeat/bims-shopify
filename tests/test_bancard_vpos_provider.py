@@ -130,11 +130,10 @@ async def test_create_checkout_url_is_signed_own_page(provider, vpos_tenant):
     prefix = "https://app.example.com/pay/bancard_vpos/acme/"
     assert intent.checkout_url.startswith(prefix)
     assert "vpos.infonet.com.py" not in intent.checkout_url
-    claims = verify_token(
-        SECRET, intent.checkout_url[len(prefix):], "acme", require_process_id=True
-    )
-    assert claims.process_id == "PROC1"
+    claims = verify_token(SECRET, intent.checkout_url[len(prefix):], "acme")
+    assert claims.process_id is None
     assert claims.order_id == "1001"
+    assert intent.process_id == "PROC1"
 
 
 @respx.mock

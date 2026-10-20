@@ -81,13 +81,20 @@ def _mock_happy_path(code: str = "00"):
         return_value=httpx.Response(200, json={"status": "success", "process_id": "pid-77"})
     )
     respx.post(CONFIRMATIONS).mock(return_value=_confirmation(code))
-    return respx.post(SHOPIFY).mock(
-        return_value=httpx.Response(
+    return respx.post(SHOPIFY).mock(side_effect=_shopify)
+
+
+def _shopify(request: httpx.Request) -> httpx.Response:
+    """Answer the live-order read and the mark-as-paid mutation like Shopify would."""
+    if b"orderMarkAsPaid" in request.content:
+        return httpx.Response(
             200,
             json={"data": {"orderMarkAsPaid": {"order": {"id": "x", "displayFinancialStatus": "PAID"},
                                                "userErrors": []}}},
         )
-    )
+    order = {"id": f"gid://shopify/Order/{ORDER_ID}", "displayFinancialStatus": "PENDING",
+             "totalPriceSet": {"shopMoney": {"amount": "130.00", "currencyCode": "PYG"}}}
+    return httpx.Response(200, json={"data": {"order": order}})
 
 
 async def _link_path(flow_ctx) -> str:
@@ -115,8 +122,9 @@ async def test_full_flow_pays_the_order_once_using_a_shopify_gid(flow):
 
     assert page.status_code == 200 and "pid-77" in page.text
     assert first.json() == replay.json() == {"status": "success"}
-    assert shopify.call_count == 1
-    variables = json.loads(shopify.calls[0].request.content)["variables"]
+    paid = [c for c in shopify.calls if b"orderMarkAsPaid" in c.request.content]
+    assert len(paid) == 1
+    variables = json.loads(paid[0].request.content)["variables"]
     assert variables == {"input": {"id": f"gid://shopify/Order/{ORDER_ID}"}}
 
 
@@ -130,7 +138,7 @@ async def test_forged_callback_never_marks_the_order_paid(flow):
                           json=_callback(token="0" * 32))
 
     assert (resp.status_code, resp.json()) == (200, {"status": "success"})
-    assert shopify.call_count == 0
+    assert not [c for c in shopify.calls if b"orderMarkAsPaid" in c.request.content]
 
 
 @respx.mock
@@ -142,4 +150,4 @@ async def test_declined_confirmation_never_marks_the_order_paid(flow):
     resp = await _request(app, "POST", "/payments/bancard_vpos/acme/callback", json=_callback())
 
     assert resp.status_code == 200
-    assert shopify.call_count == 0
+    assert not [c for c in shopify.calls if b"orderMarkAsPaid" in c.request.content]
