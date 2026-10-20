@@ -6,6 +6,8 @@ from decimal import Decimal
 
 import pytest
 
+import bims_shopify.domain.bancard_vpos as vpos
+
 from bims_shopify.domain.bancard_vpos import (
     PROBE_SHOP_PROCESS_ID,
     VposAmount,
@@ -15,7 +17,6 @@ from bims_shopify.domain.bancard_vpos import (
     build_shop_process_id,
     confirm_token,
     get_confirmation_token,
-    order_id_from_shop_process_id,
     rollback_token,
     single_buy_token,
     vpos_base_url,
@@ -119,35 +120,55 @@ def test_shop_process_id_in_tokens_must_be_int(bad):
 # --- T2.3 ids / description / urls -----------------------------------------
 
 
-def test_build_shop_process_id_roundtrip():
-    spid = build_shop_process_id("1000000000001", 3)
-    assert spid == 100000000000103
-    assert order_id_from_shop_process_id(spid) == "1000000000001"
-    assert spid // 100 == 1000000000001
+def test_build_shop_process_id_combines_row_id_and_attempt():
+    assert build_shop_process_id(42, 3) == 4203
+    assert build_shop_process_id(1, 0) == 100
+    assert build_shop_process_id(7, 99) == 799
 
 
-def test_build_accepts_int_order_id():
-    assert build_shop_process_id(9876543210123, 0) == 987654321012300
+def test_build_accepts_numeric_string_row_id():
+    assert build_shop_process_id("42", 1) == 4201
+
+
+def test_widest_row_id_still_fits_fifteen_digits():
+    spid = build_shop_process_id(1234567890123, 5)
+    assert spid == 123456789012305
+    assert len(str(spid)) == 15
+
+
+def test_order_id_is_never_derived_from_the_shop_process_id():
+    # The order is resolved through the stored provider_reference, not by arithmetic.
+    assert not hasattr(vpos, "order_id_from_shop_process_id")
 
 
 @pytest.mark.parametrize(
-    "order_id, attempt",
+    "row_id, attempt",
     [
         ("abc", 0),
         ("gid://shopify/Order/123", 0),
         ("", 0),
-        ("12345678901234", 0),  # 14 digits
+        (0, 0),  # a persisted row id is always positive
+        ("0", 0),
+        ("12345678901234", 0),  # 14 digits: the id would exceed 15 digits
         ("-5", 0),
         (True, 0),
-        ("1000", 100),
-        ("1000", -1),
-        ("1000", True),
-        ("9999999999999", 99),  # collides with the probe id
+        (1.5, 0),
+        (1000, 100),
+        (1000, -1),
+        (1000, True),
+        (9999999999999, 99),  # collides with the probe id
     ],
 )
-def test_build_rejects_invalid_input(order_id, attempt):
+def test_build_rejects_invalid_input(row_id, attempt):
     with pytest.raises(VposInvalidIdError):
-        build_shop_process_id(order_id, attempt)
+        build_shop_process_id(row_id, attempt)
+
+
+def test_no_row_id_scheme_value_can_equal_the_probe_id():
+    # The probe id is 13 nines + attempt 99; the only row id that could reach it is refused.
+    with pytest.raises(VposInvalidIdError):
+        build_shop_process_id(9999999999999, 99)
+    assert build_shop_process_id(9999999999999, 98) != PROBE_SHOP_PROCESS_ID
 
 
 def test_probe_id_is_fifteen_digits():
@@ -169,3 +190,14 @@ def test_base_url_per_environment():
 def test_base_url_unknown_raises(env):
     with pytest.raises(VposConfigurationError):
         vpos_base_url(env)
+
+
+@pytest.mark.parametrize("order_id", ["1001", 18943384158340, "189433841583401", "9" * 30])
+def test_require_plain_order_id_has_no_length_limit(order_id):
+    assert vpos.require_plain_order_id(order_id) == str(order_id)
+
+
+@pytest.mark.parametrize("order_id", ["", "abc", "gid://shopify/Order/1", "-5", "1 2", True, 1.5, None])
+def test_require_plain_order_id_refuses_malformed_ids(order_id):
+    with pytest.raises(VposInvalidIdError):
+        vpos.require_plain_order_id(order_id)

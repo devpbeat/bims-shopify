@@ -164,28 +164,43 @@ def rollback_token(private_key: str, shop_process_id: int) -> str:
     return _md5(private_key + _require_spid(shop_process_id) + "rollback" + "0.00")
 
 
-def build_shop_process_id(order_id: object, attempt: object) -> int:
-    """``order_id * 100 + attempt``; reversible with ``// 100``."""
-    if isinstance(attempt, bool) or not isinstance(attempt, int):
-        raise VposInvalidIdError("attempt must be an integer")
-    if not 0 <= attempt <= MAX_ATTEMPT:
-        raise VposInvalidIdError("attempt must be between 0 and 99")
+def require_plain_order_id(order_id: object) -> str:
+    """A Shopify order id is a plain digit string. Its size is irrelevant to vPOS.
+
+    The order id is never encoded into ``shop_process_id``, so there is no length
+    limit here; only malformed ids (gids, signs, blanks) are refused.
+    """
     if isinstance(order_id, bool) or not isinstance(order_id, (int, str)):
         raise VposInvalidIdError("order id must be numeric")
     text = str(order_id)
     if not text.isascii() or not text.isdigit():
         raise VposInvalidIdError("order id must be a plain numeric id")
-    if len(text) > MAX_INTEGER_DIGITS:
-        raise VposInvalidIdError("order id has more than 13 digits")
+    return text
+
+
+def build_shop_process_id(row_id: object, attempt: object) -> int:
+    """``payment_intents row id * 100 + attempt``.
+
+    The row id comes from a database sequence, so the result stays far below the
+    15 digits ``shop_process_id`` allows no matter how large Shopify order ids get.
+    Callers resolve the order back through the stored ``provider_reference``,
+    never by arithmetic on this value.
+    """
+    if isinstance(attempt, bool) or not isinstance(attempt, int):
+        raise VposInvalidIdError("attempt must be an integer")
+    if not 0 <= attempt <= MAX_ATTEMPT:
+        raise VposInvalidIdError("attempt must be between 0 and 99")
+    if isinstance(row_id, bool) or not isinstance(row_id, (int, str)):
+        raise VposInvalidIdError("row id must be numeric")
+    text = str(row_id)
+    if not text.isascii() or not text.isdigit() or int(text) == 0:
+        raise VposInvalidIdError("row id must be a positive plain numeric id")
+    if len(text.lstrip("0")) > MAX_INTEGER_DIGITS:
+        raise VposInvalidIdError("row id has more than 13 digits")
     spid = int(text) * 100 + attempt
     if spid == PROBE_SHOP_PROCESS_ID:
         raise VposInvalidIdError("shop_process_id collides with the reserved probe id")
     return spid
-
-
-def order_id_from_shop_process_id(shop_process_id: int) -> str:
-    _require_spid(shop_process_id)
-    return str(shop_process_id // 100)
 
 
 def vpos_description(name: str) -> str:

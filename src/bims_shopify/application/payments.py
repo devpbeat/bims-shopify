@@ -191,7 +191,12 @@ class CreatePaymentLink:
                     order_id=order_id,
                     error=type(exc).__name__,
                 )
-        intent = await provider.create_checkout(tenant, order_id, amount, currency, attempt=attempt)
+        row_id = existing.row_id if existing is not None else None
+        if row_id is None:
+            row_id = await self._ensure_row(tenant, order_id, amount, currency)
+        intent = await provider.create_checkout(
+            tenant, order_id, amount, currency, row_id=row_id, attempt=attempt
+        )
         await self._intents.save(tenant.id, self._provider.name, intent)
         if abandoned is not None and self._audit is not None:
             await self._audit.log(
@@ -207,6 +212,20 @@ class CreatePaymentLink:
                 },
             )
         return intent
+
+    async def _ensure_row(self, tenant: Tenant, order_id: str, amount: float, currency: str) -> int:
+        """Persist the placeholder intent so a row id exists before minting.
+
+        ``shop_process_id`` is derived from that id. Normally ``orders/create`` already
+        stored the row; this covers a missed webhook, where the first page open is
+        the first time the order is seen.
+        """
+        provider: Any = self._provider
+        placeholder = provider.prepare_link(tenant, order_id, amount, currency)
+        await self._intents.save(tenant.id, self._provider.name, placeholder)
+        if placeholder.row_id is None:
+            raise RuntimeError("intent repository did not return a row id")
+        return placeholder.row_id
 
 
 _RETRYABLE_STATUSES = frozenset({"failed", "cancelled"})

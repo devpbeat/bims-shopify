@@ -34,8 +34,8 @@ from bims_shopify.domain.bancard_vpos import (
     VposConfigurationError,
     VposError,
     build_shop_process_id,
-    order_id_from_shop_process_id,
     parse_confirm_operation,
+    require_plain_order_id,
     single_buy_token,
     verify_confirm_token,
     vpos_base_url,
@@ -170,7 +170,7 @@ class BancardVposProvider:
         a later mint needs so a misconfigured tenant fails here, as before.
         """
         self._credentials(tenant)
-        build_shop_process_id(order_id, 0)
+        require_plain_order_id(order_id)
         return PaymentIntent(
             tenant_slug=tenant.slug,
             order_id=str(order_id),
@@ -186,12 +186,18 @@ class BancardVposProvider:
         amount: float,
         currency: str,
         *,
+        row_id: int,
         attempt: int = 0,
     ) -> PaymentIntent:
+        """Mint the operation. ``row_id`` is the persisted ``payment_intents`` id of the order.
+
+        ``shop_process_id`` is derived from it, never from the Shopify order id, so it
+        stays small however large Shopify order ids grow.
+        """
         public_key, private_key = self._credentials(tenant)
         base_url = self._base_url(tenant)
         secret = self._link_secret()
-        spid = build_shop_process_id(order_id, attempt)
+        spid = build_shop_process_id(row_id, attempt)
         vpos_amount = VposAmount.from_order_total(amount)
         slug = tenant.slug
         public_base = self._settings.public_base_url.rstrip("/")
@@ -344,7 +350,8 @@ class BancardVposProvider:
             raise VposCallbackTokenError("confirm callback token does not match")
         return PaymentIntent(
             tenant_slug=tenant.slug,
-            order_id=order_id_from_shop_process_id(callback.shop_process_id),
+            # The callback never names the order; the use case resolves it by provider_reference.
+            order_id="",
             amount=float(callback.amount.value),
             currency=callback.currency,
             provider_reference=str(callback.shop_process_id),

@@ -23,3 +23,5 @@ class PaymentIntent:
     provider_reference: str | None = None
     status: str = "pending"
     process_id: str | None = None
+    row_id: int | None = None
+    """Persisted ``payment_intents`` primary key; set once the intent has been saved."""

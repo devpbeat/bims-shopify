@@ -86,19 +86,37 @@ async def test_create_checkout_posts_single_buy_envelope(provider, vpos_tenant):
         return_value=httpx.Response(200, json={"status": "success", "process_id": "PROC1"})
     )
 
-    intent = await provider.create_checkout(vpos_tenant, "9876543210123", 130, "PYG")
+    # A REAL 14-digit Shopify order id (the production outage): the id comes from the row.
+    intent = await provider.create_checkout(
+        vpos_tenant, "18943384158340", 130, "PYG", row_id=4242
+    )
 
     body = json.loads(route.calls.last.request.content)
     assert set(body) == {"public_key", "operation"}
     op = body["operation"]
-    assert op["shop_process_id"] == 987654321012300
+    assert op["shop_process_id"] == 424200
     assert isinstance(op["shop_process_id"], int)
+    assert len(str(op["shop_process_id"])) <= 15
     assert op["amount"] == "130.00"
     assert op["currency"] == "PYG"
-    assert op["token"] == _md5(PRIVATE_KEY + "987654321012300" + "130.00" + "PYG")
-    assert intent.provider_reference == "987654321012300"
+    assert op["token"] == _md5(PRIVATE_KEY + "424200" + "130.00" + "PYG")
+    assert intent.provider_reference == "424200"
     assert intent.status == "pending"
-    assert intent.order_id == "9876543210123"
+    assert intent.order_id == "18943384158340"
+
+
+@respx.mock
+async def test_create_checkout_accepts_fifteen_digit_order_ids(provider, vpos_tenant):
+    route = respx.post(f"{STAGING}/vpos/api/0.3/single_buy").mock(
+        return_value=httpx.Response(200, json={"status": "success", "process_id": "PROC1"})
+    )
+
+    intent = await provider.create_checkout(
+        vpos_tenant, "189433841583401", 130, "PYG", row_id=7
+    )
+
+    assert json.loads(route.calls.last.request.content)["operation"]["shop_process_id"] == 700
+    assert intent.order_id == "189433841583401"
 
 
 @respx.mock
@@ -107,7 +125,7 @@ async def test_create_checkout_truncates_description_and_builds_urls(provider, v
         return_value=httpx.Response(200, json={"status": "success", "process_id": "P"})
     )
 
-    await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG")
+    await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG", row_id=1001)
 
     op = json.loads(route.calls.last.request.content)["operation"]
     assert len(op["description"]) <= 20
@@ -125,7 +143,7 @@ async def test_create_checkout_url_is_signed_own_page(provider, vpos_tenant):
         return_value=httpx.Response(200, json={"status": "success", "process_id": "PROC1"})
     )
 
-    intent = await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG")
+    intent = await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG", row_id=1001)
 
     prefix = "https://app.example.com/pay/bancard_vpos/acme/"
     assert intent.checkout_url.startswith(prefix)
@@ -142,7 +160,7 @@ async def test_create_checkout_attempt_changes_id(provider, vpos_tenant):
         return_value=httpx.Response(200, json={"status": "success", "process_id": "P"})
     )
 
-    intent = await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG", attempt=1)
+    intent = await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG", row_id=1001, attempt=1)
 
     assert intent.provider_reference == "100101"
     assert json.loads(route.calls.last.request.content)["operation"]["shop_process_id"] == 100101
@@ -159,8 +177,8 @@ async def test_create_checkout_uses_each_tenants_environment(provider, vpos_tena
     prod_tenant = copy.deepcopy(vpos_tenant)
     prod_tenant.provider_config = {"public_key": "PUB", "environment": "production"}
 
-    await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG")
-    await provider.create_checkout(prod_tenant, "1002", 100.0, "PYG")
+    await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG", row_id=1001)
+    await provider.create_checkout(prod_tenant, "1002", 100.0, "PYG", row_id=1002)
 
     assert staging.call_count == 1 and production.call_count == 1
 
@@ -178,7 +196,7 @@ async def test_create_checkout_error_does_not_leak_private_key(provider, vpos_te
     )
 
     with pytest.raises(VposApiError) as excinfo:
-        await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG")
+        await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG", row_id=1001)
 
     assert PRIVATE_KEY not in str(excinfo.value)
 
@@ -190,7 +208,7 @@ async def test_create_checkout_missing_process_id_raises(provider, vpos_tenant):
     )
 
     with pytest.raises(VposApiError):
-        await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG")
+        await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG", row_id=1001)
 
 
 @respx.mock
@@ -203,7 +221,7 @@ async def test_create_checkout_invalid_token_is_configuration_error(provider, vp
     )
 
     with pytest.raises(VposConfigurationError):
-        await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG")
+        await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG", row_id=1001)
 
 
 @respx.mock
@@ -211,7 +229,7 @@ async def test_create_checkout_rejects_bad_ids_before_http(provider, vpos_tenant
     route = respx.post(f"{STAGING}/vpos/api/0.3/single_buy")
 
     with pytest.raises(VposInvalidIdError):
-        await provider.create_checkout(vpos_tenant, "gid://shopify/Order/1", 100.0, "PYG")
+        await provider.create_checkout(vpos_tenant, "gid://shopify/Order/1", 100.0, "PYG", row_id=0)
 
     assert route.call_count == 0
 
@@ -222,7 +240,7 @@ async def test_create_checkout_requires_private_key_before_http(provider, vpos_t
     route = respx.post(f"{STAGING}/vpos/api/0.3/single_buy")
 
     with pytest.raises(VposConfigurationError):
-        await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG")
+        await provider.create_checkout(vpos_tenant, "1001", 100.0, "PYG", row_id=1001)
 
     assert route.call_count == 0
 
@@ -253,7 +271,8 @@ def _callback(token: str | None = None, *, numbers: bool = False) -> dict:
 async def test_parse_callback_valid(provider, vpos_tenant, numbers):
     intent = await provider.parse_callback(vpos_tenant, _callback(numbers=numbers))
 
-    assert intent.order_id == "123"
+    # The callback never names the order: the use case resolves it by provider_reference.
+    assert intent.order_id == ""
     assert intent.provider_reference == "12313"
     assert Decimal(str(intent.amount)) == Decimal("10100.00")
     assert intent.currency == "PYG"

@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import re
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -13,18 +14,18 @@ import respx
 from httpx import ASGITransport, AsyncClient
 
 from bims_shopify.api import webhooks
-from bims_shopify.domain.bancard_vpos import VposAmount, build_shop_process_id, confirm_token
+from bims_shopify.checkout_link import derive_link_secret, sign_navigation_token
+from bims_shopify.domain.bancard_vpos import VposAmount, confirm_token
 from tests.conftest import VPOS_PRIVATE_KEY
 
 STAGING = "https://vpos.infonet.com.py:8888"
 SINGLE_BUY = f"{STAGING}/vpos/api/0.3/single_buy"
 CONFIRMATIONS = f"{STAGING}/vpos/api/0.3/single_buy/confirmations"
 SHOPIFY = "https://acme.myshopify.com/admin/api/2025-07/graphql.json/"
-ORDER_ID = "1001"
+ORDER_ID = "18943384158340"  # a REAL 14-digit Shopify order id
 
 
-def _callback(*, token: str | None = None) -> dict:
-    spid = build_shop_process_id(ORDER_ID, 0)
+def _callback(spid: int, *, token: str | None = None) -> dict:
     good = confirm_token(VPOS_PRIVATE_KEY, spid, VposAmount.from_order_total("130.00"))
     return {
         "operation": {
@@ -97,6 +98,19 @@ def _shopify(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json={"data": {"order": order}})
 
 
+async def _stored_spid(app) -> int:
+    """The shop_process_id minted for the order, read back from the stored intent."""
+    from bims_shopify.adapters.persistence.payment_intent_repository import (
+        SqlAlchemyPaymentIntentRepository,
+    )
+
+    async with app.state.session_factory() as session:
+        rows = await SqlAlchemyPaymentIntentRepository(session).list_recent(1)
+    spid = int(rows[0]["provider_reference"])
+    assert len(str(spid)) <= 15
+    return spid
+
+
 async def _link_path(flow_ctx) -> str:
     app, _ = flow_ctx
     await _place_order(app)
@@ -119,8 +133,9 @@ async def test_full_flow_pays_the_order_once_using_a_shopify_gid(flow):
     assert not [c for c in respx.calls if str(c.request.url) == SINGLE_BUY]
     page = await _request(app, "GET", path)
     assert len([c for c in respx.calls if str(c.request.url) == SINGLE_BUY]) == 1
-    first = await _request(app, "POST", "/payments/bancard_vpos/acme/callback", json=_callback())
-    replay = await _request(app, "POST", "/payments/bancard_vpos/acme/callback", json=_callback())
+    spid = await _stored_spid(app)
+    first = await _request(app, "POST", "/payments/bancard_vpos/acme/callback", json=_callback(spid))
+    replay = await _request(app, "POST", "/payments/bancard_vpos/acme/callback", json=_callback(spid))
 
     assert page.status_code == 200 and "pid-77" in page.text
     assert first.json() == replay.json() == {"status": "success"}
@@ -134,10 +149,11 @@ async def test_full_flow_pays_the_order_once_using_a_shopify_gid(flow):
 async def test_forged_callback_never_marks_the_order_paid(flow):
     app, _ = flow
     shopify = _mock_happy_path()
-    await _link_path(flow)
+    path = await _link_path(flow)
+    await _request(app, "GET", path)
 
     resp = await _request(app, "POST", "/payments/bancard_vpos/acme/callback",
-                          json=_callback(token="0" * 32))
+                          json=_callback(await _stored_spid(app), token="0" * 32))
 
     assert (resp.status_code, resp.json()) == (200, {"status": "success"})
     assert not [c for c in shopify.calls if b"orderMarkAsPaid" in c.request.content]
@@ -147,9 +163,62 @@ async def test_forged_callback_never_marks_the_order_paid(flow):
 async def test_declined_confirmation_never_marks_the_order_paid(flow):
     app, _ = flow
     shopify = _mock_happy_path("05")
-    await _link_path(flow)
+    path = await _link_path(flow)
+    await _request(app, "GET", path)
 
-    resp = await _request(app, "POST", "/payments/bancard_vpos/acme/callback", json=_callback())
+    resp = await _request(app, "POST", "/payments/bancard_vpos/acme/callback",
+                          json=_callback(await _stored_spid(app)))
 
     assert resp.status_code == 200
     assert not [c for c in shopify.calls if b"orderMarkAsPaid" in c.request.content]
+
+
+@respx.mock
+async def test_minted_id_is_row_based_and_fits_vpos_fifteen_digits(flow):
+    app, _ = flow
+    _mock_happy_path()
+    path = await _link_path(flow)
+
+    await _request(app, "GET", path)
+
+    sent = next(c for c in respx.calls if str(c.request.url) == SINGLE_BUY).request
+    spid = json.loads(sent.content)["operation"]["shop_process_id"]
+    assert spid == await _stored_spid(app)
+    assert spid % 100 == 0 and len(str(spid)) <= 15
+    assert str(spid) != ORDER_ID + "00"
+
+
+@respx.mock
+async def test_first_page_open_without_a_webhook_creates_the_row_before_minting(flow):
+    """orders/create never arrived: the page still opens and mints against a fresh row."""
+    app, _ = flow
+    _mock_happy_path()
+    token = sign_navigation_token(
+        derive_link_secret(flow[1]), "acme", ORDER_ID, ttl=timedelta(hours=1)
+    )
+
+    page = await _request(app, "GET", f"/pay/bancard_vpos/acme/{token}")
+
+    assert page.status_code == 200 and "pid-77" in page.text
+    spid = await _stored_spid(app)
+    first = await _request(app, "POST", "/payments/bancard_vpos/acme/callback", json=_callback(spid))
+    assert first.json() == {"status": "success"}
+    paid = [c for c in respx.calls if b"orderMarkAsPaid" in c.request.content]
+    assert len(paid) == 1
+
+
+@respx.mock
+async def test_return_page_resolves_the_order_from_a_row_based_id(flow):
+    app, _ = flow
+    _mock_happy_path()
+    path = await _link_path(flow)
+    await _request(app, "GET", path)
+    token = path.rsplit("/", 1)[-1]
+
+    resp = await _request(app, "GET", f"/pay/bancard_vpos/acme/return/{token}")
+
+    confirmations = [c for c in respx.calls if str(c.request.url) == CONFIRMATIONS]
+    assert len(confirmations) == 1
+    sent = json.loads(confirmations[0].request.content)["operation"]["shop_process_id"]
+    assert sent == await _stored_spid(app)
+    assert resp.status_code in (200, 303)

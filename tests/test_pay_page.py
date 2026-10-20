@@ -186,9 +186,9 @@ async def test_edited_order_total_rolls_back_and_mints_with_the_new_amount(vpos_
 
     assert '"pid-old"' in first.text and '"pid-new"' in second.text
     assert rollback.call_count == 1
-    assert json.loads(rollback.calls[0].request.content)["operation"]["shop_process_id"] == "100100"
+    assert json.loads(rollback.calls[0].request.content)["operation"]["shop_process_id"] == "100"
     new_body = json.loads(buy.calls[1].request.content)["operation"]
-    assert new_body["amount"] == "175000.00" and new_body["shop_process_id"] == 100101
+    assert new_body["amount"] == "175000.00" and new_body["shop_process_id"] == 101
 
 
 @respx.mock
@@ -579,7 +579,7 @@ async def test_declined_return_offers_a_retry_and_the_same_link_mints_a_new_atte
     retry = await _get(app, f"/pay/bancard_vpos/acme/{nav}")
 
     assert '"pid-retry"' in retry.text
-    assert json.loads(buy.calls[0].request.content)["operation"]["shop_process_id"] == 100101
+    assert json.loads(buy.calls[0].request.content)["operation"]["shop_process_id"] == 101
 
 
 @respx.mock
