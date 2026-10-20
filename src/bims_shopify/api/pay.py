@@ -21,8 +21,16 @@ from bims_shopify.adapters.persistence.payment_intent_repository import (
     SqlAlchemyPaymentIntentRepository,
 )
 from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenantRepository
+from bims_shopify.adapters.persistence.sync_state_repository import (
+    SqlAlchemySyncStateRepository,
+)
 from bims_shopify.adapters.shopify.client import ShopifyClient
-from bims_shopify.application.payments import CreatePaymentLink, OrderAmountError, resolve_live_order
+from bims_shopify.application.payments import (
+    CreatePaymentLink,
+    OrderAmountError,
+    SettleVerifiedPayment,
+    resolve_live_order,
+)
 from bims_shopify.checkout_link import CheckoutClaims, CheckoutTokenError, derive_link_secret, verify_token
 from bims_shopify.config import Settings
 from bims_shopify.domain.bancard_vpos import (
@@ -138,6 +146,21 @@ async def return_page(
         await _log_page_error(audit, tenant, claims.order_id, type(exc).__name__)
         return _still_confirming()
     if verdict == PaymentStatus.CONFIRMED:
+        # Bancard's server-to-server callback may never arrive (misconfigured
+        # confirm URL, outage, a restart). We already hold the bank's own
+        # confirmation here, so settle the order rather than leave a paid order
+        # stuck pending. The claim is shared with the callback, so only one of
+        # the two ever marks it.
+        settle = SettleVerifiedPayment(
+            provider,
+            ShopifyClient(tenant),
+            SqlAlchemySyncStateRepository(session),
+            intents,
+        )
+        try:
+            await settle.run(tenant, intent)
+        except Exception as exc:
+            await _log_page_error(audit, tenant, claims.order_id, type(exc).__name__)
         return await _confirmed(tenant, claims.order_id)
     if verdict == PaymentStatus.FAILED:
         if intent.status == "pending":

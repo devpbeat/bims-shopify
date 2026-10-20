@@ -394,3 +394,72 @@ class HandlePaymentCallback:
 
 def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+class SettleVerifiedPayment:
+    """Mark an already-verified payment as paid exactly once.
+
+    The buyer's ``/return`` flow verifies the outcome with ``get_confirmation``
+    out of band. Until now only the server-to-server callback marked the order
+    paid, so a callback that never arrived left a genuinely paid order stuck in
+    ``pending`` forever, even though we had the bank's own confirmation. That
+    happened in production twice: ``vpos_payment_confirmed`` was logged while
+    the intent stayed ``pending``.
+
+    Both paths claim the SAME ``(source, external_id)`` as
+    ``HandlePaymentCallback`` — ``payment:<provider>`` keyed by the provider
+    reference — so whichever lands first settles the order and the other is a
+    no-op. The claim races on a DB unique constraint, never a
+    SELECT-then-INSERT.
+    """
+
+    def __init__(
+        self,
+        provider: PaymentProviderPort,
+        storefront: StorefrontPort,
+        processed_events: ProcessedEventRepositoryPort,
+        intents: PaymentIntentRepositoryPort,
+    ) -> None:
+        self._provider = provider
+        self._storefront = storefront
+        self._processed_events = processed_events
+        self._intents = intents
+
+    async def run(self, tenant: Tenant, intent: PaymentIntent) -> bool:
+        """Return True when this call is the one that settled the order."""
+        external_id = intent.provider_reference or intent.order_id
+        if not external_id or not intent.order_id:
+            return False
+        source = f"payment:{self._provider.name}"
+        claimed = await self._processed_events.try_claim_event(
+            tenant.id, source, external_id, _hash_payload({"settled_by": "return"})
+        )
+        if not claimed:
+            return False
+        try:
+            await self._storefront.mark_order_as_paid(tenant, intent.order_id)
+            intent.status = "paid"
+            await _annotate_settled_order(self._storefront, tenant, intent)
+        except Exception:
+            # Release the claim so the callback (or a later return) can retry
+            # instead of being swallowed as already processed.
+            await self._processed_events.delete_event(tenant.id, source, external_id)
+            raise
+        await self._processed_events.mark_event_status(tenant.id, source, external_id, "paid")
+        await self._intents.update_status(tenant.id, self._provider.name, intent.order_id, "paid")
+        return True
+
+
+async def _annotate_settled_order(storefront, tenant: Tenant, intent: PaymentIntent) -> None:
+    """Best effort: a failed annotation must never undo a settled payment."""
+    if not intent.order_metafields:
+        return
+    try:
+        await storefront.set_order_metafields(tenant, intent.order_id, intent.order_metafields)
+    except Exception as exc:
+        logger.warning(
+            "payment_metafields_failed",
+            tenant=tenant.slug,
+            order_id=intent.order_id,
+            error=type(exc).__name__,
+        )

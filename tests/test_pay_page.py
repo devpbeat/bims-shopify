@@ -437,9 +437,22 @@ async def test_return_verifies_with_bancard_then_redirects_to_the_order_status_p
     resp = await _return(app, settings)
 
     assert (resp.status_code, resp.headers["location"]) == (303, STATUS_URL)
-    assert confirmations.call_count == 1 and shopify.call_count == 1
-    assert "statusPageUrl" in json.loads(shopify.calls[0].request.content)["query"]
-    assert await _stored_status(app, tenant) == "pending"
+    assert confirmations.call_count == 1
+    # The return now settles the order itself, because Bancard's callback may
+    # never arrive. Count the mutation, not raw requests, so a second marking
+    # would still fail here.
+    marked = sum(
+        1 for call in shopify.calls if b"orderMarkAsPaid" in (call.request.content or b"")
+    )
+    assert marked == 1
+    assert any(
+        "statusPageUrl" in json.loads(call.request.content).get("query", "")
+        for call in shopify.calls
+    )
+    # The order is settled here, not left waiting for a callback that may never
+    # come. Two production payments were confirmed by Bancard and still sat at
+    # "pending" because only the callback marked them.
+    assert await _stored_status(app, tenant) == "paid"
 
 
 @respx.mock
