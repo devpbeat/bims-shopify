@@ -6,6 +6,7 @@ import json
 import pytest
 import structlog
 
+from bims_shopify.application import payment_rollback
 from bims_shopify.application.payment_rollback import (
     PaymentIntentNotFoundError,
     RollbackInputError,
@@ -131,7 +132,9 @@ async def test_non_reversals_never_touch_the_local_status(tenant, result):
     assert audit.entries[0]["payload"]["status_after"] == "paid"
 
 
-async def test_manual_annulment_is_logged_at_error_level_and_audited_twice(tenant):
+async def test_manual_annulment_is_logged_at_error_level_and_audited_twice(tenant, monkeypatch):
+    # The module logger may already be cached by an earlier test; a fresh one is capturable.
+    monkeypatch.setattr(payment_rollback, "logger", structlog.get_logger("rollback-test"))
     use_case, _, _, audit, _ = _case(
         _ok(RollbackVerdict.MANUAL_ANNULMENT_REQUIRED, "TransactionAlreadyConfirmed")
     )

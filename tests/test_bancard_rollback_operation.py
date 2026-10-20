@@ -8,6 +8,7 @@ import pytest
 import respx
 import structlog
 
+from bims_shopify.adapters.payments import bancard_vpos_provider as vpos_module
 from bims_shopify.adapters.payments.bancard_vpos_provider import BancardVposProvider
 from bims_shopify.config import Settings
 from bims_shopify.domain.bancard_vpos import (
@@ -124,7 +125,8 @@ async def test_missing_credentials_raise_configuration_error_without_http(provid
 
 
 @respx.mock
-async def test_rollback_operation_never_logs_key_material(provider, vpos_tenant):
+async def test_rollback_operation_never_logs_key_material(provider, vpos_tenant, monkeypatch):
+    monkeypatch.setattr(vpos_module, "logger", structlog.get_logger("vpos-test"))
     respx.post(ROLLBACK).mock(return_value=_reply("TransactionAlreadyConfirmed"))
 
     with structlog.testing.capture_logs() as logs:
