@@ -10,7 +10,10 @@ from bims_shopify.domain.tenant import PaymentProvider, Tenant
 
 PROVIDER = PaymentProvider.BANCARD_VPOS.value
 OUTSTANDING_STATUSES = frozenset({"pending", "failed"})
-_ORDER_ID = re.compile(r"^(?:gid://shopify/Order/)?(\d{1,20})$")
+# Checkout UI extensions report the order as `gid://shopify/OrderIdentity/<id>`,
+# while the Admin API uses `gid://shopify/Order/<id>`. Both carry the same numeric
+# id, so accept either form (and a bare number) rather than only the Admin one.
+_ORDER_ID = re.compile(r"^(?:gid://shopify/Order(?:Identity)?/)?(\d{1,20})$")
 
 
 class TenantLookupPort(Protocol):

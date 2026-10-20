@@ -273,3 +273,19 @@ def test_route_is_registered_in_the_application(monkeypatch):
     app = main.create_app()
 
     assert PATH in app.openapi()["paths"]
+
+
+async def test_order_identity_gid_from_the_checkout_extension_is_accepted(ext_app):
+    """Checkout UI extensions send `OrderIdentity`, not the Admin API's `Order`.
+
+    Observed in production: the extension posts
+    `gid://shopify/OrderIdentity/18944279412868`. Rejecting that shape made the
+    endpoint answer "nothing to pay" for an order that genuinely owed money.
+    """
+    app, make_tenant, seed = ext_app
+    await seed(await make_tenant())
+
+    resp = await _post(app, _token(), order_id="gid://shopify/OrderIdentity/1001")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "pay"
