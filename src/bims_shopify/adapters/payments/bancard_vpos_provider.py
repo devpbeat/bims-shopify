@@ -21,8 +21,9 @@ from bims_shopify.checkout_link import (
 from bims_shopify.config import Settings
 from bims_shopify.domain.bancard_vpos import (
     ConfirmationOutcome,
-    RollbackOutcome,
-    classify_rollback_key,
+    RollbackResult,
+    RollbackVerdict,
+    classify_rollback_verdict,
     rollback_token,
     classify_response_code,
     get_confirmation_token,
@@ -290,7 +291,8 @@ class BancardVposProvider:
         portal can reverse it, so it is an error plus an audit entry.
         """
         try:
-            await self._rollback(tenant, intent)
+            result = await self.rollback_operation(tenant, intent)
+            await self._record_abandon_outcome(tenant, intent, result)
         except Exception as exc:
             logger.warning(
                 "vpos_rollback_failed",
@@ -300,9 +302,19 @@ class BancardVposProvider:
                 error=type(exc).__name__,
             )
 
-    async def _rollback(self, tenant: Tenant, intent: PaymentIntent) -> None:
+    async def rollback_operation(self, tenant: Tenant, intent: PaymentIntent) -> RollbackResult:
+        """Send one ``rollback`` and return the classified outcome.
+
+        Unlike ``abandon_attempt`` the caller learns what really happened.
+        Transport problems come back as ``TRANSPORT_FAILURE``; rejected
+        credentials raise ``VposConfigurationError`` so they are never read as a
+        payment outcome. Logging and auditing are the caller's job.
+        """
         public_key, private_key = self._credentials(tenant)
-        spid = int(intent.provider_reference or "")
+        try:
+            spid = int(intent.provider_reference or "")
+        except ValueError as exc:
+            raise VposConfigurationError("intent has no valid shop_process_id") from exc
         body = {
             "public_key": public_key,
             "elements": {},
@@ -312,15 +324,26 @@ class BancardVposProvider:
                 "shop_process_id": str(spid),
             },
         }
-        response = await self._post(f"{self._base_url(tenant)}{ROLLBACK_PATH}", body)
-        if response.status_code >= 500:
-            raise httpx.HTTPStatusError("server error", request=response.request, response=response)
-        data = response.json()
+        try:
+            response = await self._post(f"{self._base_url(tenant)}{ROLLBACK_PATH}", body)
+            if response.status_code >= 500:
+                raise httpx.HTTPStatusError("server error", request=response.request, response=response)
+            data = response.json()
+        except (httpx.HTTPError, ValueError):
+            return RollbackResult(RollbackVerdict.TRANSPORT_FAILURE)
         key, _, _ = self._first_message(data if isinstance(data, dict) else {})
-        outcome = classify_rollback_key(key)
-        if outcome is RollbackOutcome.BENIGN:
-            logger.debug("vpos_rollback_done", tenant=tenant.slug, shop_process_id=spid, key=key)
-        elif outcome is RollbackOutcome.OPERATOR_ACTION:
+        if key in CONFIGURATION_KEYS:
+            raise VposConfigurationError(f"vPOS rejected the credentials: {key}")
+        return RollbackResult(classify_rollback_verdict(key), key)
+
+    async def _record_abandon_outcome(
+        self, tenant: Tenant, intent: PaymentIntent, result: RollbackResult
+    ) -> None:
+        spid = int(intent.provider_reference or "")
+        verdict = result.verdict
+        if verdict in (RollbackVerdict.SUCCEEDED, RollbackVerdict.NO_OP):
+            logger.debug("vpos_rollback_done", tenant=tenant.slug, shop_process_id=spid, key=result.key)
+        elif verdict is RollbackVerdict.MANUAL_ANNULMENT_REQUIRED:
             logger.error(
                 "vpos_rollback_requires_manual_annulment",
                 tenant=tenant.slug,
@@ -337,13 +360,21 @@ class BancardVposProvider:
                     entity_id=str(spid),
                     payload={"order_id": intent.order_id, "shop_process_id": spid},
                 )
+        elif verdict is RollbackVerdict.TRANSPORT_FAILURE:
+            logger.warning(
+                "vpos_rollback_failed",
+                tenant=tenant.slug,
+                order_id=intent.order_id,
+                shop_process_id=spid,
+                error="TransportFailure",
+            )
         else:
             logger.warning(
                 "vpos_rollback_unexpected_outcome",
                 tenant=tenant.slug,
                 order_id=intent.order_id,
                 shop_process_id=spid,
-                key=key,
+                key=result.key,
             )
 
     async def parse_callback(self, tenant: Tenant, payload: dict[str, Any]) -> PaymentIntent:

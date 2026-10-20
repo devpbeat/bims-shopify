@@ -345,6 +345,39 @@ def classify_rollback_key(key: object) -> RollbackOutcome:
     return RollbackOutcome.OTHER
 
 
+class RollbackVerdict(str, Enum):
+    """What an explicit rollback actually did, as the operator needs to read it."""
+
+    SUCCEEDED = "succeeded"
+    NO_OP = "no_op"
+    MANUAL_ANNULMENT_REQUIRED = "manual_annulment_required"
+    TRANSPORT_FAILURE = "transport_failure"
+    UNEXPECTED = "unexpected"
+
+
+@dataclass(frozen=True)
+class RollbackResult:
+    """Classified answer of one rollback call; ``key`` is Bancard's message key, never a secret."""
+
+    verdict: RollbackVerdict
+    key: str | None = None
+
+
+def classify_rollback_verdict(key: object) -> RollbackVerdict:
+    """Finer-grained sibling of ``classify_rollback_key`` for the explicit rollback.
+
+    ``PaymentNotFoundError`` and ``AlreadyRollbackedError`` are expected, benign
+    no-ops; only ``RollbackSuccessful`` means a charge was actually reversed.
+    """
+    if key == "RollbackSuccessful":
+        return RollbackVerdict.SUCCEEDED
+    if key in {"PaymentNotFoundError", "AlreadyRollbackedError"}:
+        return RollbackVerdict.NO_OP
+    if key == "TransactionAlreadyConfirmed":
+        return RollbackVerdict.MANUAL_ANNULMENT_REQUIRED
+    return RollbackVerdict.UNEXPECTED
+
+
 # --- Reconciliation metafields -------------------------------------------------
 
 METAFIELD_NAMESPACE = "bims_bancard"
