@@ -96,7 +96,18 @@ async def receive_app_level_webhook(
     if not x_shopify_shop_domain:
         raise HTTPException(status_code=400, detail="Missing X-Shopify-Shop-Domain header")
 
-    tenant = await repo.get_by_slug(x_shopify_shop_domain.split(".")[0])
+    shop_domain = _normalize_shop_domain(x_shopify_shop_domain)
+    tenant = await repo.get_by_shopify_domain(shop_domain)
+    if tenant is None:
+        # Legacy fallback for tenants whose slug equals the myshopify subdomain.
+        tenant = await repo.get_by_slug(shop_domain.split(".")[0])
+        if tenant is not None:
+            logger.warning(
+                "app_webhook_slug_fallback",
+                shop=shop_domain,
+                tenant=tenant.slug,
+                topic=x_shopify_topic,
+            )
     if tenant is None:
         # Shopify still expects a 200 for webhooks addressed to shops we
         # don't recognize (e.g. a stale subscription after uninstall);
@@ -115,6 +126,11 @@ async def receive_app_level_webhook(
         body,
     )
     return {"status": "accepted"}
+
+
+def _normalize_shop_domain(value: str) -> str:
+    """Canonicalize a shop domain from a header or payload (trim + lowercase)."""
+    return (value or "").strip().lower()
 
 
 @router.post("/compliance/{topic:path}")
@@ -142,8 +158,10 @@ async def receive_compliance_webhook(
 
     if resolved_topic == "shop/redact":
         shop_domain = payload.get("shop_domain", "")
-        slug = shop_domain.split(".")[0] if shop_domain else ""
-        tenant = await repo.get_by_slug(slug) if slug else None
+        # Destructive: match the stored domain only, never the inferred slug,
+        # so an unrelated shop can never erase another tenant.
+        normalized = _normalize_shop_domain(shop_domain)
+        tenant = await repo.get_by_shopify_domain(normalized) if normalized else None
         if tenant is not None:
             await repo.delete(tenant.id)
         logger.info("shopify_compliance_shop_redact", shop=shop_domain)
