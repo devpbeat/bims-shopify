@@ -1,0 +1,14 @@
+api_version = "2026-10"
+
+[[extensions]]
+name = "Bancard pay link"
+handle = "bancard-pay-link"
+type = "ui_extension"
+description = "Shows the Bancard card payment button on the Thank you page while an order is unpaid."
+
+  [extensions.capabilities]
+  network_access = true
+
+  [[extensions.targeting]]
+  module = "./src/Checkout.jsx"
+  target = "purchase.thank-you.block.render"
