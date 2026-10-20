@@ -126,6 +126,21 @@ class CreatePaymentLink:
         self._intents = intents
         self._audit = audit
 
+    async def prepare(
+        self, tenant: Tenant, order_id: str, amount: float, currency: str
+    ) -> PaymentIntent:
+        """Persist the buyer link for providers that mint their operation on page open.
+
+        Never calls the provider's remote API; an existing intent is returned untouched.
+        """
+        existing = await self._intents.get_by_order_id(tenant.id, self._provider.name, order_id)
+        if existing is not None:
+            return existing
+        provider: Any = self._provider
+        intent = provider.prepare_link(tenant, order_id, amount, currency)
+        await self._intents.save(tenant.id, self._provider.name, intent)
+        return intent
+
     async def run(self, tenant: Tenant, order_id: str, amount: float, currency: str) -> PaymentIntent:
         existing = await self._intents.get_by_order_id(tenant.id, self._provider.name, order_id)
         if not getattr(self._provider, "supports_attempts", False):

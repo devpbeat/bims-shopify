@@ -213,3 +213,24 @@ async def test_providers_without_attempts_keep_legacy_behaviour(tenant):
     intents.rows[ORDER].status = "failed"
     await use_case.run(tenant, ORDER, 100.0, "PYG")
     assert provider.calls == 1
+
+
+async def test_prepare_never_mints_and_never_overwrites_an_existing_intent(tenant):
+    class Deferring(AttemptProvider):
+        defers_checkout = True
+
+        def prepare_link(self, tenant, order_id, amount, currency):
+            return PaymentIntent(
+                tenant_slug=tenant.slug, order_id=order_id, amount=amount, currency=currency,
+                checkout_url="https://x/link",
+            )
+
+    provider = Deferring()
+    use_case, intents = _make(provider)
+    first = await use_case.prepare(tenant, ORDER, 100.0, "PYG")
+    assert (first.checkout_url, first.provider_reference) == ("https://x/link", None)
+    assert provider.created == []
+
+    minted = await use_case.run(tenant, ORDER, 100.0, "PYG")
+    again = await use_case.prepare(tenant, ORDER, 100.0, "PYG")
+    assert again is minted and intents.rows[ORDER].process_id == "pid-0"

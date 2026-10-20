@@ -16,6 +16,7 @@ from bims_shopify.adapters.persistence.payment_intent_repository import (
 )
 from bims_shopify.adapters.persistence.sync_state_repository import SqlAlchemySyncStateRepository
 from bims_shopify.api import webhooks
+from bims_shopify.checkout_link import derive_link_secret, verify_token
 from bims_shopify.domain.tenant import PaymentProvider
 
 SINGLE_BUY = "https://vpos.infonet.com.py:8888/vpos/api/0.3/single_buy"
@@ -82,7 +83,30 @@ async def test_pagopar_claim_source_is_the_pinned_literal(bridge_app, claimed_so
 
 
 @respx.mock
-async def test_vpos_tenant_gets_a_signed_link_and_provider_scoped_source(bridge_app, claimed_sources):
+async def test_pagopar_still_creates_its_checkout_at_order_time(bridge_app):
+    app, _, make_tenant = bridge_app
+    tenant = await make_tenant(
+        payment_provider=PaymentProvider.PAGOPAR,
+        provider_config={"public_key": "pub", "private_key": "priv"},
+        bancard_vpos_private_key=None,
+    )
+    route = respx.post(PAGOPAR_INIT).mock(
+        return_value=httpx.Response(200, json={"respuesta": True, "resultado": [{"data": "h-1"}]})
+    )
+
+    resp = await _post_order(app, _payload(gateway="Pagopar"))
+
+    assert resp.status_code == 200 and route.call_count == 1
+    async with app.state.session_factory() as session:
+        intent = await SqlAlchemyPaymentIntentRepository(session).get_by_order_id(
+            tenant.id, "pagopar", "1001"
+        )
+    assert intent is not None and intent.provider_reference == "h-1"
+    assert intent.checkout_url and intent.process_id is None
+
+
+@respx.mock
+async def test_vpos_tenant_gets_the_dynamic_link_without_minting_an_operation(bridge_app, claimed_sources):
     app, settings, make_tenant = bridge_app
     tenant = await make_tenant()
     route = respx.post(SINGLE_BUY).mock(
@@ -90,16 +114,21 @@ async def test_vpos_tenant_gets_a_signed_link_and_provider_scoped_source(bridge_
     )
 
     resp = await _post_order(app, _payload())
+    replay = await _post_order(app, _payload())
 
-    assert resp.status_code == 200
-    assert route.call_count == 1
+    assert resp.status_code == replay.status_code == 200
+    assert route.call_count == 0
     assert "payment_link:bancard_vpos" in claimed_sources
     async with app.state.session_factory() as session:
         intent = await SqlAlchemyPaymentIntentRepository(session).get_by_order_id(
             tenant.id, "bancard_vpos", "1001"
         )
     assert intent is not None and intent.status == "pending"
-    assert intent.checkout_url.startswith(f"{settings.public_base_url}/pay/bancard_vpos/acme/")
+    assert intent.provider_reference is None and intent.process_id is None
+    prefix = f"{settings.public_base_url}/pay/bancard_vpos/acme/"
+    assert intent.checkout_url.startswith(prefix)
+    claims = verify_token(derive_link_secret(settings), intent.checkout_url[len(prefix):], "acme")
+    assert claims.order_id == "1001" and claims.process_id is None
 
 
 @respx.mock
@@ -134,6 +163,7 @@ async def test_vpos_unusable_order_id_makes_no_bancard_call_and_still_succeeds(b
     resp = await _post_order(app, _payload(order_id=order_id))
 
     assert resp.status_code == 200 and not route.called
+    assert await _intent_count(app) == 0
 
 
 @respx.mock
@@ -145,3 +175,13 @@ async def test_vpos_without_private_key_makes_no_bancard_call_and_still_succeeds
     resp = await _post_order(app, _payload())
 
     assert resp.status_code == 200 and not route.called
+    assert await _intent_count(app) == 0
+
+
+async def _intent_count(app) -> int:
+    import sqlalchemy as sa
+
+    from bims_shopify.adapters.persistence.models import PaymentIntentModel
+
+    async with app.state.session_factory() as session:
+        return len((await session.execute(sa.select(PaymentIntentModel))).scalars().all())

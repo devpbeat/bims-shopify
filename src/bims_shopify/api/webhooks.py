@@ -248,7 +248,11 @@ async def _maybe_create_payment_link(
     try:
         intents = SqlAlchemyPaymentIntentRepository(session)
         use_case = CreatePaymentLink(provider, intents, audit)
-        intent = await use_case.run(tenant, order_id, amount, currency)
+        if getattr(provider, "defers_checkout", False):
+            # vPOS mints its operation when the buyer opens the link, against the live total.
+            intent = await use_case.prepare(tenant, order_id, amount, currency)
+        else:
+            intent = await use_case.run(tenant, order_id, amount, currency)
     except Exception as exc:
         logger.warning(
             "payment_link_creation_failed",

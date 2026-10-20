@@ -116,7 +116,9 @@ async def test_full_flow_pays_the_order_once_using_a_shopify_gid(flow):
     shopify = _mock_happy_path()
 
     path = await _link_path(flow)
+    assert not [c for c in respx.calls if str(c.request.url) == SINGLE_BUY]
     page = await _request(app, "GET", path)
+    assert len([c for c in respx.calls if str(c.request.url) == SINGLE_BUY]) == 1
     first = await _request(app, "POST", "/payments/bancard_vpos/acme/callback", json=_callback())
     replay = await _request(app, "POST", "/payments/bancard_vpos/acme/callback", json=_callback())
 

@@ -91,6 +91,7 @@ class BancardVposProvider:
 
     name = "bancard_vpos"
     supports_attempts = True
+    defers_checkout = True
     always_ack_callback = True
 
     def __init__(
@@ -158,6 +159,25 @@ class BancardVposProvider:
         """The buyer-facing URL: it carries the signed order id, never a process_id."""
         token = sign_navigation_token(self._link_secret(), tenant.slug, str(order_id), ttl=PAY_LINK_TTL)
         return f"{self._settings.public_base_url.rstrip('/')}/pay/bancard_vpos/{tenant.slug}/{token}"
+
+    def prepare_link(
+        self, tenant: Tenant, order_id: str, amount: float, currency: str
+    ) -> PaymentIntent:
+        """The dynamic link for an order, without calling Bancard.
+
+        No operation exists until the buyer opens the page, so the amount is
+        only a hint; the page charges the live Shopify total. Validates what
+        a later mint needs so a misconfigured tenant fails here, as before.
+        """
+        self._credentials(tenant)
+        build_shop_process_id(order_id, 0)
+        return PaymentIntent(
+            tenant_slug=tenant.slug,
+            order_id=str(order_id),
+            amount=amount,
+            currency=currency,
+            checkout_url=self.pay_link(tenant, order_id),
+        )
 
     async def create_checkout(
         self,
