@@ -11,7 +11,7 @@ from bims_shopify.adapters.persistence.models import (
     PaymentIntentModel,
     ProcessedEventModel,
 )
-from bims_shopify.application.payment_purge import PurgeRefusedError
+from bims_shopify.application.payment_purge import PurgeRefusedError, TenantNotFoundError
 from bims_shopify.domain.tenant import PaymentProvider
 from bims_shopify.ops.purge_payments import run_purge
 
@@ -128,7 +128,68 @@ async def test_confirmation_must_repeat_the_tenant_slug_exactly(world, confirm):
     assert await _audits(factory) == []
 
 
+async def test_date_bounds_protect_newer_history(world):
+    factory, acme, _ = world
+
+    result = await run_purge(
+        factory, tenant_slug="acme", created_before=datetime(2026, 10, 15, tzinfo=UTC),
+        confirm_tenant="acme", out=lambda _: None,
+    )
+
+    assert (result.intents, result.events) == (2, 2)
+    async with factory() as session:
+        left = await session.scalars(select(PaymentIntentModel.order_id).where(
+            PaymentIntentModel.tenant_id == acme.id, PaymentIntentModel.provider == "bancard_vpos"))
+        assert list(left) == ["3"]
+
+
+async def test_created_after_bound_is_inclusive(world):
+    factory, *_ = world
+
+    result = await run_purge(factory, tenant_slug="acme", created_after=NEW, out=lambda _: None)
+
+    assert (result.intents, result.events) == (1, 1)
+
+
+async def test_unknown_tenant_is_refused(world):
+    factory, *_ = world
+    with pytest.raises(TenantNotFoundError):
+        await run_purge(factory, tenant_slug="ghost", out=lambda _: None)
+
+
+async def test_a_production_configured_tenant_needs_an_extra_flag(world):
+    factory, acme, _ = world
+    from bims_shopify.adapters.persistence.models import TenantModel
+
+    async with factory() as session:
+        tenant = await session.get(TenantModel, acme.id)
+        tenant.provider_config = {"environment": "production"}
+        await session.commit()
+
+    lines: list[str] = []
+    dry = await run_purge(factory, tenant_slug="acme", out=lines.append)
+    assert dry.dry_run and "production" in "\n".join(lines).lower()
+    with pytest.raises(PurgeRefusedError):
+        await run_purge(factory, tenant_slug="acme", confirm_tenant="acme", out=lambda _: None)
+    assert await _count(factory, PaymentIntentModel) == 5
+
+    done = await run_purge(
+        factory, tenant_slug="acme", confirm_tenant="acme", allow_production=True, out=lambda _: None
+    )
+    assert done.intents == 3
+
+
 def test_the_purge_is_not_reachable_over_http():
     from bims_shopify import main
 
     assert not [p for p in main.create_app().openapi()["paths"] if "purge" in p.lower()]
+
+
+def test_cli_defaults_are_a_dry_run_and_dates_are_utc_midnight():
+    from bims_shopify.ops.purge_payments import _build_arg_parser
+
+    args = _build_arg_parser().parse_args(["acme", "--created-before", "2026-10-15"])
+
+    assert args.confirm_tenant is None and args.allow_production is False
+    assert args.provider == "bancard_vpos"
+    assert args.created_before == datetime(2026, 10, 15, tzinfo=UTC)

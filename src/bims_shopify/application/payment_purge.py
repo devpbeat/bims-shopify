@@ -86,6 +86,7 @@ class PurgeTenantPayments:
         created_before: datetime | None = None,
         created_after: datetime | None = None,
         confirm_tenant: str | None = None,
+        allow_production: bool = False,
     ) -> PurgeResult:
         tenant = await self._repo.find_tenant(tenant_slug)
         if tenant is None:
@@ -96,6 +97,8 @@ class PurgeTenantPayments:
             return PurgeResult(True, tenant, scope, plan, plan.intents, plan.events)
         if confirm_tenant != tenant.slug:
             raise PurgeRefusedError("confirmation does not match the tenant slug")
+        if tenant.environment == "production" and not allow_production:
+            raise PurgeRefusedError("tenant is configured for production; override required")
         intents, events = await self._repo.delete(scope)
         await self._audit.log(
             actor="cli",
