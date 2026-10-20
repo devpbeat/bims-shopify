@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +24,9 @@ from bims_shopify.adapters.persistence.audit_repository import (
     DEFAULT_AUDIT_LIMIT,
     MAX_AUDIT_LIMIT,
     SqlAlchemyAuditLogger,
+)
+from bims_shopify.adapters.persistence.payment_intent_repository import (
+    SqlAlchemyPaymentIntentRepository,
 )
 from bims_shopify.adapters.persistence.portal_user_repository import (
     SqlAlchemyPortalUserRepository,
@@ -36,6 +39,7 @@ from bims_shopify.adapters.persistence.sync_state_repository import (
 from bims_shopify.adapters.persistence.tenant_repository import (
     SqlAlchemyTenantRepository,
 )
+from bims_shopify.adapters.reporting.payments_xlsx import build_payments_workbook
 from bims_shopify.adapters.shopify.client import ShopifyClient, ShopifyGraphQLError
 from bims_shopify.api.portal_auth import (
     LoginRateLimiter,
@@ -45,8 +49,19 @@ from bims_shopify.api.portal_auth import (
     get_portal_session_secret,
     verify_password,
 )
+from bims_shopify.application.payment_report import (
+    InvalidReportFilters,
+    build_report,
+    resolve_filters,
+)
 from bims_shopify.config import Settings
 from bims_shopify.datetime_utils import ensure_aware_utc
+from bims_shopify.domain.payment_report import (
+    DEFAULT_PAGE_SIZE,
+    EXPORT_ROW_CAP,
+    MAX_PAGE_SIZE,
+    ReportFilters,
+)
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
@@ -62,7 +77,8 @@ from .deps import (
 router = APIRouter(prefix="/api/portal/{slug}", tags=["portal"])
 logger = get_logger(__name__)
 
-VALID_ACTIONS = {"keep", "delete", "approve_sku", "ignore"}
+XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+VALID_ACTIONS ={"keep", "delete", "approve_sku", "ignore"}
 _REPORT_CATEGORIES = ("planned_rewrites", "name_mismatch", "unresolved", "duplicate_target")
 
 _APPLY_ERRORS: tuple[type[Exception], ...] = (
@@ -254,6 +270,64 @@ async def list_payments(
     repo = SqlAlchemyPaymentIntentRepository(session)
     payments = await repo.list_recent(tenant.id)
     return {"payments": payments}
+
+
+def _report_filters(
+    date_from: date | None, date_to: date | None, status: str | None, provider: str | None
+) -> ReportFilters:
+    try:
+        return resolve_filters(date_from, date_to, status, provider, datetime.now(UTC).date())
+    except InvalidReportFilters as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+@router.get("/payments/report")
+async def payments_report(
+    date_from: date | None = None,
+    date_to: date | None = None,
+    status: str | None = None,
+    provider: str | None = None,
+    limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+    tenant: Tenant = Depends(get_portal_tenant),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Filtered payment rows plus per-status and per-day aggregates for charts.
+
+    Aggregates cover every matching row; ``rows`` is one page. Rows never
+    include ``checkout_url``.
+    """
+    filters = _report_filters(date_from, date_to, status, provider)
+    return await build_report(
+        SqlAlchemyPaymentIntentRepository(session), tenant.id, filters, limit, offset
+    )
+
+
+@router.get("/payments/export")
+async def payments_export(
+    date_from: date | None = None,
+    date_to: date | None = None,
+    status: str | None = None,
+    provider: str | None = None,
+    tenant: Tenant = Depends(get_portal_tenant),
+    session: AsyncSession = Depends(get_db_session),
+) -> Response:
+    """The same report as an XLSX download, capped at ``EXPORT_ROW_CAP`` rows."""
+    filters = _report_filters(date_from, date_to, status, provider)
+    report = await build_report(
+        SqlAlchemyPaymentIntentRepository(session), tenant.id, filters, EXPORT_ROW_CAP, 0
+    )
+    truncated = report["total"] > EXPORT_ROW_CAP
+    content = build_payments_workbook(
+        report["rows"], report["by_status"], report["by_day"], truncated=truncated
+    )
+    applied = report["filters"]
+    safe_slug = "".join(ch for ch in tenant.slug if ch.isalnum() or ch in "-_")
+    filename = f"payments-{safe_slug}-{applied['date_from']}_{applied['date_to']}.xlsx"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if truncated:
+        headers["X-Report-Truncated"] = "true"
+    return Response(content=content, media_type=XLSX_MEDIA_TYPE, headers=headers)
 
 
 async def _rekey_report_is_obsolete(
