@@ -410,14 +410,35 @@ async def test_verify_payment_currency_mismatch_fails(provider, vpos_tenant):
 
 @pytest.mark.parametrize("key", ["BuyNotFoundError", "PaymentNotFoundError"])
 @respx.mock
-async def test_verify_payment_not_found_fails(provider, vpos_tenant, key):
+async def test_verify_payment_not_found_is_pending_not_declined(provider, vpos_tenant, key):
+    # Bancard: PaymentNotFoundError means the buyer has not paid (yet) and "must be taken
+    # as a correct answer". It is never a decline, which only arrives as a declined code.
     respx.post(CONFIRMATIONS).mock(
         return_value=httpx.Response(
             200, json={"status": "error", "messages": [{"key": key, "level": "error", "dsc": "x"}]}
         )
     )
 
-    assert await provider.verify_payment(vpos_tenant, _intent()) == PaymentStatus.FAILED
+    with structlog.testing.capture_logs() as logs:
+        status = await provider.verify_payment(vpos_tenant, _intent())
+
+    assert status == PaymentStatus.PENDING
+    assert [e["key"] for e in logs if e["event"] == "vpos_payment_not_found"] == [key]
+
+
+@respx.mock
+async def test_declined_code_fails_while_not_found_key_stays_pending(provider, vpos_tenant):
+    route = respx.post(CONFIRMATIONS)
+    route.mock(return_value=httpx.Response(200, json=_confirmation("05")))
+    declined = await provider.verify_payment(vpos_tenant, _intent())
+    route.mock(
+        return_value=httpx.Response(
+            200, json={"status": "error", "messages": [{"key": "PaymentNotFoundError", "level": "error"}]}
+        )
+    )
+    unpaid = await provider.verify_payment(vpos_tenant, _intent())
+
+    assert (declined, unpaid) == (PaymentStatus.FAILED, PaymentStatus.PENDING)
 
 
 @pytest.mark.parametrize(

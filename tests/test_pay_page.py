@@ -517,6 +517,48 @@ async def test_return_with_rejected_credentials_says_still_confirming_and_audits
     assert await _audit_actions(app) == ["payment.page_error"]
 
 
+@pytest.mark.parametrize("key", ["PaymentNotFoundError", "BuyNotFoundError"])
+@respx.mock
+async def test_return_before_the_buyer_has_paid_says_still_confirming_not_declined(vpos_app, key):
+    app, settings, make_tenant = vpos_app
+    tenant = await make_tenant()
+    await _seed_attempt(app, tenant)
+    respx.post(CONFIRMATIONS).mock(
+        return_value=httpx.Response(
+            200, json={"status": "error", "messages": [{"key": key, "level": "error"}]}
+        )
+    )
+
+    resp = await _return(app, settings)
+
+    assert resp.status_code == 200 and "still confirming" in resp.text
+    assert "declined" not in resp.text and "location" not in resp.headers
+    assert await _stored_status(app, tenant) == "pending"
+
+
+@respx.mock
+async def test_reopening_an_unpaid_attempt_with_an_unchanged_total_does_not_mint_again(vpos_app):
+    app, settings, make_tenant = vpos_app
+    tenant = await make_tenant()
+    shopify, buy = _mock()
+    first = await _get(app, f"/pay/bancard_vpos/acme/{_token(settings)}")
+    confirmations = respx.post(CONFIRMATIONS).mock(
+        return_value=httpx.Response(
+            200, json={"status": "error", "messages": [{"key": "PaymentNotFoundError", "level": "error"}]}
+        )
+    )
+    rollback = respx.post(ROLLBACK).mock(return_value=httpx.Response(200, json={"status": "success"}))
+
+    returned = await _return(app, settings)
+    reopened = await _get(app, f"/pay/bancard_vpos/acme/{_token(settings)}")
+
+    assert "still confirming" in returned.text
+    assert confirmations.call_count == 1
+    assert '"pid-abc"' in first.text and '"pid-abc"' in reopened.text
+    assert buy.call_count == 1 and rollback.call_count == 0
+    assert await _stored_status(app, tenant) == "pending"
+
+
 @respx.mock
 async def test_declined_return_offers_a_retry_and_the_same_link_mints_a_new_attempt(vpos_app):
     app, settings, make_tenant = vpos_app

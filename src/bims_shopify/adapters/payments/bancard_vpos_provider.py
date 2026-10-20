@@ -410,12 +410,22 @@ class BancardVposProvider:
         return PaymentStatus.CONFIRMED
 
     def _error_status(self, tenant: Tenant, spid: int, data: dict[str, Any]) -> PaymentStatus:
+        """Classify a non-success get_confirmation answer.
+
+        PaymentNotFoundError / BuyNotFoundError are NOT declines. Bancard documents
+        PaymentNotFoundError as "no payment order exists for this process: the customer did
+        not pay this order", and says it must be taken as a correct answer for those cases.
+        For a confirmation query that means the buyer has not paid YET, so it is PENDING.
+        A real decline only ever arrives as a confirmation with a declined response_code.
+        Mapping these keys to FAILED would tell an in-flight buyer they were declined and
+        let the next page open roll back a live operation.
+        """
         key, _, _ = self._first_message(data)
         if key in CONFIGURATION_KEYS:
             raise VposConfigurationError(f"vPOS rejected the credentials: {key}")
         if key in NOT_FOUND_KEYS:
             logger.info("vpos_payment_not_found", tenant=tenant.slug, shop_process_id=spid, key=key)
-            return PaymentStatus.FAILED
+            return PaymentStatus.PENDING
         logger.warning("vpos_get_confirmation_error", tenant=tenant.slug, shop_process_id=spid, key=key)
         return PaymentStatus.PENDING
 
