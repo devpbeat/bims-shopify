@@ -540,7 +540,7 @@ async def test_return_before_the_buyer_has_paid_says_still_confirming_not_declin
 async def test_reopening_an_unpaid_attempt_with_an_unchanged_total_does_not_mint_again(vpos_app):
     app, settings, make_tenant = vpos_app
     tenant = await make_tenant()
-    shopify, buy = _mock()
+    _, buy = _mock()
     first = await _get(app, f"/pay/bancard_vpos/acme/{_token(settings)}")
     confirmations = respx.post(CONFIRMATIONS).mock(
         return_value=httpx.Response(
