@@ -154,7 +154,7 @@ async def test_legacy_bancard_tenant_gets_no_link(bridge_app):
 
 
 @respx.mock
-@pytest.mark.parametrize("order_id", ["gid-not-numeric", 12345678901234])
+@pytest.mark.parametrize("order_id", ["gid-not-numeric", "12 34", "-5"])
 async def test_vpos_unusable_order_id_makes_no_bancard_call_and_still_succeeds(bridge_app, order_id):
     app, _, make_tenant = bridge_app
     await make_tenant()
@@ -164,6 +164,24 @@ async def test_vpos_unusable_order_id_makes_no_bancard_call_and_still_succeeds(b
 
     assert resp.status_code == 200 and not route.called
     assert await _intent_count(app) == 0
+
+
+@respx.mock
+@pytest.mark.parametrize("order_id", [18943384158340, 189433841583401])
+async def test_vpos_long_real_shopify_order_ids_get_a_link(bridge_app, order_id):
+    """Regression: 14-digit Shopify ids used to be refused, so no link was ever created."""
+    app, _, make_tenant = bridge_app
+    tenant = await make_tenant()
+    route = respx.post(SINGLE_BUY).mock(return_value=httpx.Response(200, json={}))
+
+    resp = await _post_order(app, _payload(order_id=order_id))
+
+    assert resp.status_code == 200 and not route.called
+    async with app.state.session_factory() as session:
+        intent = await SqlAlchemyPaymentIntentRepository(session).get_by_order_id(
+            tenant.id, "bancard_vpos", str(order_id)
+        )
+    assert intent is not None and intent.status == "pending" and intent.checkout_url
 
 
 @respx.mock

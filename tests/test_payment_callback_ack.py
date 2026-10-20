@@ -6,7 +6,7 @@ import pytest
 import respx
 from httpx import ASGITransport, AsyncClient
 
-from bims_shopify.domain.bancard_vpos import VposAmount, build_shop_process_id, confirm_token
+from bims_shopify.domain.bancard_vpos import VposAmount, confirm_token
 from tests.conftest import VPOS_PRIVATE_KEY
 
 STAGING = "https://vpos.infonet.com.py:8888"
@@ -15,8 +15,28 @@ SHOPIFY = "https://acme.myshopify.com/admin/api/2025-07/graphql.json/"
 ACK = {"status": "success"}
 
 
-def _callback(order_id: str = "1001", amount: str = "130.00", *, token: str | None = None) -> dict:
-    spid = build_shop_process_id(order_id, 0)
+SPID = 424200
+
+
+async def _seed_intent(app, order_id: str = "18943384158340") -> None:
+    """Persist the row a minted operation leaves behind: the callback resolves it by reference."""
+    from bims_shopify.adapters.persistence.payment_intent_repository import (
+        SqlAlchemyPaymentIntentRepository,
+    )
+    from bims_shopify.domain.payment import PaymentIntent
+
+    async with app.state.session_factory() as session:
+        await SqlAlchemyPaymentIntentRepository(session).save(
+            1,
+            "bancard_vpos",
+            PaymentIntent(
+                tenant_slug="acme", order_id=order_id, amount=130.0, currency="PYG",
+                provider_reference=str(SPID), process_id="pid-1",
+            ),
+        )
+
+
+def _callback(spid: int = SPID, amount: str = "130.00", *, token: str | None = None) -> dict:
     good = confirm_token(VPOS_PRIVATE_KEY, spid, VposAmount.from_order_total(amount))
     return {
         "operation": {
@@ -55,6 +75,10 @@ def _shopify_ok() -> httpx.Response:
     )
 
 
+def _operation_count(route, operation: str) -> int:
+    return sum(1 for call in route.calls if operation in call.request.content.decode())
+
+
 async def _post(app, provider: str, **kwargs) -> httpx.Response:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         return await client.post(f"/payments/{provider}/acme/callback", **kwargs)
@@ -64,6 +88,7 @@ async def _post(app, provider: str, **kwargs) -> httpx.Response:
 async def test_verified_callback_is_acked_and_paid_once_even_on_replay(vpos_app):
     app, _, make_tenant = vpos_app
     await make_tenant()
+    await _seed_intent(app)
     respx.post(CONFIRMATIONS).mock(return_value=_confirmation())
     shopify = respx.post(SHOPIFY).mock(return_value=_shopify_ok())
 
@@ -72,7 +97,10 @@ async def test_verified_callback_is_acked_and_paid_once_even_on_replay(vpos_app)
 
     assert first.status_code == replay.status_code == 200
     assert first.json() == replay.json() == ACK
-    assert shopify.call_count == 1
+    # Count by operation: the callback also writes reconciliation metafields, so the
+    # route's raw call count is not the "paid once" signal. The mutation count is.
+    assert _operation_count(shopify, "orderMarkAsPaid") == 1
+    assert _operation_count(shopify, "metafieldsSet") == 1
 
 
 @respx.mock

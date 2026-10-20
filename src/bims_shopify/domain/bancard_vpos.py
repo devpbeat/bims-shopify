@@ -6,7 +6,8 @@ No I/O lives here. The module owns the three things that must never drift:
   the same instance, so two divergent strings cannot exist;
 * the md5 token concatenations, which take a ``VposAmount`` and never a raw
   number or string;
-* the ``shop_process_id`` derivation from a Shopify order id.
+* the ``shop_process_id`` derivation from the ``payment_intents`` row id;
+* the order metafields written back after a confirmed payment.
 """
 from __future__ import annotations
 
@@ -15,8 +16,11 @@ import hmac
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from enum import Enum
+
+from bims_shopify.domain.payment import OrderMetafield
 
 CURRENCY = "PYG"
 MAX_INTEGER_DIGITS = 13
@@ -164,28 +168,43 @@ def rollback_token(private_key: str, shop_process_id: int) -> str:
     return _md5(private_key + _require_spid(shop_process_id) + "rollback" + "0.00")
 
 
-def build_shop_process_id(order_id: object, attempt: object) -> int:
-    """``order_id * 100 + attempt``; reversible with ``// 100``."""
-    if isinstance(attempt, bool) or not isinstance(attempt, int):
-        raise VposInvalidIdError("attempt must be an integer")
-    if not 0 <= attempt <= MAX_ATTEMPT:
-        raise VposInvalidIdError("attempt must be between 0 and 99")
+def require_plain_order_id(order_id: object) -> str:
+    """A Shopify order id is a plain digit string. Its size is irrelevant to vPOS.
+
+    The order id is never encoded into ``shop_process_id``, so there is no length
+    limit here; only malformed ids (gids, signs, blanks) are refused.
+    """
     if isinstance(order_id, bool) or not isinstance(order_id, (int, str)):
         raise VposInvalidIdError("order id must be numeric")
     text = str(order_id)
     if not text.isascii() or not text.isdigit():
         raise VposInvalidIdError("order id must be a plain numeric id")
-    if len(text) > MAX_INTEGER_DIGITS:
-        raise VposInvalidIdError("order id has more than 13 digits")
+    return text
+
+
+def build_shop_process_id(row_id: object, attempt: object) -> int:
+    """``payment_intents row id * 100 + attempt``.
+
+    The row id comes from a database sequence, so the result stays far below the
+    15 digits ``shop_process_id`` allows no matter how large Shopify order ids get.
+    Callers resolve the order back through the stored ``provider_reference``,
+    never by arithmetic on this value.
+    """
+    if isinstance(attempt, bool) or not isinstance(attempt, int):
+        raise VposInvalidIdError("attempt must be an integer")
+    if not 0 <= attempt <= MAX_ATTEMPT:
+        raise VposInvalidIdError("attempt must be between 0 and 99")
+    if isinstance(row_id, bool) or not isinstance(row_id, (int, str)):
+        raise VposInvalidIdError("row id must be numeric")
+    text = str(row_id)
+    if not text.isascii() or not text.isdigit() or int(text) == 0:
+        raise VposInvalidIdError("row id must be a positive plain numeric id")
+    if len(text.lstrip("0")) > MAX_INTEGER_DIGITS:
+        raise VposInvalidIdError("row id has more than 13 digits")
     spid = int(text) * 100 + attempt
     if spid == PROBE_SHOP_PROCESS_ID:
         raise VposInvalidIdError("shop_process_id collides with the reserved probe id")
     return spid
-
-
-def order_id_from_shop_process_id(shop_process_id: int) -> str:
-    _require_spid(shop_process_id)
-    return str(shop_process_id // 100)
 
 
 def vpos_description(name: str) -> str:
@@ -324,3 +343,65 @@ def classify_rollback_key(key: object) -> RollbackOutcome:
     if key == "TransactionAlreadyConfirmed":
         return RollbackOutcome.OPERATOR_ACTION
     return RollbackOutcome.OTHER
+
+
+# --- Reconciliation metafields -------------------------------------------------
+
+METAFIELD_NAMESPACE = "bims_bancard"
+_METAFIELD_TEXT_MAX = 255
+EXTRA_RESPONSE_ATTRIBUTES = (
+    "payment_card_type",
+    "payment_card_brand",
+    "payment_masked_card_number",
+    "payment_origin",
+)
+_CARD_ATTRIBUTES = ("payment_masked_card_number", "payment_card_brand", "payment_card_type")
+
+
+def _metafield_text(raw: object) -> str | None:
+    """One bounded line of text, or None when there is nothing worth writing."""
+    if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+        return None
+    text = " ".join(str(raw).split())[:_METAFIELD_TEXT_MAX]
+    return text or None
+
+
+def confirmation_metafields(
+    shop_process_id: int, confirmation: Mapping[str, object], confirmed_at: datetime
+) -> list[OrderMetafield]:
+    """Order metafields for an APPROVED ``get_confirmation`` answer.
+
+    Built only from the out-of-band confirmation, never from the callback body.
+    Optional values are written only when Bancard sent them. Nothing here is
+    secret: the masked card number is already masked by Bancard, and no token
+    or key is ever copied.
+    """
+
+    def make(key: str, type_: str, value: str) -> OrderMetafield:
+        return OrderMetafield(namespace=METAFIELD_NAMESPACE, key=key, type=type_, value=value)
+
+    text_type = "single_line_text_field"
+    result = [make("shop_process_id", "number_integer", str(shop_process_id))]
+    try:
+        ticket = _coerce_int(confirmation.get("ticket_number"), "ticket_number")
+    except VposCallbackShapeError:
+        ticket = None
+    if ticket is not None:
+        result.append(make("ticket_number", "number_integer", str(ticket)))
+    for key in ("response_code", "authorization_number"):
+        value = _metafield_text(confirmation.get(key))
+        if value is not None:
+            result.append(make(key, text_type, value))
+    extras = confirmation.get("extra_attributes")
+    for key in _CARD_ATTRIBUTES:
+        raw = extras.get(key) if isinstance(extras, Mapping) else None
+        value = _metafield_text(raw if raw is not None else confirmation.get(key))
+        if value is not None:
+            result.append(make(key, text_type, value))
+    security = confirmation.get("security_information")
+    source = _metafield_text(security.get("card_source")) if isinstance(security, Mapping) else None
+    if source is not None:
+        result.append(make("card_source", text_type, source))
+    stamp = confirmed_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    result.append(make("confirmed_at", "date_time", stamp))
+    return result

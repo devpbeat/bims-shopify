@@ -43,7 +43,7 @@ class AttemptAwarePaymentProviderPort(PaymentProviderPort, Protocol):
     supports_attempts: bool
 
     async def create_checkout(  # type: ignore[override]
-        self, tenant: Tenant, order_id: str, amount: float, currency: str, *, attempt: int = 0
+        self, tenant: Tenant, order_id: str, amount: float, currency: str, *, row_id: int, attempt: int = 0
     ) -> PaymentIntent: ...
 
     async def abandon_attempt(self, tenant: Tenant, intent: PaymentIntent) -> None:

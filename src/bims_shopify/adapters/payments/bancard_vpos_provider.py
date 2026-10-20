@@ -8,7 +8,7 @@ taken from the callback body: it comes only from the out-of-band
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
 
@@ -27,6 +27,7 @@ from bims_shopify.domain.bancard_vpos import (
     classify_response_code,
     get_confirmation_token,
     CURRENCY,
+    EXTRA_RESPONSE_ATTRIBUTES,
     PROBE_SHOP_PROCESS_ID,
     VposAmount,
     VposApiError,
@@ -34,8 +35,9 @@ from bims_shopify.domain.bancard_vpos import (
     VposConfigurationError,
     VposError,
     build_shop_process_id,
-    order_id_from_shop_process_id,
+    confirmation_metafields,
     parse_confirm_operation,
+    require_plain_order_id,
     single_buy_token,
     verify_confirm_token,
     vpos_base_url,
@@ -46,6 +48,10 @@ from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 SINGLE_BUY_PATH = "/vpos/api/0.3/single_buy"
 CONFIRMATIONS_PATH = "/vpos/api/0.3/single_buy/confirmations"
@@ -170,7 +176,7 @@ class BancardVposProvider:
         a later mint needs so a misconfigured tenant fails here, as before.
         """
         self._credentials(tenant)
-        build_shop_process_id(order_id, 0)
+        require_plain_order_id(order_id)
         return PaymentIntent(
             tenant_slug=tenant.slug,
             order_id=str(order_id),
@@ -186,12 +192,18 @@ class BancardVposProvider:
         amount: float,
         currency: str,
         *,
+        row_id: int,
         attempt: int = 0,
     ) -> PaymentIntent:
+        """Mint the operation. ``row_id`` is the persisted ``payment_intents`` id of the order.
+
+        ``shop_process_id`` is derived from it, never from the Shopify order id, so it
+        stays small however large Shopify order ids grow.
+        """
         public_key, private_key = self._credentials(tenant)
         base_url = self._base_url(tenant)
         secret = self._link_secret()
-        spid = build_shop_process_id(order_id, attempt)
+        spid = build_shop_process_id(row_id, attempt)
         vpos_amount = VposAmount.from_order_total(amount)
         slug = tenant.slug
         public_base = self._settings.public_base_url.rstrip("/")
@@ -344,7 +356,8 @@ class BancardVposProvider:
             raise VposCallbackTokenError("confirm callback token does not match")
         return PaymentIntent(
             tenant_slug=tenant.slug,
-            order_id=order_id_from_shop_process_id(callback.shop_process_id),
+            # The callback never names the order; the use case resolves it by provider_reference.
+            order_id="",
             amount=float(callback.amount.value),
             currency=callback.currency,
             provider_reference=str(callback.shop_process_id),
@@ -371,6 +384,8 @@ class BancardVposProvider:
                 "token": get_confirmation_token(private_key, spid),
                 "shop_process_id": spid,
             },
+            # Ask for the card details so the merchant can reconcile from the Shopify admin.
+            "extra_response_attributes": list(EXTRA_RESPONSE_ATTRIBUTES),
         }
         try:
             response = await self._post(f"{base_url}{CONFIRMATIONS_PATH}", body)
@@ -407,6 +422,7 @@ class BancardVposProvider:
         if not await self._matches_intent(tenant, spid, intent, confirmation):
             return PaymentStatus.FAILED
         logger.info("vpos_payment_confirmed", tenant=tenant.slug, shop_process_id=spid)
+        intent.order_metafields = confirmation_metafields(spid, confirmation, _utcnow())
         return PaymentStatus.CONFIRMED
 
     def _error_status(self, tenant: Tenant, spid: int, data: dict[str, Any]) -> PaymentStatus:

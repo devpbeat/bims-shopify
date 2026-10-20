@@ -11,13 +11,28 @@ ORDER = "1001"
 
 
 class FakeIntents:
+    """Hands out sequential row ids the way the real table does."""
+
     def __init__(self) -> None:
         self.rows: dict[str, PaymentIntent] = {}
+        self._next = 1
+
+    def _assign(self, intent: PaymentIntent) -> None:
+        if intent.row_id is None:
+            intent.row_id = self._next
+            self._next += 1
 
     async def get_by_order_id(self, tenant_id, provider, order_id):
-        return self.rows.get(order_id)
+        row = self.rows.get(order_id)
+        if row is not None:
+            self._assign(row)
+        return row
 
     async def save(self, tenant_id, provider, intent):
+        previous = self.rows.get(intent.order_id)
+        if previous is not None and intent.row_id is None:
+            intent.row_id = previous.row_id
+        self._assign(intent)
         self.rows[intent.order_id] = intent
 
 
@@ -38,7 +53,13 @@ class AttemptProvider:
         self.abandoned: list[str] = []
         self._abandon_error = abandon_error
 
-    async def create_checkout(self, tenant, order_id, amount, currency, *, attempt=0):
+    def prepare_link(self, tenant, order_id, amount, currency):
+        return PaymentIntent(
+            tenant_slug=tenant.slug, order_id=order_id, amount=amount, currency=currency,
+            checkout_url="https://x/link",
+        )
+
+    async def create_checkout(self, tenant, order_id, amount, currency, *, row_id, attempt=0):
         self.created.append(attempt)
         return PaymentIntent(
             tenant_slug=tenant.slug,
@@ -46,7 +67,7 @@ class AttemptProvider:
             amount=amount,
             currency=currency,
             checkout_url=f"https://x/pay/{attempt}",
-            provider_reference=str(int(order_id) * 100 + attempt),
+            provider_reference=str(row_id * 100 + attempt),
             process_id=f"pid-{attempt}",
         )
 
@@ -91,10 +112,10 @@ async def test_changed_amount_abandons_the_old_attempt_and_mints_the_next(tenant
     await use_case.run(tenant, ORDER, 100.0, "PYG")
     result = await use_case.run(tenant, ORDER, 120.0, "PYG")
     assert provider.created == [0, 1]
-    assert provider.abandoned == ["100100"]
+    assert provider.abandoned == ["100"]
     assert result.amount == 120.0
     assert result.process_id == "pid-1"
-    assert intents.rows[ORDER].provider_reference == "100101"
+    assert intents.rows[ORDER].provider_reference == "101"
     assert [e["action"] for e in audit.entries] == ["payment.retry_minted"]
 
 
@@ -125,12 +146,12 @@ async def test_legacy_pending_without_process_id_is_replaced(tenant):
     use_case, intents = _make(provider)
     intents.rows[ORDER] = PaymentIntent(
         tenant_slug="acme", order_id=ORDER, amount=100.0, currency="PYG",
-        checkout_url="https://x/old", provider_reference="100100",
+        checkout_url="https://x/old", provider_reference="100",
     )
     result = await use_case.run(tenant, ORDER, 100.0, "PYG")
     assert provider.created == [1]
-    assert provider.abandoned == ["100100"]
-    assert result.provider_reference == "100101"
+    assert provider.abandoned == ["100"]
+    assert result.provider_reference == "101"
 
 
 async def test_changed_amount_with_no_attempts_left_raises(tenant):
@@ -138,7 +159,7 @@ async def test_changed_amount_with_no_attempts_left_raises(tenant):
     use_case, intents = _make(provider)
     intents.rows[ORDER] = PaymentIntent(
         tenant_slug="acme", order_id=ORDER, amount=100.0, currency="PYG",
-        checkout_url="u", provider_reference="100199", process_id="p",
+        checkout_url="u", provider_reference="199", process_id="p",
     )
     with pytest.raises(VposAttemptsExhaustedError):
         await use_case.run(tenant, ORDER, 120.0, "PYG")
@@ -164,9 +185,9 @@ async def test_failed_or_cancelled_mints_next_attempt(tenant, status):
     intents.rows[ORDER].status = status
     result = await use_case.run(tenant, ORDER, 100.0, "PYG")
     assert provider.created == [0, 1]
-    assert provider.abandoned == ["100100"]
-    assert result.provider_reference == "100101"
-    assert intents.rows[ORDER].provider_reference == "100101"
+    assert provider.abandoned == ["100"]
+    assert result.provider_reference == "101"
+    assert intents.rows[ORDER].provider_reference == "101"
     assert intents.rows[ORDER].status == "pending"
     assert [e["action"] for e in audit.entries] == ["payment.retry_minted"]
     assert audit.entries[0]["payload"]["attempt"] == 1
@@ -178,7 +199,7 @@ async def test_abandon_failure_does_not_block_retry(tenant):
     await use_case.run(tenant, ORDER, 100.0, "PYG")
     intents.rows[ORDER].status = "failed"
     result = await use_case.run(tenant, ORDER, 100.0, "PYG")
-    assert result.provider_reference == "100101"
+    assert result.provider_reference == "101"
 
 
 async def test_pending_without_checkout_url_retries_same_attempt(tenant):
@@ -186,12 +207,12 @@ async def test_pending_without_checkout_url_retries_same_attempt(tenant):
     use_case, intents = _make(provider)
     intents.rows[ORDER] = PaymentIntent(
         tenant_slug="acme", order_id=ORDER, amount=1.0, currency="PYG",
-        checkout_url=None, provider_reference="100102",
+        checkout_url=None, provider_reference="102",
     )
     result = await use_case.run(tenant, ORDER, 100.0, "PYG")
     assert provider.created == [2]
     assert provider.abandoned == []
-    assert result.provider_reference == "100102"
+    assert result.provider_reference == "102"
 
 
 async def test_attempts_exhausted(tenant):
@@ -199,7 +220,7 @@ async def test_attempts_exhausted(tenant):
     use_case, intents = _make(provider)
     intents.rows[ORDER] = PaymentIntent(
         tenant_slug="acme", order_id=ORDER, amount=1.0, currency="PYG",
-        checkout_url="u", provider_reference="100199", status="failed",
+        checkout_url="u", provider_reference="199", status="failed",
     )
     with pytest.raises(VposAttemptsExhaustedError):
         await use_case.run(tenant, ORDER, 100.0, "PYG")
