@@ -52,9 +52,9 @@ def _db_url() -> tuple[str, str]:
 def test_upgrade_adds_the_column_and_downgrade_drops_it():
     url, path = _db_url()
     try:
-        _run(url, command.upgrade, "head")
+        _run(url, command.upgrade, "0025_bancard_vpos_private_key")
         assert COLUMN in _columns(url)
-        _run(url, command.downgrade, "-1")
+        _run(url, command.downgrade, "0024_continuous_pull_settings")
         assert COLUMN not in _columns(url)
     finally:
         os.unlink(path)
@@ -69,7 +69,7 @@ def test_revision_chain():
 def test_upgrade_is_idempotent_when_the_column_exists():
     url, path = _db_url()
     try:
-        _run(url, command.upgrade, "head")
+        _run(url, command.upgrade, "0025_bancard_vpos_private_key")
         module = _load_migration()
         engine = sa.create_engine(url)
         try:

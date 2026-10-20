@@ -16,7 +16,6 @@ import httpx
 
 from bims_shopify.checkout_link import (
     derive_link_secret,
-    sign_checkout_token,
     sign_navigation_token,
 )
 from bims_shopify.config import Settings
@@ -53,6 +52,7 @@ CONFIRMATIONS_PATH = "/vpos/api/0.3/single_buy/confirmations"
 ROLLBACK_PATH = "/vpos/api/0.3/single_buy/rollback"
 NOT_FOUND_KEYS = frozenset({"BuyNotFoundError", "PaymentNotFoundError"})
 LINK_TTL = timedelta(hours=24)
+PAY_LINK_TTL = timedelta(days=7)
 REQUEST_TIMEOUT_SECONDS = 20.0
 
 # Message keys that mean the tenant's credentials or application are wrong.
@@ -91,6 +91,7 @@ class BancardVposProvider:
 
     name = "bancard_vpos"
     supports_attempts = True
+    defers_checkout = True
     always_ack_callback = True
 
     def __init__(
@@ -154,6 +155,30 @@ class BancardVposProvider:
         """vPOS expects this exact body for every confirm call (PDF p.45/p.51)."""
         return {"status": "success"}
 
+    def pay_link(self, tenant: Tenant, order_id: str) -> str:
+        """The buyer-facing URL: it carries the signed order id, never a process_id."""
+        token = sign_navigation_token(self._link_secret(), tenant.slug, str(order_id), ttl=PAY_LINK_TTL)
+        return f"{self._settings.public_base_url.rstrip('/')}/pay/bancard_vpos/{tenant.slug}/{token}"
+
+    def prepare_link(
+        self, tenant: Tenant, order_id: str, amount: float, currency: str
+    ) -> PaymentIntent:
+        """The dynamic link for an order, without calling Bancard.
+
+        No operation exists until the buyer opens the page, so the amount is
+        only a hint; the page charges the live Shopify total. Validates what
+        a later mint needs so a misconfigured tenant fails here, as before.
+        """
+        self._credentials(tenant)
+        build_shop_process_id(order_id, 0)
+        return PaymentIntent(
+            tenant_slug=tenant.slug,
+            order_id=str(order_id),
+            amount=amount,
+            currency=currency,
+            checkout_url=self.pay_link(tenant, order_id),
+        )
+
     async def create_checkout(
         self,
         tenant: Tenant,
@@ -194,17 +219,15 @@ class BancardVposProvider:
         process_id = data.get("process_id")
         if not process_id:
             raise VposApiError("MissingProcessId", "error", "single_buy returned no process_id")
-        checkout_token = sign_checkout_token(
-            secret, slug, str(order_id), str(process_id), ttl=LINK_TTL
-        )
         logger.info("vpos_single_buy_created", tenant=slug, order_id=order_id, shop_process_id=spid)
         return PaymentIntent(
             tenant_slug=slug,
             order_id=str(order_id),
             amount=float(vpos_amount.value),
             currency=currency,
-            checkout_url=f"{public_base}/pay/bancard_vpos/{slug}/{checkout_token}",
+            checkout_url=self.pay_link(tenant, order_id),
             provider_reference=str(spid),
+            process_id=str(process_id),
         )
 
     async def check_credentials(self, tenant: Tenant) -> CredentialCheck:
@@ -387,12 +410,22 @@ class BancardVposProvider:
         return PaymentStatus.CONFIRMED
 
     def _error_status(self, tenant: Tenant, spid: int, data: dict[str, Any]) -> PaymentStatus:
+        """Classify a non-success get_confirmation answer.
+
+        PaymentNotFoundError / BuyNotFoundError are NOT declines. Bancard documents
+        PaymentNotFoundError as "no payment order exists for this process: the customer did
+        not pay this order", and says it must be taken as a correct answer for those cases.
+        For a confirmation query that means the buyer has not paid YET, so it is PENDING.
+        A real decline only ever arrives as a confirmation with a declined response_code.
+        Mapping these keys to FAILED would tell an in-flight buyer they were declined and
+        let the next page open roll back a live operation.
+        """
         key, _, _ = self._first_message(data)
         if key in CONFIGURATION_KEYS:
             raise VposConfigurationError(f"vPOS rejected the credentials: {key}")
         if key in NOT_FOUND_KEYS:
             logger.info("vpos_payment_not_found", tenant=tenant.slug, shop_process_id=spid, key=key)
-            return PaymentStatus.FAILED
+            return PaymentStatus.PENDING
         logger.warning("vpos_get_confirmation_error", tenant=tenant.slug, shop_process_id=spid, key=key)
         return PaymentStatus.PENDING
 

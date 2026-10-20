@@ -22,3 +22,4 @@ class PaymentIntent:
     checkout_url: str | None = None
     provider_reference: str | None = None
     status: str = "pending"
+    process_id: str | None = None

@@ -214,6 +214,7 @@ query GetOrder($id: ID!) {
     id
     name
     displayFinancialStatus
+    statusPageUrl
     totalPriceSet { shopMoney { amount currencyCode } }
     lineItems(first: 100) {
       nodes { sku quantity variant { id price } }

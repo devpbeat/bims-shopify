@@ -27,6 +27,7 @@ def _to_domain(model: PaymentIntentModel) -> PaymentIntent:
         checkout_url=model.checkout_url,
         provider_reference=model.provider_reference,
         status=model.status,
+        process_id=model.process_id,
     )
 
 
@@ -78,6 +79,7 @@ class SqlAlchemyPaymentIntentRepository:
         model.status = intent.status
         model.checkout_url = intent.checkout_url
         model.provider_reference = intent.provider_reference
+        model.process_id = intent.process_id
         await self._session.commit()
 
     async def update_status(

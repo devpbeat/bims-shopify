@@ -215,6 +215,7 @@ class PaymentIntentModel(Base):
     status: Mapped[str] = mapped_column(String(40), default="pending")
     checkout_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     provider_reference: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
+    process_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now_utc, onupdate=_now_utc
