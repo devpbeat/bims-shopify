@@ -21,6 +21,7 @@ from bims_shopify.adapters.persistence.tenant_repository import (
 )
 from bims_shopify.api import (
     audit,
+    checkout_extension,
     health,
     ops,
     pay,
@@ -227,6 +228,7 @@ def create_app() -> FastAPI:
     app.include_router(portal_payments.router)
     app.include_router(audit.router)
     app.include_router(ops.router)
+    app.include_router(checkout_extension.router)
     _mount_portal_spa(app)
     return app
 
