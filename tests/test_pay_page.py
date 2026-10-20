@@ -29,6 +29,8 @@ TTL = timedelta(hours=1)
 SHOPIFY = "https://acme.myshopify.com/admin/api/2025-07/graphql.json/"
 SINGLE_BUY = f"{STAGING}/vpos/api/0.3/single_buy"
 ROLLBACK = f"{STAGING}/vpos/api/0.3/single_buy/rollback"
+CONFIRMATIONS = f"{STAGING}/vpos/api/0.3/single_buy/confirmations"
+STATUS_URL = "https://acme.myshopify.com/1/orders/abc/authenticate?key=k"
 
 
 def _token(settings, *, slug="acme", order="1001", ttl=TTL):
@@ -347,8 +349,8 @@ async def test_locally_paid_intent_shows_already_paid_without_any_call(vpos_app)
     assert not respx.calls
 
 
-@pytest.mark.parametrize("outcome,text", [("return", "confirming"), ("cancel", "cancelled")])
-async def test_return_and_cancel_pages_change_nothing(vpos_app, outcome, text):
+@pytest.mark.parametrize("outcome,text", [("cancel", "cancelled")])
+async def test_cancel_page_changes_nothing(vpos_app, outcome, text):
     app, settings, make_tenant = vpos_app
     tenant = await make_tenant()
     nav = sign_navigation_token(derive_link_secret(settings), "acme", "1001", ttl=TTL)
@@ -380,3 +382,194 @@ async def test_return_page_rejects_a_forged_token(vpos_app):
     resp = await _get(app, "/pay/bancard_vpos/acme/return/forged.token")
 
     assert resp.status_code == 403
+
+
+async def _seed_attempt(app, tenant, *, status="pending"):
+    async with app.state.session_factory() as session:
+        await SqlAlchemyPaymentIntentRepository(session).save(
+            tenant.id,
+            "bancard_vpos",
+            PaymentIntent(tenant_slug="acme", order_id="1001", amount=130.0, currency="PYG",
+                          provider_reference="100100", process_id="pid-abc", status=status,
+                          checkout_url="https://pay.example.com/x"),
+        )
+
+
+def _confirmation(code="00", amount="130.00") -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={"status": "success",
+              "confirmation": {"response_code": code, "amount": amount, "currency": "PYG"}},
+    )
+
+
+def _order_with_status(url=STATUS_URL) -> httpx.Response:
+    order = {
+        "id": "gid://shopify/Order/1001",
+        "displayFinancialStatus": "PENDING",
+        "statusPageUrl": url,
+        "totalPriceSet": {"shopMoney": {"amount": "130.00", "currencyCode": "PYG"}},
+    }
+    return httpx.Response(200, json={"data": {"order": order}})
+
+
+async def _return(app, settings, query=""):
+    nav = _token(settings)
+    return await _get(app, f"/pay/bancard_vpos/acme/return/{nav}{query}")
+
+
+async def _stored_status(app, tenant) -> str:
+    async with app.state.session_factory() as session:
+        stored = await SqlAlchemyPaymentIntentRepository(session).get_by_order_id(
+            tenant.id, "bancard_vpos", "1001"
+        )
+    return stored.status
+
+
+@respx.mock
+async def test_return_verifies_with_bancard_then_redirects_to_the_order_status_page(vpos_app):
+    app, settings, make_tenant = vpos_app
+    tenant = await make_tenant()
+    await _seed_attempt(app, tenant)
+    confirmations = respx.post(CONFIRMATIONS).mock(return_value=_confirmation())
+    shopify = respx.post(SHOPIFY).mock(return_value=_order_with_status())
+
+    resp = await _return(app, settings)
+
+    assert (resp.status_code, resp.headers["location"]) == (303, STATUS_URL)
+    assert confirmations.call_count == 1 and shopify.call_count == 1
+    assert "statusPageUrl" in json.loads(shopify.calls[0].request.content)["query"]
+    assert await _stored_status(app, tenant) == "pending"
+
+
+@respx.mock
+async def test_return_without_a_status_url_shows_an_in_app_confirmation(vpos_app):
+    app, settings, make_tenant = vpos_app
+    tenant = await make_tenant()
+    await _seed_attempt(app, tenant)
+    respx.post(CONFIRMATIONS).mock(return_value=_confirmation())
+    respx.post(SHOPIFY).mock(return_value=_order_with_status(url=None))
+
+    resp = await _return(app, settings)
+
+    assert resp.status_code == 200 and "Payment received" in resp.text
+
+
+@respx.mock
+async def test_return_never_redirects_to_a_non_https_status_url(vpos_app):
+    app, settings, make_tenant = vpos_app
+    tenant = await make_tenant()
+    await _seed_attempt(app, tenant)
+    respx.post(CONFIRMATIONS).mock(return_value=_confirmation())
+    respx.post(SHOPIFY).mock(return_value=_order_with_status(url="javascript:alert(1)"))
+
+    resp = await _return(app, settings)
+
+    assert resp.status_code == 200 and "location" not in resp.headers
+
+
+@respx.mock
+async def test_return_trusts_bancard_not_the_browser(vpos_app):
+    app, settings, make_tenant = vpos_app
+    tenant = await make_tenant()
+    await _seed_attempt(app, tenant)
+    respx.post(CONFIRMATIONS).mock(
+        return_value=httpx.Response(
+            200, json={"status": "error", "messages": [{"key": "SomethingElse", "level": "error"}]}
+        )
+    )
+
+    resp = await _return(app, settings, "?status=success&response_code=00")
+
+    assert resp.status_code == 200 and "still confirming" in resp.text
+    assert "location" not in resp.headers
+
+
+@respx.mock
+async def test_return_while_bancard_is_unreachable_says_still_confirming(vpos_app):
+    app, settings, make_tenant = vpos_app
+    tenant = await make_tenant()
+    await _seed_attempt(app, tenant)
+    respx.post(CONFIRMATIONS).mock(side_effect=httpx.ConnectError("down"))
+
+    resp = await _return(app, settings)
+
+    assert resp.status_code == 200 and "still confirming" in resp.text
+    assert await _stored_status(app, tenant) == "pending"
+
+
+@respx.mock
+async def test_return_with_rejected_credentials_says_still_confirming_and_audits(vpos_app):
+    app, settings, make_tenant = vpos_app
+    tenant = await make_tenant()
+    await _seed_attempt(app, tenant)
+    respx.post(CONFIRMATIONS).mock(
+        return_value=httpx.Response(
+            200, json={"status": "error", "messages": [{"key": "InvalidTokenError", "level": "error"}]}
+        )
+    )
+
+    resp = await _return(app, settings)
+
+    assert resp.status_code == 200 and "still confirming" in resp.text
+    assert "InvalidTokenError" not in resp.text
+    assert await _stored_status(app, tenant) == "pending"
+    assert await _audit_actions(app) == ["payment.page_error"]
+
+
+@respx.mock
+async def test_declined_return_offers_a_retry_and_the_same_link_mints_a_new_attempt(vpos_app):
+    app, settings, make_tenant = vpos_app
+    tenant = await make_tenant()
+    await _seed_attempt(app, tenant)
+    respx.post(CONFIRMATIONS).mock(return_value=_confirmation("05"))
+    respx.post(ROLLBACK).mock(return_value=httpx.Response(200, json={"status": "success"}))
+    respx.post(SHOPIFY).mock(return_value=_order())
+    buy = _buy("pid-retry")
+
+    declined = await _return(app, settings)
+
+    nav = _token(settings)
+    assert declined.status_code == 200 and "declined" in declined.text
+    assert f'href="/pay/bancard_vpos/acme/{nav}"' in declined.text
+    assert await _stored_status(app, tenant) == "failed"
+
+    retry = await _get(app, f"/pay/bancard_vpos/acme/{nav}")
+
+    assert '"pid-retry"' in retry.text
+    assert json.loads(buy.calls[0].request.content)["operation"]["shop_process_id"] == 100101
+
+
+@respx.mock
+async def test_return_for_an_already_paid_intent_redirects_without_asking_bancard(vpos_app):
+    app, settings, make_tenant = vpos_app
+    tenant = await make_tenant()
+    await _seed_attempt(app, tenant, status="paid")
+    shopify = respx.post(SHOPIFY).mock(return_value=_order_with_status())
+
+    resp = await _return(app, settings)
+
+    assert resp.status_code == 303 and shopify.call_count == 1
+
+
+@respx.mock
+async def test_return_before_any_attempt_exists_says_still_confirming(vpos_app):
+    app, settings, make_tenant = vpos_app
+    await make_tenant()
+
+    resp = await _return(app, settings)
+
+    assert resp.status_code == 200 and "still confirming" in resp.text
+    assert not respx.calls
+
+
+@pytest.mark.parametrize("flavour,status", [("expired", 410), ("tampered", 403)])
+@respx.mock
+async def test_return_rejects_bad_tokens_without_any_outbound_call(vpos_app, flavour, status):
+    app, settings, make_tenant = vpos_app
+    await make_tenant()
+    nav = _token(settings, ttl=timedelta(seconds=-5)) if flavour == "expired" else _token(settings)[:-2] + "xx"
+
+    resp = await _get(app, f"/pay/bancard_vpos/acme/return/{nav}")
+
+    assert resp.status_code == status and not respx.calls

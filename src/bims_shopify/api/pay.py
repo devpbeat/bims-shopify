@@ -9,9 +9,10 @@ from __future__ import annotations
 import html
 import json
 import secrets
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bims_shopify.adapters.payments.factory import build_provider
@@ -30,6 +31,7 @@ from bims_shopify.domain.bancard_vpos import (
     VposError,
     vpos_base_url,
 )
+from bims_shopify.domain.payment import PaymentStatus
 from bims_shopify.domain.tenant import PaymentProvider, Tenant
 from bims_shopify.logging import get_logger
 
@@ -107,16 +109,67 @@ async def return_page(
     slug: str,
     token: str,
     repo: SqlAlchemyTenantRepository = Depends(get_tenant_repository),
+    session: AsyncSession = Depends(get_db_session),
     settings: Settings = Depends(get_settings),
 ):
+    """Where Bancard sends the buyer back.
+
+    The browser return proves nothing, so the outcome is read out of band with
+    ``get_confirmation`` before anything else happens. Marking the Shopify order
+    paid stays with the server-to-server callback.
+    """
     resolved = await _resolve(slug, token, repo, settings, require_process_id=False)
     if isinstance(resolved, HTMLResponse):
         return resolved
+    tenant, claims = resolved
+    intents = SqlAlchemyPaymentIntentRepository(session)
+    intent = await intents.get_by_order_id(tenant.id, "bancard_vpos", claims.order_id)
+    if intent is None or not intent.provider_reference:
+        return _still_confirming()
+    if intent.status == "paid":
+        return await _confirmed(tenant, claims.order_id)
+
+    audit = SqlAlchemyAuditLogger(session)
+    provider = build_provider("bancard_vpos", tenant, settings=settings, audit=audit)
+    try:
+        verdict = await provider.verify_payment(tenant, intent)
+    except Exception as exc:
+        # Credential problems and outages are ours, never a failed payment for the buyer.
+        await _log_page_error(audit, tenant, claims.order_id, type(exc).__name__)
+        return _still_confirming()
+    if verdict == PaymentStatus.CONFIRMED:
+        return await _confirmed(tenant, claims.order_id)
+    if verdict == PaymentStatus.FAILED:
+        if intent.status == "pending":
+            await intents.update_status(tenant.id, "bancard_vpos", claims.order_id, "failed")
+        retry = f"/pay/bancard_vpos/{slug}/{token}"
+        return _page(
+            200,
+            "Payment declined",
+            "<p>Your payment was not approved and you were not charged.</p>"
+            f'<p><a href="{html.escape(retry, quote=True)}">Try again</a></p>',
+        )
+    return _still_confirming()
+
+
+def _still_confirming() -> HTMLResponse:
     return _message(
         200,
         "Thank you",
-        "We are confirming your payment with the bank. Your order will update shortly.",
+        "We are still confirming your payment with the bank. Your order will update shortly.",
     )
+
+
+async def _confirmed(tenant: Tenant, order_id: str) -> Response:
+    """Send a verified buyer to the Shopify order status page, else confirm in-app."""
+    status_url: str | None = None
+    try:
+        status_url = (await resolve_live_order(tenant, order_id, ShopifyClient(tenant))).status_url
+    except Exception as exc:
+        logger.warning("vpos_return_status_url_failed", tenant=tenant.slug, error=type(exc).__name__)
+    if status_url and urlsplit(status_url).scheme == "https":
+        return RedirectResponse(status_url, status_code=303, headers=_HEADERS)
+    return _message(200, "Payment received", "Thank you. Your payment was received and your order will update shortly.")
 
 
 @router.get("/{slug}/cancel/{token}")
@@ -219,6 +272,11 @@ async def _page_error(
     audit: SqlAlchemyAuditLogger, tenant: Tenant, order_id: str, reason: str, status: int, text: str
 ) -> HTMLResponse:
     """Log and audit a failed page open; the buyer sees plain copy, never the cause."""
+    await _log_page_error(audit, tenant, order_id, reason)
+    return _message(status, "Payment unavailable", text)
+
+
+async def _log_page_error(audit: SqlAlchemyAuditLogger, tenant: Tenant, order_id: str, reason: str) -> None:
     logger.error("vpos_pay_page_failed", tenant=tenant.slug, order_id=order_id, reason=reason)
     await audit.log(
         actor="system",
@@ -228,4 +286,3 @@ async def _page_error(
         entity_id=order_id,
         payload={"reason": reason},
     )
-    return _message(status, "Payment unavailable", text)
