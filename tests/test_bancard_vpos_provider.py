@@ -347,7 +347,7 @@ async def test_verify_payment_request_shape(provider, vpos_tenant):
     assert status == PaymentStatus.CONFIRMED
     assert route.calls.last.request.url.path == "/vpos/api/0.3/single_buy/confirmations"
     body = json.loads(route.calls.last.request.content)
-    assert set(body) == {"public_key", "operation"}
+    assert set(body) == {"public_key", "operation", "extra_response_attributes"}
     assert body["operation"]["shop_process_id"] == 100000000000100
     assert isinstance(body["operation"]["shop_process_id"], int)
     assert body["operation"]["token"] == _md5(PRIVATE_KEY + "100000000000100" + "get_confirmation")

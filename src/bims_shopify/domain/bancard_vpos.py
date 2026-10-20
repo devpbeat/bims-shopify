@@ -6,7 +6,8 @@ No I/O lives here. The module owns the three things that must never drift:
   the same instance, so two divergent strings cannot exist;
 * the md5 token concatenations, which take a ``VposAmount`` and never a raw
   number or string;
-* the ``shop_process_id`` derivation from a Shopify order id.
+* the ``shop_process_id`` derivation from the ``payment_intents`` row id;
+* the order metafields written back after a confirmed payment.
 """
 from __future__ import annotations
 
@@ -15,8 +16,11 @@ import hmac
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from enum import Enum
+
+from bims_shopify.domain.payment import OrderMetafield
 
 CURRENCY = "PYG"
 MAX_INTEGER_DIGITS = 13
@@ -339,3 +343,65 @@ def classify_rollback_key(key: object) -> RollbackOutcome:
     if key == "TransactionAlreadyConfirmed":
         return RollbackOutcome.OPERATOR_ACTION
     return RollbackOutcome.OTHER
+
+
+# --- Reconciliation metafields -------------------------------------------------
+
+METAFIELD_NAMESPACE = "bims_bancard"
+_METAFIELD_TEXT_MAX = 255
+EXTRA_RESPONSE_ATTRIBUTES = (
+    "payment_card_type",
+    "payment_card_brand",
+    "payment_masked_card_number",
+    "payment_origin",
+)
+_CARD_ATTRIBUTES = ("payment_masked_card_number", "payment_card_brand", "payment_card_type")
+
+
+def _metafield_text(raw: object) -> str | None:
+    """One bounded line of text, or None when there is nothing worth writing."""
+    if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+        return None
+    text = " ".join(str(raw).split())[:_METAFIELD_TEXT_MAX]
+    return text or None
+
+
+def confirmation_metafields(
+    shop_process_id: int, confirmation: Mapping[str, object], confirmed_at: datetime
+) -> list[OrderMetafield]:
+    """Order metafields for an APPROVED ``get_confirmation`` answer.
+
+    Built only from the out-of-band confirmation, never from the callback body.
+    Optional values are written only when Bancard sent them. Nothing here is
+    secret: the masked card number is already masked by Bancard, and no token
+    or key is ever copied.
+    """
+
+    def make(key: str, type_: str, value: str) -> OrderMetafield:
+        return OrderMetafield(namespace=METAFIELD_NAMESPACE, key=key, type=type_, value=value)
+
+    text_type = "single_line_text_field"
+    result = [make("shop_process_id", "number_integer", str(shop_process_id))]
+    try:
+        ticket = _coerce_int(confirmation.get("ticket_number"), "ticket_number")
+    except VposCallbackShapeError:
+        ticket = None
+    if ticket is not None:
+        result.append(make("ticket_number", "number_integer", str(ticket)))
+    for key in ("response_code", "authorization_number"):
+        value = _metafield_text(confirmation.get(key))
+        if value is not None:
+            result.append(make(key, text_type, value))
+    extras = confirmation.get("extra_attributes")
+    for key in _CARD_ATTRIBUTES:
+        raw = extras.get(key) if isinstance(extras, Mapping) else None
+        value = _metafield_text(raw if raw is not None else confirmation.get(key))
+        if value is not None:
+            result.append(make(key, text_type, value))
+    security = confirmation.get("security_information")
+    source = _metafield_text(security.get("card_source")) if isinstance(security, Mapping) else None
+    if source is not None:
+        result.append(make("card_source", text_type, source))
+    stamp = confirmed_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    result.append(make("confirmed_at", "date_time", stamp))
+    return result

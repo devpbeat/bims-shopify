@@ -1,9 +1,10 @@
 """Port describing operations the application needs from a storefront (Shopify)."""
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any, Protocol
 
+from bims_shopify.domain.payment import OrderMetafield
 from bims_shopify.domain.product import InventoryDelta
 from bims_shopify.domain.tenant import Tenant
 
@@ -41,6 +42,12 @@ class StorefrontPort(Protocol):
 
     async def mark_order_as_paid(self, tenant: Tenant, order_id: str) -> None:
         """Mark a Shopify order as paid via orderMarkAsPaid."""
+        ...
+
+    async def set_order_metafields(
+        self, tenant: Tenant, order_id: str, metafields: Sequence[OrderMetafield]
+    ) -> None:
+        """Upsert metafields on an order. Re-sending the same keys overwrites, never duplicates."""
         ...
 
     async def get_order(self, tenant: Tenant, order_id: str) -> dict[str, Any] | None:

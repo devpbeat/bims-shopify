@@ -129,7 +129,9 @@ async def _handle_payment_callback(
     intents = SqlAlchemyPaymentIntentRepository(session)
     audit = SqlAlchemyAuditLogger(session)
     provider_impl = _build_provider(provider, tenant, settings, audit)
-    use_case = HandlePaymentCallback(provider_impl, storefront, processed_events, intents)
+    use_case = HandlePaymentCallback(
+        provider_impl, storefront, processed_events, intents, audit=audit
+    )
     always_ack = bool(getattr(provider_impl, "always_ack_callback", False))
     if extraction_error is not None:
         if not always_ack:

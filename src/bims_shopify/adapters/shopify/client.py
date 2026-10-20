@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import httpx
 
+from bims_shopify.domain.payment import OrderMetafield
 from bims_shopify.domain.tenant import Tenant
 
 API_VERSION = "2025-07"
@@ -54,6 +55,18 @@ mutation OrderMarkAsPaid($input: OrderMarkAsPaidInput!) {
   }
 }
 """
+
+_METAFIELDS_SET = """
+mutation SetOrderMetafields($metafields: [MetafieldsSetInput!]!) {
+  metafieldsSet(metafields: $metafields) {
+    metafields { id namespace key }
+    userErrors { field message code }
+  }
+}
+"""
+
+# metafieldsSet accepts at most 25 metafields per call (Admin GraphQL docs).
+_METAFIELDS_SET_BATCH = 25
 
 _LIST_ALL_VARIANTS = """
 query ListAllVariants($cursor: String) {
@@ -422,6 +435,20 @@ class ShopifyClient:
         gid = order_id if order_id.startswith("gid://") else f"gid://shopify/Order/{order_id}"
         data = await self._graphql(_ORDER_MARK_AS_PAID, {"input": {"id": gid}})
         self._check_user_errors(data.get("orderMarkAsPaid"))
+
+    async def set_order_metafields(
+        self, tenant: Tenant, order_id: str, metafields: Sequence[OrderMetafield]
+    ) -> None:
+        """Upsert order metafields via ``metafieldsSet`` (idempotent per owner+namespace+key)."""
+        gid = order_id if order_id.startswith("gid://") else f"gid://shopify/Order/{order_id}"
+        inputs = [
+            {"ownerId": gid, "namespace": m.namespace, "key": m.key, "type": m.type, "value": m.value}
+            for m in metafields
+        ]
+        for start in range(0, len(inputs), _METAFIELDS_SET_BATCH):
+            batch = inputs[start : start + _METAFIELDS_SET_BATCH]
+            data = await self._graphql(_METAFIELDS_SET, {"metafields": batch})
+            self._check_user_errors(data.get("metafieldsSet"))
 
     async def get_order(self, tenant: Tenant, order_id: str) -> dict[str, Any] | None:
         data = await self._graphql(_GET_ORDER, {"id": order_id})

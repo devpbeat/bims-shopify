@@ -288,11 +288,13 @@ class HandlePaymentCallback:
         storefront: StorefrontPort,
         processed_events: ProcessedEventRepositoryPort,
         intents: PaymentIntentRepositoryPort | None = None,
+        audit: AuditLogPort | None = None,
     ) -> None:
         self._provider = provider
         self._storefront = storefront
         self._processed_events = processed_events
         self._intents = intents
+        self._audit = audit
 
     async def run(self, tenant: Tenant, payload: dict[str, Any]) -> PaymentIntent:
         intent = await self._provider.parse_callback(tenant, payload)
@@ -328,6 +330,7 @@ class HandlePaymentCallback:
             if verified_status == PaymentStatus.CONFIRMED and intent.order_id:
                 await self._storefront.mark_order_as_paid(tenant, intent.order_id)
                 intent.status = "paid"
+                await self._annotate_order(tenant, intent)
             elif verified_status == PaymentStatus.PENDING:
                 intent.status = "pending"
             else:
@@ -347,6 +350,46 @@ class HandlePaymentCallback:
                 tenant.id, self._provider.name, intent.order_id, intent.status
             )
         return intent
+
+    async def _annotate_order(self, tenant: Tenant, intent: PaymentIntent) -> None:
+        """Write the provider's reconciliation metafields onto the already-paid order.
+
+        Best effort by design: the order is paid at this point, so a failure here is
+        a warning plus an audit entry, never an error that releases the claim or
+        reverses the payment.
+        """
+        if not intent.order_metafields:
+            return
+        try:
+            storefront: Any = self._storefront
+            await storefront.set_order_metafields(tenant, intent.order_id, intent.order_metafields)
+        except Exception as exc:
+            error = type(exc).__name__
+            logger.warning(
+                "payment_metafields_failed",
+                tenant=tenant.slug,
+                provider=self._provider.name,
+                order_id=intent.order_id,
+                error=error,
+            )
+            await self._audit_metafield_failure(tenant, intent, error)
+
+    async def _audit_metafield_failure(self, tenant: Tenant, intent: PaymentIntent, error: str) -> None:
+        if self._audit is None:
+            return
+        try:
+            await self._audit.log(
+                actor="system",
+                action="payment.metafields_failed",
+                entity="order",
+                tenant_id=tenant.id,
+                entity_id=intent.order_id,
+                payload={"error": error, "shop_process_id": intent.provider_reference},
+            )
+        except Exception as exc:  # the audit trail must not undo a good payment either
+            logger.warning(
+                "payment_metafields_audit_failed", tenant=tenant.slug, error=type(exc).__name__
+            )
 
 
 def _hash_payload(payload: dict[str, Any]) -> str:
