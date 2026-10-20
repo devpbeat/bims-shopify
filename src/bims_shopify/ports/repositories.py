@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol
 
+from bims_shopify.domain.payment_report import ReportFilters
 from bims_shopify.domain.tenant import Tenant
 
 
@@ -49,3 +50,17 @@ class SyncStateRepository(Protocol):
     ) -> None: ...
 
     async def delete_event(self, tenant_id: int, source: str, external_id: str) -> None: ...
+
+
+class PaymentReportRepository(Protocol):
+    """Read-only reporting queries over persisted payment intents.
+
+    Rows never carry ``checkout_url`` (it embeds a signed token). Every
+    method is scoped to ``tenant_id``.
+    """
+
+    async def report_rows(
+        self, tenant_id: int, filters: ReportFilters, limit: int, offset: int
+    ) -> list[dict]: ...
+
+    async def report_aggregates(self, tenant_id: int, filters: ReportFilters) -> dict: ...
