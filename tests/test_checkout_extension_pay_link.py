@@ -289,3 +289,33 @@ async def test_order_identity_gid_from_the_checkout_extension_is_accepted(ext_ap
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "pay"
+
+
+async def test_bare_hostname_dest_claim_from_a_real_token_is_accepted(ext_app):
+    """Shopify sends `dest` as a bare hostname while `iss` is a full URL.
+
+    A real production token carried `iss=https://<shop>/checkouts` and
+    `dest=<shop>` with no scheme. Requiring https on both claims rejected it
+    with 401, so the buyer never saw the pay button. The `_token` helper only
+    ever built `dest` as a URL, which is why no test caught this.
+    """
+    app, make_tenant, seed = ext_app
+    await seed(await make_tenant())
+
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "iss": "https://acme.myshopify.com/checkouts",
+            "dest": "acme.myshopify.com",
+            "aud": CLIENT_ID,
+            "exp": now + 300,
+            "nbf": now - 10,
+            "iat": now,
+        },
+        SECRET,
+        algorithm="HS256",
+    )
+    resp = await _post(app, token)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "pay"

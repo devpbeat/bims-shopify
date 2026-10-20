@@ -32,9 +32,22 @@ def normalize_shop_domain(value: str) -> str:
 
 
 def _hostname(url: object) -> str:
+    """Hostname from either an https URL or a bare host.
+
+    Shopify is not consistent across claims: checkout UI extension tokens send
+    ``iss`` as a full URL (``https://shop.myshopify.com/checkouts``) but ``dest``
+    as a bare hostname (``shop.myshopify.com``). Requiring a scheme on both
+    rejected every real token with a 401.
+    """
     if not isinstance(url, str):
         raise SessionTokenError("claim is not a URL")
-    parts = urlsplit(url.strip())
+    raw = url.strip()
+    if "//" not in raw:
+        host = normalize_shop_domain(raw.split("/", 1)[0])
+        if not host or " " in host:
+            raise SessionTokenError("claim is not a hostname")
+        return host
+    parts = urlsplit(raw)
     if parts.scheme != "https" or not parts.hostname:
         raise SessionTokenError("claim is not an https URL")
     return normalize_shop_domain(parts.hostname)
