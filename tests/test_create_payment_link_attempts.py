@@ -47,6 +47,7 @@ class AttemptProvider:
             currency=currency,
             checkout_url=f"https://x/pay/{attempt}",
             provider_reference=str(int(order_id) * 100 + attempt),
+            process_id=f"pid-{attempt}",
         )
 
     async def abandon_attempt(self, tenant, intent):
@@ -81,6 +82,66 @@ async def test_pending_is_idempotent(tenant):
     second = await use_case.run(tenant, ORDER, 100.0, "PYG")
     assert provider.created == [0]
     assert second.checkout_url == first.checkout_url
+
+
+async def test_changed_amount_abandons_the_old_attempt_and_mints_the_next(tenant):
+    provider = AttemptProvider()
+    audit = FakeAudit()
+    use_case, intents = _make(provider, audit)
+    await use_case.run(tenant, ORDER, 100.0, "PYG")
+    result = await use_case.run(tenant, ORDER, 120.0, "PYG")
+    assert provider.created == [0, 1]
+    assert provider.abandoned == ["100100"]
+    assert result.amount == 120.0
+    assert result.process_id == "pid-1"
+    assert intents.rows[ORDER].provider_reference == "100101"
+    assert [e["action"] for e in audit.entries] == ["payment.retry_minted"]
+
+
+async def test_same_amount_after_rounding_still_reuses(tenant):
+    provider = AttemptProvider()
+    use_case, _ = _make(provider)
+    await use_case.run(tenant, ORDER, 100.0, "PYG")
+    result = await use_case.run(tenant, ORDER, 100.004, "PYG")
+    assert provider.created == [0]
+    assert result.process_id == "pid-0"
+
+
+async def test_prepared_intent_without_an_operation_mints_attempt_zero(tenant):
+    provider = AttemptProvider()
+    use_case, intents = _make(provider)
+    intents.rows[ORDER] = PaymentIntent(
+        tenant_slug="acme", order_id=ORDER, amount=100.0, currency="PYG",
+        checkout_url="https://x/link", provider_reference=None,
+    )
+    result = await use_case.run(tenant, ORDER, 100.0, "PYG")
+    assert provider.created == [0]
+    assert provider.abandoned == []
+    assert result.process_id == "pid-0"
+
+
+async def test_legacy_pending_without_process_id_is_replaced(tenant):
+    provider = AttemptProvider()
+    use_case, intents = _make(provider)
+    intents.rows[ORDER] = PaymentIntent(
+        tenant_slug="acme", order_id=ORDER, amount=100.0, currency="PYG",
+        checkout_url="https://x/old", provider_reference="100100",
+    )
+    result = await use_case.run(tenant, ORDER, 100.0, "PYG")
+    assert provider.created == [1]
+    assert provider.abandoned == ["100100"]
+    assert result.provider_reference == "100101"
+
+
+async def test_changed_amount_with_no_attempts_left_raises(tenant):
+    provider = AttemptProvider()
+    use_case, intents = _make(provider)
+    intents.rows[ORDER] = PaymentIntent(
+        tenant_slug="acme", order_id=ORDER, amount=100.0, currency="PYG",
+        checkout_url="u", provider_reference="100199", process_id="p",
+    )
+    with pytest.raises(VposAttemptsExhaustedError):
+        await use_case.run(tenant, ORDER, 120.0, "PYG")
 
 
 async def test_paid_never_calls_provider_or_rolls_back(tenant):

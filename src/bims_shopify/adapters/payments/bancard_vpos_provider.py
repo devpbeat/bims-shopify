@@ -205,6 +205,7 @@ class BancardVposProvider:
             currency=currency,
             checkout_url=f"{public_base}/pay/bancard_vpos/{slug}/{checkout_token}",
             provider_reference=str(spid),
+            process_id=str(process_id),
         )
 
     async def check_credentials(self, tenant: Tenant) -> CredentialCheck:

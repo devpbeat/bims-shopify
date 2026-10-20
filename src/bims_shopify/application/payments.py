@@ -3,10 +3,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
-from bims_shopify.domain.bancard_vpos import MAX_ATTEMPT, VposAttemptsExhaustedError
+from bims_shopify.domain.bancard_vpos import (
+    MAX_ATTEMPT,
+    VposAmount,
+    VposAttemptsExhaustedError,
+)
 from bims_shopify.domain.payment import PaymentIntent, PaymentStatus
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
@@ -24,10 +29,19 @@ class OrderAmountError(Exception):
         self.not_found = not_found
 
 
-async def resolve_order_amount(
+@dataclass(frozen=True)
+class LiveOrder:
+    """What the storefront says about an order right now."""
+
+    amount: float
+    paid: bool
+    status_url: str | None
+
+
+async def resolve_live_order(
     tenant: Tenant, order_id: str, storefront: StorefrontPort, *, currency: str = "PYG"
-) -> float:
-    """Charge amount read from the Shopify order itself, never from a request body.
+) -> LiveOrder:
+    """Read the chargeable total (and paid state) from the Shopify order itself.
 
     Raises ``OrderAmountError`` if the order is missing or not priced in
     ``currency``; storefront transport errors propagate to the caller.
@@ -45,7 +59,19 @@ async def resolve_order_amount(
         raise OrderAmountError("order total is unreadable") from exc
     if not total.is_finite() or total <= 0:
         raise OrderAmountError("order total is not chargeable")
-    return float(total)
+    status_url = order.get("statusPageUrl")
+    return LiveOrder(
+        amount=float(total),
+        paid=order.get("displayFinancialStatus") == "PAID",
+        status_url=status_url if isinstance(status_url, str) and status_url else None,
+    )
+
+
+async def resolve_order_amount(
+    tenant: Tenant, order_id: str, storefront: StorefrontPort, *, currency: str = "PYG"
+) -> float:
+    """Charge amount read from the Shopify order itself, never from a request body."""
+    return (await resolve_live_order(tenant, order_id, storefront, currency=currency)).amount
 
 
 class PaymentIntentRepositoryPort(Protocol):
@@ -123,11 +149,19 @@ class CreatePaymentLink:
         abandoned: PaymentIntent | None = None
         if existing is not None:
             attempt = _attempt_of(existing)
-            if existing.status == "paid" or (
-                existing.status == "pending" and existing.checkout_url
-            ):
+            if existing.status == "paid":
                 return existing
-            if existing.status in _RETRYABLE_STATUSES:
+            if existing.status == "pending":
+                if existing.provider_reference and existing.checkout_url:
+                    if existing.process_id and _same_amount(existing.amount, amount):
+                        return existing
+                    # The order total moved (or the operation predates stored
+                    # process ids): roll back the stale operation, mint the next.
+                    if attempt >= MAX_ATTEMPT:
+                        raise VposAttemptsExhaustedError("no attempts left for this order")
+                    attempt += 1
+                    abandoned = existing
+            elif existing.status in _RETRYABLE_STATUSES:
                 if attempt >= MAX_ATTEMPT:
                     raise VposAttemptsExhaustedError("no attempts left for this order")
                 attempt += 1
@@ -161,6 +195,14 @@ class CreatePaymentLink:
 
 
 _RETRYABLE_STATUSES = frozenset({"failed", "cancelled"})
+
+
+def _same_amount(stored: float, live: float) -> bool:
+    """Compare as the wire does: rounded to the two decimals vPOS is charged."""
+    try:
+        return VposAmount.from_order_total(stored).value == VposAmount.from_order_total(live).value
+    except ValueError:
+        return False
 
 
 def _attempt_of(intent: PaymentIntent) -> int:
