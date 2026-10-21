@@ -157,3 +157,58 @@ export interface PaymentsTestResult {
   reason: string
   message: string
 }
+
+export interface PaymentReportFilters {
+  date_from: string | null
+  date_to: string | null
+  status: string | null
+  provider: string | null
+}
+
+export interface PaymentReportRow {
+  id: number
+  order_id: string
+  provider: string
+  amount: number
+  currency: string
+  status: string
+  provider_reference: string | null
+  process_id: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface PaymentStatusAggregate {
+  status: string
+  count: number
+  total_amount: number
+}
+
+export interface PaymentDayAggregate {
+  date: string
+  count: number
+  total_amount: number
+}
+
+export interface PaymentReport {
+  filters: PaymentReportFilters
+  rows: PaymentReportRow[]
+  total: number
+  limit: number
+  offset: number
+  by_status: PaymentStatusAggregate[]
+  by_day: PaymentDayAggregate[]
+}
+
+export interface PaymentReportQuery {
+  date_from?: string
+  date_to?: string
+  status?: string
+  provider?: string
+}
+
+export interface PaymentExportFile {
+  blob: Blob
+  filename: string
+  truncated: boolean
+}
