@@ -67,6 +67,7 @@ export interface Messages {
     mismatches: string
     activity: string
     payments: string
+    paymentsReport: string
   }
   dashboard: {
     syncStatus: string
@@ -258,5 +259,46 @@ export interface Messages {
     testFailed: string
     loadFailed: string
     loading: string
+  }
+  paymentsReport: {
+    title: string
+    intro: string
+    dateFrom: string
+    dateTo: string
+    status: string
+    provider: string
+    allStatuses: string
+    allProviders: string
+    apply: string
+    applied: string
+    appliedNone: string
+    statusPending: string
+    statusPaid: string
+    statusFailed: string
+    statusCancelled: string
+    tileCount: string
+    chartTitle: string
+    chartAxisDate: string
+    chartAxisAmount: string
+    chartEmpty: string
+    chartCountLabel: string
+    download: string
+    downloading: string
+    downloadFailed: string
+    truncated: string
+    tableOrder: string
+    tableProvider: string
+    tableAmount: string
+    tableStatus: string
+    tableReference: string
+    tableCreated: string
+    total: string
+    pageRange: string
+    previous: string
+    next: string
+    empty: string
+    loading: string
+    loadFailed: string
+    sessionExpired: string
   }
 }
