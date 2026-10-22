@@ -1,7 +1,10 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
 import { useT } from '../i18n'
-import { LanguageToggle } from './LanguageToggle'
+import { AuthLayout } from './AuthLayout'
+import { Field } from './Field'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 
 interface TokenGateProps {
   slug: string
@@ -20,29 +23,30 @@ export function TokenGate({ slug, onSubmit, onBackToLogin }: TokenGateProps) {
   }
 
   return (
-    <div className="centered-page">
-      <form className="token-card" onSubmit={handleSubmit}>
-        <div className="token-card-top">
-          <h1>{t.login.title}</h1>
-          <LanguageToggle />
-        </div>
-        <p className="muted">{t.login.accessKeyPrompt(slug)}</p>
-        <input
-          type="password"
-          autoFocus
-          placeholder={t.login.accessKeyPlaceholder}
-          value={value}
-          onChange={(event) => setValue(event.target.value)}
-        />
-        <button type="submit" className="btn btn-primary" disabled={!value.trim()}>
+    <AuthLayout title={t.login.title} description={t.login.accessKeyPrompt(slug)}>
+      <form className="flex flex-col gap-4" onSubmit={handleSubmit}>
+        <Field label={t.login.accessKeyLabel}>
+          {(control) => (
+            <Input
+              {...control}
+              className="h-11 sm:h-9"
+              type="password"
+              autoFocus
+              placeholder={t.login.accessKeyPlaceholder}
+              value={value}
+              onChange={(event) => setValue(event.target.value)}
+            />
+          )}
+        </Field>
+        <Button type="submit" className="h-11 sm:h-9" disabled={!value.trim()}>
           {t.common.continueLabel}
-        </button>
+        </Button>
         {onBackToLogin && (
-          <button type="button" className="btn-link" onClick={onBackToLogin}>
+          <Button type="button" variant="link" className="h-11 sm:h-9" onClick={onBackToLogin}>
             {t.common.backToLogin}
-          </button>
+          </Button>
         )}
       </form>
-    </div>
+    </AuthLayout>
   )
 }

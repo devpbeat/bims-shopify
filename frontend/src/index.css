@@ -1,9 +1,5 @@
 @import "tailwindcss";
 
-/* Layer order: legacy view styles sit above Tailwind's base reset and below
-   utilities, so shadcn components and utility classes always win. */
-@layer theme, base, legacy, components, utilities;
-@import "./legacy.css" layer(legacy);
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 

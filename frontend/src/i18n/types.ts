@@ -1,3 +1,5 @@
+import type { MetricId } from '../activity/activityFormat'
+
 export type Locale = 'es' | 'en'
 
 export interface HelpSection {
@@ -51,16 +53,21 @@ export interface Messages {
     menu: string
     openMenu: string
     menuDescription: string
+    missingSlug: string
+    actions: string
   }
   login: {
     title: string
     subtitle: (slug: string) => string
+    emailLabel: string
     emailPlaceholder: string
+    passwordLabel: string
     passwordPlaceholder: string
     tooManyAttempts: string
     invalidCredentials: string
     loginFailedGeneric: string
     accessKeyPrompt: (slug: string) => string
+    accessKeyLabel: string
     accessKeyPlaceholder: string
   }
   tabs: {
@@ -146,10 +153,27 @@ export interface Messages {
     colStatus: string
   }
   activity: {
-    colTime: string
-    colActor: string
-    colAction: string
-    colDetail: string
+    listLabel: string
+    originLabel: string
+    origins: Record<'admin' | 'portal' | 'system' | 'shopify', string>
+    unknownAction: string
+    actions: Record<string, string>
+    metrics: Record<MetricId, string>
+    yes: string
+    no: string
+    noSummary: string
+    viewDetails: (action: string) => string
+    detailsTitle: string
+    detailsDescription: string
+    timestampLabel: string
+    entityLabel: string
+    entityIdLabel: string
+    actionCodeLabel: string
+    rawPayloadTitle: string
+    rawPayloadNote: string
+    noPayload: string
+    copyHint: string
+    showing: (count: number) => string
   }
   help: {
     modalTitleSuffix: string
@@ -170,6 +194,10 @@ export interface Messages {
     jobHistoryTitle: string
     noJobs: string
     resultLabel: string
+    progressLabel: string
+    historyLoadFailed: string
+    runFailed: string
+    viewJobDetails: string
     runButton: string
     running: string
     jobAlreadyRunning: string

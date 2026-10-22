@@ -3,7 +3,10 @@ import type { NameMismatchRow, PendingQueue, Resolution } from '../api/types'
 import { useT } from '../i18n'
 import { findResolution, isLocked } from '../resolutionUtils'
 import { HelpModal, TabHelpHeader } from './HelpModal'
-import { StatusBadge } from './StatusBadge'
+import { ResponsiveRecords } from './ResponsiveRecords'
+import type { RecordColumn } from './ResponsiveRecords'
+import { RowStatus } from './StatusBadge'
+import { Button } from '@/components/ui/button'
 
 interface NameMismatchTabProps {
   rows: NameMismatchRow[]
@@ -17,70 +20,61 @@ export function NameMismatchTab({ rows, resolutions, pending, onApprove, onIgnor
   const { t } = useT()
   const [helpOpen, setHelpOpen] = useState(false)
 
+  const header = (
+    <>
+      <TabHelpHeader onHelp={() => setHelpOpen(true)} label={t.tabs.mismatches} />
+      {helpOpen && <HelpModal section={t.help.mismatches} onClose={() => setHelpOpen(false)} />}
+    </>
+  )
+
   if (rows.length === 0) {
     return (
       <>
-        <TabHelpHeader onHelp={() => setHelpOpen(true)} label={t.tabs.mismatches} />
-        {helpOpen && <HelpModal section={t.help.mismatches} onClose={() => setHelpOpen(false)} />}
-        <p className="empty-state">{t.mismatches.empty}</p>
+        {header}
+        <p className="py-6 text-center text-sm text-muted-foreground">{t.mismatches.empty}</p>
       </>
     )
   }
 
+  const columns: RecordColumn<NameMismatchRow>[] = [
+    { id: 'product', header: t.mismatches.colProduct, cell: (row) => row.product_title },
+    { id: 'bims', header: t.mismatches.colBimsName, cell: (row) => row.bims_name },
+    { id: 'old', header: t.mismatches.colOldSku, cell: (row) => <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{row.old_sku}</code> },
+    { id: 'new', header: t.mismatches.colNewSku, cell: (row) => <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{row.new_sku}</code> },
+    {
+      id: 'status',
+      header: t.mismatches.colStatus,
+      cell: (row) => {
+        const entry = pending[row.variant_id]
+        const queued = entry ? (entry.action === 'approve_sku' ? t.common.queuedApprove : t.common.queuedIgnore) : null
+        return <RowStatus resolution={findResolution(resolutions, row.variant_id)} queuedLabel={queued} />
+      },
+    },
+  ]
+
   return (
     <div>
-      <TabHelpHeader onHelp={() => setHelpOpen(true)} label={t.tabs.mismatches} />
-      {helpOpen && <HelpModal section={t.help.mismatches} onClose={() => setHelpOpen(false)} />}
-      <table className="data-table">
-        <thead>
-          <tr>
-            <th>{t.mismatches.colProduct}</th>
-            <th>{t.mismatches.colBimsName}</th>
-            <th>{t.mismatches.colOldSku}</th>
-            <th>{t.mismatches.colNewSku}</th>
-            <th>{t.mismatches.colStatus}</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => {
-            const resolution = findResolution(resolutions, row.variant_id)
-            const locked = isLocked(resolutions, row.variant_id)
-            const pendingEntry = pending[row.variant_id]
-            return (
-              <tr key={row.variant_id}>
-                <td>{row.product_title}</td>
-                <td>{row.bims_name}</td>
-                <td>
-                  <code>{row.old_sku}</code>
-                </td>
-                <td>
-                  <code>{row.new_sku}</code>
-                </td>
-                <td>
-                  {resolution ? (
-                    <StatusBadge status={resolution.status} />
-                  ) : pendingEntry ? (
-                    <span className="badge badge-queued">
-                      {pendingEntry.action === 'approve_sku' ? t.common.queuedApprove : t.common.queuedIgnore}
-                    </span>
-                  ) : (
-                    <span className="muted">{t.common.pendingDecision}</span>
-                  )}
-                </td>
-                <td className="row-actions">
-                  <button type="button" className="btn btn-primary" disabled={locked} onClick={() => onApprove(row.variant_id)}>
-                    {t.common.approve}
-                  </button>
-                  <button type="button" className="btn btn-secondary" disabled={locked} onClick={() => onIgnore(row.variant_id)}>
-                    {t.common.ignore}
-                  </button>
-                </td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
+      {header}
+      <ResponsiveRecords
+        rows={rows}
+        columns={columns}
+        getKey={(row) => row.variant_id}
+        label={t.tabs.mismatches}
+        actionsHeader={t.common.actions}
+        actions={(row) => {
+          const locked = isLocked(resolutions, row.variant_id)
+          return (
+            <>
+              <Button type="button" className="h-11 sm:h-9" disabled={locked} onClick={() => onApprove(row.variant_id)}>
+                {t.common.approve}
+              </Button>
+              <Button type="button" variant="outline" className="h-11 sm:h-9" disabled={locked} onClick={() => onIgnore(row.variant_id)}>
+                {t.common.ignore}
+              </Button>
+            </>
+          )
+        }}
+      />
     </div>
   )
 }

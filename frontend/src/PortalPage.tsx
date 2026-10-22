@@ -25,8 +25,12 @@ import { clearToken, loadToken, saveToken } from './session'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent } from '@/components/ui/tabs'
+import { cn } from '@/lib/utils'
 
 type Tab = 'dashboard' | 'duplicates' | 'unresolved' | 'mismatches' | 'activity' | 'payments' | 'paymentsReport' | 'operations'
+
+// These tabs lay out their own cards; the others render inside a shared surface.
+const SELF_CONTAINED_TABS: Tab[] = ['dashboard', 'payments', 'paymentsReport', 'operations']
 
 function tokenFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get('token')
@@ -313,7 +317,10 @@ export function PortalPage() {
 
           <TabsContent
             value={tab}
-            className="min-h-60 min-w-0 flex-none overflow-x-auto rounded-xl border bg-card p-3 text-card-foreground shadow-sm sm:p-4"
+            className={cn(
+              'min-w-0 flex-none',
+              !SELF_CONTAINED_TABS.includes(tab) && 'min-h-60 rounded-xl border bg-card p-3 text-card-foreground shadow-sm sm:p-4',
+            )}
           >
           {tab === 'dashboard' && (
             <DashboardTab

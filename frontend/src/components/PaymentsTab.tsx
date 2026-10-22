@@ -3,6 +3,14 @@ import type { FormEvent } from 'react'
 import { getPaymentsConfig, putPaymentsConfig, testPaymentsConnection } from '../api/client'
 import type { PaymentsTestResult } from '../api/types'
 import { useT } from '../i18n'
+import { Field } from './Field'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Skeleton } from '@/components/ui/skeleton'
 
 interface PaymentsTabProps {
   slug: string
@@ -99,90 +107,144 @@ export function PaymentsTab({ slug, token }: PaymentsTabProps) {
     }
   }
 
-  if (loading) return <p className="muted">{t.payments.loading}</p>
-  if (loadError) return <p className="error-text">{loadError}</p>
+  if (loading) {
+    return (
+      <div className="flex flex-col gap-3" role="status" aria-live="polite">
+        <p className="text-sm text-muted-foreground">{t.payments.loading}</p>
+        <Skeleton className="h-40 w-full" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+    )
+  }
+  if (loadError) {
+    return (
+      <Alert variant="destructive">
+        <AlertDescription>{loadError}</AlertDescription>
+      </Alert>
+    )
+  }
+
+  const touch = 'h-11 sm:h-9'
 
   return (
-    <form className="ops-tab" onSubmit={handleSave}>
-      <section className="ops-card">
-        <h3>{t.payments.title}</h3>
-        <p className="muted">{t.payments.intro}</p>
-        {!editable && <p className="muted">{t.payments.readOnlyNotice}</p>}
+    <div className="flex flex-col gap-4">
+      <form onSubmit={handleSave}>
+        <Card size="sm">
+          <CardHeader>
+            <CardTitle>{t.payments.title}</CardTitle>
+            <CardDescription>{t.payments.intro}</CardDescription>
+          </CardHeader>
+          <CardContent className="gap-4">
+            {!editable && (
+              <Alert>
+                <AlertDescription>{t.payments.readOnlyNotice}</AlertDescription>
+              </Alert>
+            )}
 
-        <label className="ops-field">
-          {t.payments.publicKeyLabel}
-          <input type="text" value={publicKey} disabled={!editable} onChange={(e) => setPublicKey(e.target.value)} />
-        </label>
+            <Field label={t.payments.publicKeyLabel}>
+              {(control) => (
+                <Input {...control} className={touch} value={publicKey} disabled={!editable} onChange={(e) => setPublicKey(e.target.value)} />
+              )}
+            </Field>
 
-        <label className="ops-field">
-          <span>
-            {t.payments.privateKeyLabel}{' '}
-            <strong>
-              ({privateKeyConfigured ? t.payments.privateKeyConfiguredBadge : t.payments.privateKeyNotConfiguredBadge})
-            </strong>
-          </span>
-          <input
-            type="password"
-            value={privateKey}
-            autoComplete="new-password"
-            placeholder={t.payments.privateKeyPlaceholder}
-            disabled={!editable}
-            onChange={(e) => setPrivateKey(e.target.value)}
+            <Field
+              hint={t.payments.privateKeyHelp}
+              label={
+                <>
+                  {t.payments.privateKeyLabel}
+                  <Badge variant={privateKeyConfigured ? 'secondary' : 'outline'}>
+                    {privateKeyConfigured ? t.payments.privateKeyConfiguredBadge : t.payments.privateKeyNotConfiguredBadge}
+                  </Badge>
+                </>
+              }
+            >
+              {(control) => (
+                <Input
+                  {...control}
+                  className={touch}
+                  type="password"
+                  value={privateKey}
+                  autoComplete="new-password"
+                  placeholder={t.payments.privateKeyPlaceholder}
+                  disabled={!editable}
+                  onChange={(e) => setPrivateKey(e.target.value)}
+                />
+              )}
+            </Field>
+
+            <Field label={t.payments.environmentLabel}>
+              {(control) => (
+                <Select value={environment} disabled={!editable} onValueChange={setEnvironment}>
+                  <SelectTrigger {...control} className={`${touch} w-full sm:w-64`}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="staging">{t.payments.environmentStaging}</SelectItem>
+                    <SelectItem value="production">{t.payments.environmentProduction}</SelectItem>
+                  </SelectContent>
+                </Select>
+              )}
+            </Field>
+
+            <Field label={t.payments.gatewayNameLabel} hint={t.payments.gatewayNameHelp}>
+              {(control) => (
+                <Input {...control} className={touch} value={gatewayName} disabled={!editable} onChange={(e) => setGatewayName(e.target.value)} />
+              )}
+            </Field>
+
+            {editable && (
+              <Button type="submit" className={`${touch} w-full sm:w-auto sm:self-start`} disabled={saving}>
+                {saving ? t.payments.saving : t.payments.save}
+              </Button>
+            )}
+            {saveMessage && (
+              <Alert variant={saveMessage.ok ? 'default' : 'destructive'} role={saveMessage.ok ? 'status' : 'alert'}>
+                <AlertDescription>{saveMessage.text}</AlertDescription>
+              </Alert>
+            )}
+          </CardContent>
+        </Card>
+      </form>
+
+      <Card size="sm">
+        <CardHeader>
+          <CardTitle>{t.payments.confirmUrlLabel}</CardTitle>
+          <CardDescription>{t.payments.confirmUrlHelp}</CardDescription>
+        </CardHeader>
+        <CardContent className="gap-2 sm:flex-row">
+          <Input
+            aria-label={t.payments.confirmUrlLabel}
+            className={`${touch} min-w-0 font-mono text-xs`}
+            readOnly
+            value={confirmUrl}
+            onFocus={(e) => e.currentTarget.select()}
           />
-        </label>
-        <p className="muted">{t.payments.privateKeyHelp}</p>
-
-        <label className="ops-field">
-          {t.payments.environmentLabel}
-          <select value={environment} disabled={!editable} onChange={(e) => setEnvironment(e.target.value)}>
-            <option value="staging">{t.payments.environmentStaging}</option>
-            <option value="production">{t.payments.environmentProduction}</option>
-          </select>
-        </label>
-
-        <label className="ops-field">
-          {t.payments.gatewayNameLabel}
-          <input type="text" value={gatewayName} disabled={!editable} onChange={(e) => setGatewayName(e.target.value)} />
-        </label>
-        <p className="muted">{t.payments.gatewayNameHelp}</p>
-
-        {editable && (
-          <div>
-            <button type="submit" className="btn btn-primary" disabled={saving}>
-              {saving ? t.payments.saving : t.payments.save}
-            </button>
-          </div>
-        )}
-        {saveMessage && <p className={saveMessage.ok ? 'muted' : 'error-text'}>{saveMessage.text}</p>}
-      </section>
-
-      <section className="ops-card">
-        <h3>{t.payments.confirmUrlLabel}</h3>
-        <p className="muted">{t.payments.confirmUrlHelp}</p>
-        <div>
-          <input type="text" readOnly value={confirmUrl} size={60} onFocus={(e) => e.currentTarget.select()} />{' '}
-          <button type="button" className="btn btn-secondary" onClick={handleCopy}>
+          <Button type="button" variant="outline" className={`${touch} shrink-0`} onClick={handleCopy} aria-live="polite">
             {copied ? t.payments.copied : t.payments.copy}
-          </button>
-        </div>
-      </section>
+          </Button>
+        </CardContent>
+      </Card>
 
       {editable && (
-        <section className="ops-card">
-          <h3>{t.payments.testConnection}</h3>
-          <p className="muted">{t.payments.testHelp}</p>
-          <div>
-            <button type="button" className="btn btn-secondary" disabled={testing} onClick={handleTest}>
+        <Card size="sm">
+          <CardHeader>
+            <CardTitle>{t.payments.testConnection}</CardTitle>
+            <CardDescription>{t.payments.testHelp}</CardDescription>
+          </CardHeader>
+          <CardContent className="gap-3">
+            <Button type="button" variant="outline" className={`${touch} w-full sm:w-auto sm:self-start`} disabled={testing} onClick={handleTest}>
               {testing ? t.payments.testing : t.payments.testConnection}
-            </button>
-          </div>
-          {testResult && (
-            <p className={testResult.ok ? 'muted' : 'error-text'}>
-              {testResult.ok ? t.payments.testOk : t.payments.testFailed} {testResult.message}
-            </p>
-          )}
-        </section>
+            </Button>
+            {testResult && (
+              <Alert variant={testResult.ok ? 'default' : 'destructive'} role={testResult.ok ? 'status' : 'alert'}>
+                <AlertDescription>
+                  {testResult.ok ? t.payments.testOk : t.payments.testFailed} {testResult.message}
+                </AlertDescription>
+              </Alert>
+            )}
+          </CardContent>
+        </Card>
       )}
-    </form>
+    </div>
   )
 }

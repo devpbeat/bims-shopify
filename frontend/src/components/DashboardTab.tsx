@@ -1,32 +1,17 @@
+import { CircleAlertIcon, CircleCheckIcon } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { formatRelativeTime } from '../activity/activityFormat'
 import { getOpsJobs } from '../api/opsClient'
 import type { OpsJob } from '../api/opsTypes'
 import type { DashboardData, SyncStatus } from '../api/types'
 import { useT } from '../i18n'
-
-interface StatTileProps {
-  label: string
-  count: number
-  onClick: () => void
-}
-
-function StatTile({ label, count, onClick }: StatTileProps) {
-  const hasIssues = count > 0
-  return (
-    <button
-      type="button"
-      className={`dash-stat-tile${hasIssues ? ' dash-stat-tile--warn' : ' dash-stat-tile--ok'}`}
-      onClick={onClick}
-    >
-      <span className="dash-stat-count">{count}</span>
-      <span className="dash-stat-label">{label}</span>
-    </button>
-  )
-}
-
-function JobStatusDot({ status }: { status: string }) {
-  return <span className={`dash-job-dot dash-job-dot--${status}`} />
-}
+import { ResponsiveRecords } from './ResponsiveRecords'
+import type { RecordColumn } from './ResponsiveRecords'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { cn } from '@/lib/utils'
 
 interface DashboardTabProps {
   slug: string
@@ -39,6 +24,44 @@ interface DashboardTabProps {
   pendingCount: number
   adminToken: string | null
   onNavigate: (tab: 'duplicates' | 'unresolved' | 'mismatches' | 'operations') => void
+}
+
+interface MetricTileProps {
+  label: string
+  value: number | null
+  tone?: 'default' | 'warn'
+}
+
+/** One catalog counter. The label wraps instead of truncating. */
+function MetricTile({ label, value, tone = 'default' }: MetricTileProps) {
+  const { locale } = useT()
+  return (
+    <div
+      className={cn(
+        'flex flex-col-reverse justify-end gap-1 rounded-lg border bg-muted/30 p-3',
+        tone === 'warn' && 'border-amber-500/40 bg-amber-500/5',
+      )}
+    >
+      <dt className="text-xs leading-snug text-muted-foreground">{label}</dt>
+      <dd className="text-2xl leading-none font-semibold tabular-nums">{value === null ? '—' : value.toLocaleString(locale === 'es' ? 'es-419' : 'en-US')}</dd>
+    </div>
+  )
+}
+
+function IssueTile({ label, count, onClick }: { label: string; count: number; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'flex min-h-20 flex-col items-center justify-center gap-1 rounded-lg border p-3 text-center transition-colors hover:bg-muted focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none',
+        count > 0 ? 'border-amber-500/40 bg-amber-500/5' : 'bg-muted/30',
+      )}
+    >
+      <span className="text-2xl leading-none font-semibold tabular-nums">{count}</span>
+      <span className="text-xs leading-snug text-muted-foreground">{label}</span>
+    </button>
+  )
 }
 
 export function DashboardTab({
@@ -65,203 +88,185 @@ export function DashboardTab({
       .catch(() => {})
   }, [adminToken, slug])
 
-  const localeTag = locale === 'es' ? 'es-AR' : 'en-US'
+  const localeTag = locale === 'es' ? 'es-419' : 'en-US'
   const lastSync = dashboard?.last_sync.ran_at ?? syncStatus?.last_run_at
   const formattedSync = lastSync ? new Date(lastSync).toLocaleString(localeTag) : d.never
-  const relativeSync = lastSync ? formatRelative(lastSync, locale) : null
-
-  const lastSyncStatus = dashboard?.last_sync.status
-  const syncHealthy = lastSyncStatus === 'ok'
-
+  const relativeSync = lastSync ? formatRelativeTime(lastSync, locale) : null
+  const syncHealthy = dashboard?.last_sync.status === 'ok'
   const totalIssues = duplicatesCount + unresolvedCount + mismatchesCount
+  const { last_error: lastError, last_error_at: lastErrorAt, auto_import: autoImport, catalog } = dashboard ?? {}
 
-  const lastError = dashboard?.last_error
-  const lastErrorAt = dashboard?.last_error_at
-
-  const autoImport = dashboard?.auto_import
-  const catalog = dashboard?.catalog
+  const jobColumns: RecordColumn<OpsJob>[] = [
+    { id: 'command', header: t.operator.columns.command, cell: (job) => job.command },
+    {
+      id: 'status',
+      header: t.operator.columns.status,
+      cell: (job) => (
+        <Badge variant={job.status === 'failed' || job.status === 'interrupted' ? 'destructive' : 'secondary'}>
+          {(t.operator.jobStatus as Record<string, string>)[job.status] ?? job.status}
+        </Badge>
+      ),
+    },
+    {
+      id: 'time',
+      header: t.operator.columns.time,
+      cell: (job) => <span className="text-muted-foreground">{new Date(job.created_at).toLocaleString(localeTag)}</span>,
+    },
+  ]
 
   return (
-    <div className="dash-tab">
+    <div className="flex flex-col gap-4">
       {lastError && !errorDismissed && (
-        <div className="dash-error-banner">
-          <div>
-            <strong>{d.lastErrorTitle}</strong>
-            <p className="muted">{lastError}</p>
+        <Alert variant="destructive">
+          <CircleAlertIcon />
+          <AlertTitle>{d.lastErrorTitle}</AlertTitle>
+          <AlertDescription className="flex flex-col gap-3">
+            <span className="break-words">{lastError}</span>
             {lastErrorAt && (
-              <p className="muted">
+              <span>
                 {d.lastErrorAt}: {new Date(lastErrorAt).toLocaleString(localeTag)}
-              </p>
+              </span>
             )}
-          </div>
-          <button type="button" className="btn-link" onClick={() => setErrorDismissed(true)}>
-            {t.common.dismiss}
-          </button>
-        </div>
+            <Button type="button" variant="outline" className="h-11 self-start sm:h-9" onClick={() => setErrorDismissed(true)}>
+              {t.common.dismiss}
+            </Button>
+          </AlertDescription>
+        </Alert>
       )}
 
-      <div className="dash-row">
-        <div className="dash-card dash-card--sync">
-          <p className="label">{d.syncStatus}</p>
-          <div className="dash-sync-status">
-            <span className={`dash-health-dot${syncHealthy ? ' dash-health-dot--ok' : ' dash-health-dot--warn'}`} />
-            <span className="dash-sync-label">{syncHealthy ? d.healthy : d.needsAttention}</span>
-          </div>
-          <p className="muted">
-            {d.lastSync}: <strong>{relativeSync ?? formattedSync}</strong>
-          </p>
-          {relativeSync && <p className="muted">{formattedSync}</p>}
-          {dashboard?.last_sync.matched != null && (
-            <p className="muted">
-              {d.matched}: {dashboard.last_sync.matched} · {d.updated}: {dashboard.last_sync.updated}
+      <div className="grid gap-4 md:grid-cols-2">
+        <Card size="sm">
+          <CardHeader>
+            <CardTitle>{d.syncStatus}</CardTitle>
+          </CardHeader>
+          <CardContent className="gap-2">
+            <p className="flex items-center gap-2 font-medium">
+              {syncHealthy ? (
+                <CircleCheckIcon className="size-4 text-emerald-600" aria-hidden="true" />
+              ) : (
+                <CircleAlertIcon className="size-4 text-amber-600" aria-hidden="true" />
+              )}
+              {syncHealthy ? d.healthy : d.needsAttention}
             </p>
-          )}
-          <p className="muted">
-            {dashboard?.last_push
-              ? d.lastPush(dashboard.last_push.updated, new Date(dashboard.last_push.ran_at).toLocaleString(localeTag))
-              : d.lastPushNone}
-          </p>
-        </div>
-
-        <div className="dash-card dash-card--pending">
-          <p className="label">{d.pendingTitle}</p>
-          {pendingCount === 0 ? (
-            <p className="dash-pending-none">{d.pendingNone}</p>
-          ) : (
-            <p className="dash-pending-count">{d.pendingCount(pendingCount)}</p>
-          )}
-        </div>
-      </div>
-
-      <div className="dash-card">
-        <p className="label">{d.autoImportTitle}</p>
-        {autoImport ? (
-          <p className="muted">
-            {autoImport.enabled ? d.autoImportOn : d.autoImportOff}
-            {autoImport.enabled && (
-              <>
-                {' · '}
-                {d.autoImportInterval(autoImport.interval_minutes)}
-                {' · '}
-                {autoImport.only_with_stock ? d.autoImportOnlyWithStock : d.autoImportAllProducts}
-              </>
-            )}
-          </p>
-        ) : (
-          <p className="muted">{d.never}</p>
-        )}
-      </div>
-
-      <div className="dash-card">
-        <p className="label">{d.catalogTitle}</p>
-        {catalog && catalog.shopify_products != null ? (
-          <>
-            <div className="dash-stat-row">
-              <div className="dash-stat-tile dash-stat-tile--ok">
-                <span className="dash-stat-count">{catalog.bims_eligible_products}</span>
-                <span className="dash-stat-label">{d.catalogEligibleProducts}</span>
-              </div>
-              <div className="dash-stat-tile dash-stat-tile--ok">
-                <span className="dash-stat-count">{catalog.bims_with_stock}</span>
-                <span className="dash-stat-label">{d.catalogWithStock}</span>
-              </div>
-              <div className="dash-stat-tile dash-stat-tile--ok">
-                <span className="dash-stat-count">{catalog.shopify_products}</span>
-                <span className="dash-stat-label">{d.catalogProducts}</span>
-              </div>
-              <div className="dash-stat-tile dash-stat-tile--ok">
-                <span className="dash-stat-count">{catalog.shopify_variants}</span>
-                <span className="dash-stat-label">{d.catalogVariants}</span>
-              </div>
-              <div className="dash-stat-tile dash-stat-tile--ok">
-                <span className="dash-stat-count">{catalog.matched_skus}</span>
-                <span className="dash-stat-label">{d.catalogMatched}</span>
-              </div>
-              <div className="dash-stat-tile dash-stat-tile--warn">
-                <span className="dash-stat-count">{catalog.bims_not_in_shopify}</span>
-                <span className="dash-stat-label">{d.catalogNotInShopify}</span>
-              </div>
-            </div>
-            {catalog.checked_at && (
-              <p className="muted">
-                {d.catalogCheckedAt(formatRelative(catalog.checked_at, locale) ?? new Date(catalog.checked_at).toLocaleString(localeTag))}
+            <p className="text-muted-foreground">
+              {d.lastSync}: <span className="font-medium text-foreground">{relativeSync ?? formattedSync}</span>
+            </p>
+            {relativeSync && <p className="text-xs text-muted-foreground">{formattedSync}</p>}
+            {dashboard?.last_sync.matched != null && (
+              <p className="text-muted-foreground">
+                {d.matched}: {dashboard.last_sync.matched} · {d.updated}: {dashboard.last_sync.updated}
               </p>
             )}
-          </>
-        ) : (
-          <p className="muted">{catalog?.hint ?? d.catalogNoData}</p>
-        )}
+            <p className="text-muted-foreground">
+              {dashboard?.last_push
+                ? d.lastPush(dashboard.last_push.updated, new Date(dashboard.last_push.ran_at).toLocaleString(localeTag))
+                : d.lastPushNone}
+            </p>
+          </CardContent>
+        </Card>
+
+        <div className="flex flex-col gap-4">
+          <Card size="sm">
+            <CardHeader>
+              <CardTitle>{d.pendingTitle}</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className={pendingCount === 0 ? 'text-muted-foreground' : 'font-medium text-amber-700'}>
+                {pendingCount === 0 ? d.pendingNone : d.pendingCount(pendingCount)}
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card size="sm">
+            <CardHeader>
+              <CardTitle>{d.autoImportTitle}</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {autoImport ? (
+                <p className="flex flex-wrap items-center gap-2">
+                  <Badge variant={autoImport.enabled ? 'default' : 'secondary'}>
+                    {autoImport.enabled ? d.autoImportOn : d.autoImportOff}
+                  </Badge>
+                  {autoImport.enabled && (
+                    <span className="text-muted-foreground">
+                      {d.autoImportInterval(autoImport.interval_minutes)} ·{' '}
+                      {autoImport.only_with_stock ? d.autoImportOnlyWithStock : d.autoImportAllProducts}
+                    </span>
+                  )}
+                </p>
+              ) : (
+                <p className="text-muted-foreground">{d.never}</p>
+              )}
+            </CardContent>
+          </Card>
+        </div>
       </div>
 
-      {conflictsVisible && (
-        <div className="dash-card">
-          <p className="label">{d.issuesTitle}</p>
-          {totalIssues === 0 ? (
-            <p className="empty-state" style={{ padding: '12px 0' }}>{d.healthy} — no open issues</p>
+      <Card size="sm">
+        <CardHeader>
+          <CardTitle>{d.catalogTitle}</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {catalog && catalog.shopify_products != null ? (
+            <>
+              <dl className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
+                <MetricTile label={d.catalogEligibleProducts} value={catalog.bims_eligible_products} />
+                <MetricTile label={d.catalogWithStock} value={catalog.bims_with_stock} />
+                <MetricTile label={d.catalogProducts} value={catalog.shopify_products} />
+                <MetricTile label={d.catalogVariants} value={catalog.shopify_variants} />
+                <MetricTile label={d.catalogMatched} value={catalog.matched_skus} />
+                <MetricTile label={d.catalogNotInShopify} value={catalog.bims_not_in_shopify} tone="warn" />
+              </dl>
+              {catalog.checked_at && (
+                <p className="text-xs text-muted-foreground">
+                  {d.catalogCheckedAt(
+                    formatRelativeTime(catalog.checked_at, locale) ?? new Date(catalog.checked_at).toLocaleString(localeTag),
+                  )}
+                </p>
+              )}
+            </>
           ) : (
-            <div className="dash-stat-row">
-              <StatTile label={d.statDuplicates} count={duplicatesCount} onClick={() => onNavigate('duplicates')} />
-              <StatTile label={d.statUnresolved} count={unresolvedCount} onClick={() => onNavigate('unresolved')} />
-              <StatTile label={d.statMismatches} count={mismatchesCount} onClick={() => onNavigate('mismatches')} />
-            </div>
+            <p className="text-muted-foreground">{catalog?.hint ?? d.catalogNoData}</p>
           )}
-        </div>
+        </CardContent>
+      </Card>
+
+      {conflictsVisible && (
+        <Card size="sm">
+          <CardHeader>
+            <CardTitle>{d.issuesTitle}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {totalIssues === 0 ? (
+              <p className="text-muted-foreground">{d.noConflicts}</p>
+            ) : (
+              <div className="grid grid-cols-3 gap-3">
+                <IssueTile label={d.statDuplicates} count={duplicatesCount} onClick={() => onNavigate('duplicates')} />
+                <IssueTile label={d.statUnresolved} count={unresolvedCount} onClick={() => onNavigate('unresolved')} />
+                <IssueTile label={d.statMismatches} count={mismatchesCount} onClick={() => onNavigate('mismatches')} />
+              </div>
+            )}
+          </CardContent>
+        </Card>
       )}
 
       {adminToken && (
-        <div className="dash-card">
-          <div className="dash-card-header">
-            <p className="label">{d.recentJobsTitle}</p>
-            <button type="button" className="btn-link" onClick={() => onNavigate('operations')}>
+        <Card size="sm">
+          <CardHeader>
+            <CardTitle>{d.recentJobsTitle}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {recentJobs.length === 0 ? (
+              <p className="text-muted-foreground">{d.noJobs}</p>
+            ) : (
+              <ResponsiveRecords rows={recentJobs} columns={jobColumns} getKey={(job) => job.id} label={d.recentJobsTitle} />
+            )}
+            <Button type="button" variant="outline" className="h-11 w-full sm:h-9 sm:w-auto sm:self-start" onClick={() => onNavigate('operations')}>
               {d.viewAll}
-            </button>
-          </div>
-          {recentJobs.length === 0 ? (
-            <p className="muted">{d.noJobs}</p>
-          ) : (
-            <table className="ops-history-table">
-              <thead>
-                <tr>
-                  <th>{t.operator.columns.command}</th>
-                  <th>{t.operator.columns.status}</th>
-                  <th>{t.operator.columns.time}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recentJobs.map((job) => (
-                  <tr key={job.id}>
-                    <td>{job.command}</td>
-                    <td>
-                      <JobStatusDot status={job.status} />
-                      <span className={`badge badge-ops-${job.status}`}>
-                        {(t.operator.jobStatus as Record<string, string>)[job.status] ?? job.status}
-                      </span>
-                    </td>
-                    <td className="muted">{new Date(job.created_at).toLocaleString()}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
+            </Button>
+          </CardContent>
+        </Card>
       )}
     </div>
   )
-}
-
-function formatRelative(value: string, locale: 'es' | 'en'): string | null {
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return null
-  const diffMs = Date.now() - date.getTime()
-  const diffMinutes = Math.round(diffMs / 60000)
-  if (diffMinutes < 1) return locale === 'es' ? 'hace instantes' : 'just now'
-  if (diffMinutes < 60) {
-    return locale === 'es' ? `hace ${diffMinutes} min` : `${diffMinutes} min ago`
-  }
-  const diffHours = Math.round(diffMinutes / 60)
-  if (diffHours < 24) {
-    return locale === 'es' ? `hace ${diffHours} h` : `${diffHours} h ago`
-  }
-  const diffDays = Math.round(diffHours / 24)
-  return locale === 'es' ? `hace ${diffDays} d` : `${diffDays} d ago`
 }
