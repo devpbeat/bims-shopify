@@ -34,6 +34,7 @@ interface MetricTileProps {
 
 /** One catalog counter. The label wraps instead of truncating. */
 function MetricTile({ label, value, tone = 'default' }: MetricTileProps) {
+  const { locale } = useT()
   return (
     <div
       className={cn(
@@ -42,7 +43,7 @@ function MetricTile({ label, value, tone = 'default' }: MetricTileProps) {
       )}
     >
       <dt className="text-xs leading-snug text-muted-foreground">{label}</dt>
-      <dd className="text-2xl leading-none font-semibold tabular-nums">{value ?? '—'}</dd>
+      <dd className="text-2xl leading-none font-semibold tabular-nums">{value === null ? '—' : value.toLocaleString(locale === 'es' ? 'es-419' : 'en-US')}</dd>
     </div>
   )
 }
