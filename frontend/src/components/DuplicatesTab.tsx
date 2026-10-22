@@ -3,7 +3,8 @@ import type { DuplicateTargetRow, PendingQueue, Resolution } from '../api/types'
 import { useT } from '../i18n'
 import { findResolution, isLocked } from '../resolutionUtils'
 import { HelpModal, TabHelpHeader } from './HelpModal'
-import { StatusBadge } from './StatusBadge'
+import { RowStatus } from './StatusBadge'
+import { cn } from '@/lib/utils'
 
 interface DuplicatesTabProps {
   rows: DuplicateTargetRow[]
@@ -26,83 +27,74 @@ export function DuplicatesTab({ rows, resolutions, pending, onPick }: Duplicates
   const { t } = useT()
   const [helpOpen, setHelpOpen] = useState(false)
 
+  const header = (
+    <>
+      <TabHelpHeader onHelp={() => setHelpOpen(true)} label={t.tabs.duplicates} />
+      {helpOpen && <HelpModal section={t.help.duplicates} onClose={() => setHelpOpen(false)} />}
+    </>
+  )
+
   if (rows.length === 0) {
     return (
       <>
-        <TabHelpHeader onHelp={() => setHelpOpen(true)} label={t.tabs.duplicates} />
-        {helpOpen && <HelpModal section={t.help.duplicates} onClose={() => setHelpOpen(false)} />}
-        <p className="empty-state">{t.duplicates.empty}</p>
+        {header}
+        <p className="py-6 text-center text-sm text-muted-foreground">{t.duplicates.empty}</p>
       </>
     )
   }
 
-  const groups = groupBySku(rows)
-
   return (
     <div>
-      <TabHelpHeader onHelp={() => setHelpOpen(true)} label={t.tabs.duplicates} />
-      {helpOpen && <HelpModal section={t.help.duplicates} onClose={() => setHelpOpen(false)} />}
-      <div className="group-list">
-        {[...groups.entries()].map(([newSku, groupRows]) => (
-          <div className="group-card" key={newSku}>
-            <div className="group-card-header">
-              <span className="label">{t.duplicates.targetSku}</span>
-              <code>{newSku}</code>
-            </div>
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>{t.duplicates.colKeep}</th>
-                  <th>{t.duplicates.colProduct}</th>
-                  <th>{t.duplicates.colOldSku}</th>
-                  <th>{t.duplicates.colBimsName}</th>
-                  <th>{t.duplicates.colStatus}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {groupRows.map((row) => {
-                  const resolution = findResolution(resolutions, row.variant_id)
-                  const locked = isLocked(resolutions, row.variant_id)
-                  const pendingEntry = pending[row.variant_id]
-                  const checked = pendingEntry?.action === 'keep'
-                  return (
-                    <tr key={row.variant_id}>
-                      <td>
-                        <input
-                          type="radio"
-                          name={`dup-${newSku}`}
-                          checked={checked}
-                          disabled={locked}
-                          onChange={() =>
-                            onPick(
-                              row.variant_id,
-                              groupRows.map((sibling) => sibling.variant_id).filter((id) => id !== row.variant_id),
-                            )
-                          }
-                        />
-                      </td>
-                      <td>{row.product_title}</td>
-                      <td>
-                        <code>{row.old_sku}</code>
-                      </td>
-                      <td>{row.bims_name}</td>
-                      <td>
-                        {resolution ? (
-                          <StatusBadge status={resolution.status} />
-                        ) : pendingEntry ? (
-                          <span className="badge badge-queued">
-                            {pendingEntry.action === 'keep' ? t.common.queuedKeep : t.common.queuedDelete}
-                          </span>
-                        ) : (
-                          <span className="muted">{t.common.pendingDecision}</span>
-                        )}
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
+      {header}
+      <div className="flex flex-col gap-4">
+        {[...groupBySku(rows).entries()].map(([newSku, groupRows]) => (
+          <fieldset key={newSku} className="flex min-w-0 flex-col gap-2 rounded-lg border p-3">
+            <legend className="px-1 text-xs text-muted-foreground">
+              {t.duplicates.targetSku}: <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-foreground">{newSku}</code>
+            </legend>
+            {groupRows.map((row) => {
+              const resolution = findResolution(resolutions, row.variant_id)
+              const locked = isLocked(resolutions, row.variant_id)
+              const pendingEntry = pending[row.variant_id]
+              const checked = pendingEntry?.action === 'keep'
+              const queuedLabel = pendingEntry ? (pendingEntry.action === 'keep' ? t.common.queuedKeep : t.common.queuedDelete) : null
+              return (
+                <label
+                  key={row.variant_id}
+                  className={cn(
+                    'flex min-h-11 cursor-pointer items-start gap-3 rounded-md border p-3 has-focus-visible:ring-[3px] has-focus-visible:ring-ring/50',
+                    checked && 'border-primary bg-muted/50',
+                    locked && 'cursor-not-allowed opacity-70',
+                  )}
+                >
+                  <input
+                    type="radio"
+                    className="mt-0.5 size-5 shrink-0 accent-primary"
+                    name={`dup-${newSku}`}
+                    checked={checked}
+                    disabled={locked}
+                    aria-label={`${t.duplicates.colKeep}: ${row.product_title}`}
+                    onChange={() =>
+                      onPick(
+                        row.variant_id,
+                        groupRows.map((sibling) => sibling.variant_id).filter((id) => id !== row.variant_id),
+                      )
+                    }
+                  />
+                  <span className="flex min-w-0 flex-1 flex-col gap-1 text-sm">
+                    <span className="font-medium break-words">{row.product_title}</span>
+                    <span className="break-words text-muted-foreground">{row.bims_name}</span>
+                    <span className="text-xs text-muted-foreground">
+                      {t.duplicates.colOldSku}: <code className="font-mono text-foreground">{row.old_sku}</code>
+                    </span>
+                    <span className="mt-1">
+                      <RowStatus resolution={resolution} queuedLabel={queuedLabel} />
+                    </span>
+                  </span>
+                </label>
+              )
+            })}
+          </fieldset>
         ))}
       </div>
     </div>

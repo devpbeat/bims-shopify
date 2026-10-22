@@ -43,6 +43,7 @@ export const en: Messages = {
     openMenu: 'Open menu',
     menuDescription: 'Language, operator access and sign out.',
     missingSlug: 'Missing store identifier. Use a link like /portal/your-store.',
+    actions: 'Actions',
   },
   login: {
     title: 'Store portal',

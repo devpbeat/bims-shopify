@@ -43,6 +43,7 @@ export const es: Messages = {
     openMenu: 'Abrir menú',
     menuDescription: 'Idioma, acceso de operador y cierre de sesión.',
     missingSlug: 'Falta el identificador de la tienda. Use un enlace como /portal/su-tienda.',
+    actions: 'Acciones',
   },
   login: {
     title: 'Portal de la tienda',

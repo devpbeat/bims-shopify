@@ -1,3 +1,4 @@
+import { CircleHelpIcon } from 'lucide-react'
 import { useT } from '../i18n'
 import type { HelpSection } from '../i18n/types'
 import { Button } from '@/components/ui/button'
@@ -46,19 +47,15 @@ export function HelpModal({ section, onClose }: HelpModalProps) {
   )
 }
 
-export function HelpButton({ onClick, label }: { onClick: () => void; label: string }) {
-  return (
-    <button type="button" className="help-button" onClick={onClick} aria-label={label} title={label}>
-      ?
-    </button>
-  )
-}
-
 export function TabHelpHeader({ onHelp, label }: { onHelp: () => void; label: string }) {
+  const { t } = useT()
   return (
-    <div className="tab-help-row">
-      <span className="tab-help-title">{label}</span>
-      <HelpButton onClick={onHelp} label={label} />
+    <div className="mb-3 flex items-center justify-between gap-2">
+      <h2 className="text-sm font-semibold">{label}</h2>
+      <Button type="button" variant="outline" className="h-11 sm:h-9" onClick={onHelp}>
+        <CircleHelpIcon />
+        {t.common.viewGuide}
+      </Button>
     </div>
   )
 }

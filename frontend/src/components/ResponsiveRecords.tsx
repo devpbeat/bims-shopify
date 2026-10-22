@@ -58,7 +58,11 @@ export function ResponsiveRecords<T>({ rows, columns, getKey, label, actions, ac
                   {column.cell(row)}
                 </TableCell>
               ))}
-              {actions && <TableCell>{actions(row)}</TableCell>}
+              {actions && (
+                <TableCell>
+                  <div className="flex justify-end gap-2">{actions(row)}</div>
+                </TableCell>
+              )}
             </TableRow>
           ))}
         </TableBody>

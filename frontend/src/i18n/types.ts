@@ -54,6 +54,7 @@ export interface Messages {
     openMenu: string
     menuDescription: string
     missingSlug: string
+    actions: string
   }
   login: {
     title: string
