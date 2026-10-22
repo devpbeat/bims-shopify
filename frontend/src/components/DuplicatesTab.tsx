@@ -50,7 +50,7 @@ export function DuplicatesTab({ rows, resolutions, pending, onPick }: Duplicates
         {[...groupBySku(rows).entries()].map(([newSku, groupRows]) => (
           <fieldset key={newSku} className="flex min-w-0 flex-col gap-2 rounded-lg border p-3">
             <legend className="px-1 text-xs text-muted-foreground">
-              {t.duplicates.targetSku}: <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-foreground">{newSku}</code>
+              {t.duplicates.targetSku}: <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground">{newSku}</code>
             </legend>
             {groupRows.map((row) => {
               const resolution = findResolution(resolutions, row.variant_id)
@@ -85,7 +85,7 @@ export function DuplicatesTab({ rows, resolutions, pending, onPick }: Duplicates
                     <span className="font-medium break-words">{row.product_title}</span>
                     <span className="break-words text-muted-foreground">{row.bims_name}</span>
                     <span className="text-xs text-muted-foreground">
-                      {t.duplicates.colOldSku}: <code className="font-mono text-foreground">{row.old_sku}</code>
+                      {t.duplicates.colOldSku}: <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground">{row.old_sku}</code>
                     </span>
                     <span className="mt-1">
                       <RowStatus resolution={resolution} queuedLabel={queuedLabel} />

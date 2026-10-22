@@ -39,7 +39,7 @@ export function UnresolvedTab({ rows, resolutions, pending, onIgnore }: Unresolv
 
   const columns: RecordColumn<UnresolvedRow>[] = [
     { id: 'product', header: t.unresolved.colProduct, cell: (row) => row.product_title },
-    { id: 'sku', header: t.unresolved.colSku, cell: (row) => <code className="font-mono text-xs">{row.sku}</code> },
+    { id: 'sku', header: t.unresolved.colSku, cell: (row) => <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{row.sku}</code> },
     {
       id: 'note',
       header: t.unresolved.colNote,

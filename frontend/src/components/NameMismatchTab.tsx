@@ -39,8 +39,8 @@ export function NameMismatchTab({ rows, resolutions, pending, onApprove, onIgnor
   const columns: RecordColumn<NameMismatchRow>[] = [
     { id: 'product', header: t.mismatches.colProduct, cell: (row) => row.product_title },
     { id: 'bims', header: t.mismatches.colBimsName, cell: (row) => row.bims_name },
-    { id: 'old', header: t.mismatches.colOldSku, cell: (row) => <code className="font-mono text-xs">{row.old_sku}</code> },
-    { id: 'new', header: t.mismatches.colNewSku, cell: (row) => <code className="font-mono text-xs">{row.new_sku}</code> },
+    { id: 'old', header: t.mismatches.colOldSku, cell: (row) => <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{row.old_sku}</code> },
+    { id: 'new', header: t.mismatches.colNewSku, cell: (row) => <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{row.new_sku}</code> },
     {
       id: 'status',
       header: t.mismatches.colStatus,
