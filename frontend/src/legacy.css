@@ -198,41 +198,6 @@ code {
   color: var(--legacy-warning);
 }
 
-.badge-actor-admin {
-  background: rgba(37, 99, 235, 0.12);
-  color: var(--legacy-primary);
-}
-
-.badge-actor-portal {
-  background: rgba(22, 163, 74, 0.12);
-  color: var(--legacy-success);
-}
-
-.badge-actor-system {
-  background: rgba(107, 114, 128, 0.15);
-  color: var(--legacy-muted);
-}
-
-.badge-actor-shopify {
-  background: rgba(217, 119, 6, 0.12);
-  color: var(--legacy-warning);
-}
-
-.load-more {
-  margin-top: 16px;
-  padding: 8px 16px;
-  border: 1px solid var(--legacy-border);
-  border-radius: 6px;
-  background: var(--legacy-surface);
-  cursor: pointer;
-  font-size: 13px;
-}
-
-.load-more:disabled {
-  cursor: default;
-  opacity: 0.6;
-}
-
 .empty-state {
   color: var(--legacy-muted);
   font-size: 14px;

@@ -1,3 +1,5 @@
+import type { MetricId } from '../activity/activityFormat'
+
 export type Locale = 'es' | 'en'
 
 export interface HelpSection {
@@ -146,10 +148,27 @@ export interface Messages {
     colStatus: string
   }
   activity: {
-    colTime: string
-    colActor: string
-    colAction: string
-    colDetail: string
+    listLabel: string
+    originLabel: string
+    origins: Record<'admin' | 'portal' | 'system' | 'shopify', string>
+    unknownAction: string
+    actions: Record<string, string>
+    metrics: Record<MetricId, string>
+    yes: string
+    no: string
+    noSummary: string
+    viewDetails: (action: string) => string
+    detailsTitle: string
+    detailsDescription: string
+    timestampLabel: string
+    entityLabel: string
+    entityIdLabel: string
+    actionCodeLabel: string
+    rawPayloadTitle: string
+    rawPayloadNote: string
+    noPayload: string
+    copyHint: string
+    showing: (count: number) => string
   }
   help: {
     modalTitleSuffix: string
