@@ -25,6 +25,7 @@ import { clearToken, loadToken, saveToken } from './session'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent } from '@/components/ui/tabs'
+import { cn } from '@/lib/utils'
 
 type Tab = 'dashboard' | 'duplicates' | 'unresolved' | 'mismatches' | 'activity' | 'payments' | 'paymentsReport' | 'operations'
 
@@ -313,7 +314,10 @@ export function PortalPage() {
 
           <TabsContent
             value={tab}
-            className="min-h-60 min-w-0 flex-none overflow-x-auto rounded-xl border bg-card p-3 text-card-foreground shadow-sm sm:p-4"
+            className={cn(
+              'min-w-0 flex-none',
+              tab !== 'dashboard' && 'min-h-60 rounded-xl border bg-card p-3 text-card-foreground shadow-sm sm:p-4',
+            )}
           >
           {tab === 'dashboard' && (
             <DashboardTab
