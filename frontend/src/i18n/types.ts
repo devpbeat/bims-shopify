@@ -48,6 +48,9 @@ export interface Messages {
     viewGuide: string
     dismiss: string
     languageToggleLabel: string
+    menu: string
+    openMenu: string
+    menuDescription: string
   }
   login: {
     title: string
@@ -68,6 +71,7 @@ export interface Messages {
     activity: string
     payments: string
     paymentsReport: string
+    navLabel: string
   }
   dashboard: {
     syncStatus: string
@@ -158,6 +162,7 @@ export interface Messages {
     gateTitle: string
     gatePrompt: (slug: string) => string
     tokenPlaceholder: string
+    tokenLabel: string
     enter: string
     invalidToken: string
     exit: string
