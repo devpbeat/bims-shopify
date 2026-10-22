@@ -194,6 +194,10 @@ export interface Messages {
     jobHistoryTitle: string
     noJobs: string
     resultLabel: string
+    progressLabel: string
+    historyLoadFailed: string
+    runFailed: string
+    viewJobDetails: string
     runButton: string
     running: string
     jobAlreadyRunning: string
