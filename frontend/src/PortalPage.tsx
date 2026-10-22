@@ -29,6 +29,9 @@ import { cn } from '@/lib/utils'
 
 type Tab = 'dashboard' | 'duplicates' | 'unresolved' | 'mismatches' | 'activity' | 'payments' | 'paymentsReport' | 'operations'
 
+// These tabs lay out their own cards; the others render inside a shared surface.
+const SELF_CONTAINED_TABS: Tab[] = ['dashboard', 'payments', 'paymentsReport', 'operations']
+
 function tokenFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get('token')
 }
@@ -316,7 +319,7 @@ export function PortalPage() {
             value={tab}
             className={cn(
               'min-w-0 flex-none',
-              tab !== 'dashboard' && 'min-h-60 rounded-xl border bg-card p-3 text-card-foreground shadow-sm sm:p-4',
+              !SELF_CONTAINED_TABS.includes(tab) && 'min-h-60 rounded-xl border bg-card p-3 text-card-foreground shadow-sm sm:p-4',
             )}
           >
           {tab === 'dashboard' && (
