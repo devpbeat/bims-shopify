@@ -53,16 +53,20 @@ export interface Messages {
     menu: string
     openMenu: string
     menuDescription: string
+    missingSlug: string
   }
   login: {
     title: string
     subtitle: (slug: string) => string
+    emailLabel: string
     emailPlaceholder: string
+    passwordLabel: string
     passwordPlaceholder: string
     tooManyAttempts: string
     invalidCredentials: string
     loginFailedGeneric: string
     accessKeyPrompt: (slug: string) => string
+    accessKeyLabel: string
     accessKeyPlaceholder: string
   }
   tabs: {

@@ -2,7 +2,11 @@ import { useState } from 'react'
 import type { FormEvent } from 'react'
 import { ApiError, login } from '../api/client'
 import { useT } from '../i18n'
-import { LanguageToggle } from './LanguageToggle'
+import { AuthLayout } from './AuthLayout'
+import { Field } from './Field'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 
 interface LoginCardProps {
   slug: string
@@ -39,40 +43,47 @@ export function LoginCard({ slug, onSuccess, onUseAccessKey }: LoginCardProps) {
   }
 
   return (
-    <div className="centered-page">
-      <form className="token-card" onSubmit={handleSubmit}>
-        <div className="token-card-top">
-          <h1>{t.login.title}</h1>
-          <LanguageToggle />
-        </div>
-        <p className="muted">{t.login.subtitle(slug)}</p>
-        <input
-          type="email"
-          autoFocus
-          placeholder={t.login.emailPlaceholder}
-          value={email}
-          autoComplete="username"
-          onChange={(event) => setEmail(event.target.value)}
-        />
-        <input
-          type="password"
-          placeholder={t.login.passwordPlaceholder}
-          value={password}
-          autoComplete="current-password"
-          onChange={(event) => setPassword(event.target.value)}
-        />
-        {error && <p className="error-text">{error}</p>}
-        <button
-          type="submit"
-          className="btn btn-primary"
-          disabled={submitting || !email.trim() || !password}
-        >
+    <AuthLayout title={t.login.title} description={t.login.subtitle(slug)}>
+      <form className="flex flex-col gap-4" onSubmit={handleSubmit}>
+        <Field label={t.login.emailLabel}>
+          {(control) => (
+            <Input
+              {...control}
+              className="h-11 sm:h-9"
+              type="email"
+              autoFocus
+              placeholder={t.login.emailPlaceholder}
+              value={email}
+              autoComplete="username"
+              onChange={(event) => setEmail(event.target.value)}
+            />
+          )}
+        </Field>
+        <Field label={t.login.passwordLabel}>
+          {(control) => (
+            <Input
+              {...control}
+              className="h-11 sm:h-9"
+              type="password"
+              placeholder={t.login.passwordPlaceholder}
+              value={password}
+              autoComplete="current-password"
+              onChange={(event) => setPassword(event.target.value)}
+            />
+          )}
+        </Field>
+        {error && (
+          <Alert variant="destructive" role="alert">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+        <Button type="submit" className="h-11 sm:h-9" disabled={submitting || !email.trim() || !password}>
           {submitting ? t.common.signingIn : t.common.signIn}
-        </button>
-        <button type="button" className="btn-link" onClick={onUseAccessKey}>
+        </Button>
+        <Button type="button" variant="link" className="h-11 sm:h-9" onClick={onUseAccessKey}>
           {t.common.haveAccessKey}
-        </button>
+        </Button>
       </form>
-    </div>
+    </AuthLayout>
   )
 }

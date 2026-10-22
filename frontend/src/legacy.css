@@ -14,39 +14,6 @@
   color-scheme: light;
 }
 
-.centered-page {
-  min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-}
-
-.token-card {
-  background: var(--legacy-surface);
-  border: 1px solid var(--legacy-border);
-  border-radius: var(--legacy-radius);
-  box-shadow: var(--legacy-shadow-sm);
-  padding: 32px;
-  width: 100%;
-  max-width: 360px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.token-card h1 {
-  margin: 0;
-  font-size: 20px;
-}
-
-.token-card input {
-  padding: 10px 12px;
-  border: 1px solid var(--legacy-border);
-  border-radius: var(--legacy-radius);
-  font-size: 14px;
-}
-
 .muted {
   color: var(--legacy-muted);
   font-size: 14px;
@@ -216,18 +183,6 @@ code {
   border: 1px solid rgba(220, 38, 38, 0.24);
   border-radius: var(--legacy-radius);
   padding: 10px 14px;
-}
-
-.token-card-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.token-card-top h1 {
-  margin: 0;
-  font-size: 20px;
 }
 
 .tab-help-row {
