@@ -472,32 +472,6 @@ code {
   color: var(--legacy-danger);
 }
 
-/* Payments report */
-.payments-filters {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  align-items: flex-end;
-}
-
-.payments-tiles {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 12px;
-}
-
-.payments-tile {
-  background: var(--legacy-surface);
-  border: 1px solid var(--legacy-border);
-  border-left-width: 4px;
-  border-radius: var(--legacy-radius);
-  box-shadow: var(--legacy-shadow-sm);
-  padding: 12px 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
 .payments-tile-value {
   font-size: 20px;
   font-weight: 600;
@@ -507,34 +481,3 @@ code {
 .payments-tile-pending { border-left-color: var(--legacy-warning); }
 .payments-tile-failed { border-left-color: var(--legacy-danger); }
 .payments-tile-cancelled { border-left-color: var(--legacy-muted); }
-
-.payments-chart {
-  width: 100%;
-  height: auto;
-}
-
-.payments-chart-grid {
-  stroke: var(--legacy-border);
-  stroke-width: 1;
-}
-
-.payments-chart-bar {
-  fill: var(--legacy-primary);
-}
-
-.payments-chart-tick,
-.payments-chart-axis {
-  fill: var(--legacy-muted);
-  font-size: 11px;
-}
-
-.payments-pagination {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-}
-
-.num {
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
