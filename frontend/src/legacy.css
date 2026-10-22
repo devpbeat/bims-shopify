@@ -75,63 +75,11 @@
   color: var(--legacy-muted);
 }
 
-.data-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 14px;
-}
-
-.data-table th {
-  text-align: left;
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  color: var(--legacy-muted);
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--legacy-border);
-}
-
-.data-table td {
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--legacy-border);
-  vertical-align: middle;
-}
-
-.data-table tr:last-child td {
-  border-bottom: none;
-}
-
-.data-table input[type='text'] {
-  width: 100%;
-  padding: 6px 8px;
-  border: 1px solid var(--legacy-border);
-  border-radius: 6px;
-  font-size: 13px;
-}
-
-.row-actions {
-  display: flex;
-  gap: 8px;
-}
-
 code {
   background: var(--legacy-bg);
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 12px;
-}
-
-.group-list {
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-}
-
-.group-card-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
 }
 
 .badge {
@@ -144,83 +92,11 @@ code {
   color: var(--legacy-muted);
 }
 
-.badge-applied,
-.badge-recorded {
-  background: rgba(22, 163, 74, 0.12);
-  color: var(--legacy-success);
-}
-
-.badge-failed {
-  background: rgba(220, 38, 38, 0.12);
-  color: var(--legacy-danger);
-}
-
-.badge-already_resolved {
-  background: rgba(107, 114, 128, 0.15);
-  color: var(--legacy-muted);
-}
-
-.badge-queued {
-  background: rgba(217, 119, 6, 0.12);
-  color: var(--legacy-warning);
-}
-
 .empty-state {
   color: var(--legacy-muted);
   font-size: 14px;
   padding: 24px 0;
   text-align: center;
-}
-
-.error-text,
-.error-banner {
-  color: var(--legacy-danger);
-  font-size: 14px;
-}
-
-.error-banner {
-  background: rgba(220, 38, 38, 0.08);
-  border: 1px solid rgba(220, 38, 38, 0.24);
-  border-radius: var(--legacy-radius);
-  padding: 10px 14px;
-}
-
-.tab-help-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.tab-help-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--legacy-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-}
-
-.help-button {
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  border: 1px solid var(--legacy-border);
-  background: var(--legacy-bg);
-  color: var(--legacy-muted);
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-}
-
-.help-button:hover {
-  background: var(--legacy-primary);
-  color: white;
-  border-color: var(--legacy-primary);
 }
 
 .modal-overlay {
@@ -245,62 +121,6 @@ code {
   flex-direction: column;
 }
 
-.modal-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--legacy-border);
-}
-
-.modal-header h2 {
-  margin: 0;
-  font-size: 18px;
-}
-
-.modal-close {
-  font-size: 16px;
-  padding: 0 4px;
-}
-
-.modal-body {
-  padding: 20px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  font-size: 14px;
-  line-height: 1.5;
-}
-
-.modal-body p {
-  margin: 0;
-}
-
-.modal-highlight {
-  background: rgba(217, 119, 6, 0.1);
-  border: 1px solid rgba(217, 119, 6, 0.28);
-  border-radius: var(--legacy-radius);
-  padding: 12px 14px;
-}
-
-.modal-highlight strong {
-  display: block;
-  margin-bottom: 4px;
-  color: var(--legacy-warning);
-}
-
-.modal-highlight p {
-  margin: 0;
-}
-
-.modal-footer {
-  padding: 12px 20px;
-  border-top: 1px solid var(--legacy-border);
-  display: flex;
-  justify-content: flex-end;
-}
-
 .btn-danger {
   background: var(--legacy-danger);
   color: white;
@@ -315,13 +135,6 @@ code {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 16px;
-}
-
-.operator-gate-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(16, 24, 40, 0.5);
-  z-index: 20;
 }
 
 .ops-tab {
@@ -472,3 +285,8 @@ code {
   color: var(--legacy-danger);
 }
 
+
+.error-text {
+  color: var(--legacy-danger);
+  font-size: 14px;
+}
