@@ -472,12 +472,3 @@ code {
   color: var(--legacy-danger);
 }
 
-.payments-tile-value {
-  font-size: 20px;
-  font-weight: 600;
-}
-
-.payments-tile-paid { border-left-color: var(--legacy-success); }
-.payments-tile-pending { border-left-color: var(--legacy-warning); }
-.payments-tile-failed { border-left-color: var(--legacy-danger); }
-.payments-tile-cancelled { border-left-color: var(--legacy-muted); }
