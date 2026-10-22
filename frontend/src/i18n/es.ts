@@ -4,14 +4,14 @@ export const es: Messages = {
   common: {
     signIn: 'Iniciar sesión',
     signingIn: 'Iniciando sesión…',
-    haveAccessKey: '¿Tenés una clave de acceso?',
+    haveAccessKey: '¿Tiene una clave de acceso?',
     backToLogin: 'Volver a inicio de sesión con email y contraseña',
     continueLabel: 'Continuar',
     logout: 'Cerrar sesión',
     lastSync: 'Última sincronización',
     never: 'Nunca',
     loadingReport: 'Cargando reporte de reconciliación…',
-    sessionExpired: 'La sesión expiró o las credenciales no son válidas. Iniciá sesión nuevamente.',
+    sessionExpired: 'La sesión expiró o las credenciales no son válidas. Inicie sesión nuevamente.',
     loadFailed: 'No se pudo cargar el reporte de reconciliación.',
     applyFailed: 'No se pudieron aplicar las resoluciones.',
     noReport: 'No se encontró un reporte de reconciliación para esta tienda.',
@@ -47,12 +47,12 @@ export const es: Messages = {
   },
   login: {
     title: 'Portal de la tienda',
-    subtitle: (slug) => `Iniciá sesión en "${slug}" con tu email y contraseña.`,
+    subtitle: (slug) => `Inicie sesión en "${slug}" con su correo electrónico y contraseña.`,
     emailLabel: 'Correo electrónico',
     passwordLabel: 'Contraseña',
     emailPlaceholder: 'Email',
     passwordPlaceholder: 'Contraseña',
-    tooManyAttempts: 'Demasiados intentos de inicio de sesión. Esperá un minuto e intentá de nuevo.',
+    tooManyAttempts: 'Demasiados intentos de inicio de sesión. Espere un minuto e intente de nuevo.',
     invalidCredentials: 'Email o contraseña inválidos.',
     loginFailedGeneric: 'No se pudo iniciar sesión.',
     accessKeyPrompt: (slug) => `Ingrese el token de acceso para "${slug}" para continuar.`,
@@ -102,7 +102,7 @@ export const es: Messages = {
     catalogVariants: 'En Shopify (variantes)',
     catalogMatched: 'SKUs coincidentes',
     catalogNotInShopify: 'En BIMS sin Shopify',
-    catalogNoData: 'Todavía no se ejecutó una reconciliación. Corré "Estado" para generar una.',
+    catalogNoData: 'Todavía no se ejecutó una reconciliación. Ejecute "Estado" para generar una.',
     catalogCheckedAt: (relative) => `Actualizado ${relative}`,
     noConflicts: 'No hay conflictos pendientes.',
     lastPush: (n, date) => `Última actualización de stock: ${n} producto${n === 1 ? '' : 's'} · ${date}`,
@@ -262,7 +262,7 @@ export const es: Messages = {
       howAutoResolves:
         'La reconciliación automática elige una variante como sobreviviente (la que tiene el SKU correcto de BIMS) y elimina o desactiva la variante duplicada, para que el stock deje de contarse dos veces.',
       manualActions:
-        'Si preferís resolverlo manualmente: el botón "Mantener" marca qué variante querés conservar; las demás del mismo grupo quedan en cola para eliminarse.',
+        'Si prefiere resolverlo manualmente: el botón "Mantener" marca qué variante desea conservar; las demás del mismo grupo quedan en cola para eliminarse.',
       ifNothingDoneTitle: '¿Qué pasa si no se hace nada?',
       ifNothingDone:
         'El stock aparente se duplica: el mismo producto figura con el doble de unidades disponibles de las que realmente existen.',
@@ -327,7 +327,7 @@ export const es: Messages = {
     syncForceWarning:
       'Forzar ignora tanto la marca de agua desactualizada como el resguardo de seguridad por corrida (ratio de ceros / máximo de cambios), y vuelve a enviar cada SKU con stock resoluble aunque parezca sin cambios. Usar después de vaciar y reconstruir la tienda.',
     autoResolve: 'Auto-resolver',
-    typeDomainToConfirm: (domain) => `Escribí "${domain}" para confirmar esta acción destructiva.`,
+    typeDomainToConfirm: (domain) => `Escriba "${domain}" para confirmar esta acción destructiva.`,
     domainMismatch: 'El valor ingresado no coincide con el dominio de la tienda.',
     cleanupMode: 'Modo',
     cleanupModeDraft: 'Borrador (cambiar a estado Draft)',
@@ -382,12 +382,12 @@ export const es: Messages = {
           'Ordena la tienda eliminando productos muertos que BIMS no permite borrar: busca productos de Shopify con stock cero confirmado en BIMS y los pasa a Draft, o los elimina permanentemente.',
         confirmApplyDraft: 'Esto pasará a estado Draft los productos sin stock listados. ¿Continuar?',
         confirmApplyDelete:
-          'DESTRUCTIVO: esto ELIMINARÁ PERMANENTEMENTE los productos sin stock listados de Shopify. Esta acción no se puede deshacer. ¿Continuar?',
+          'Acción destructiva: esto eliminará de forma permanente los productos sin stock listados de Shopify. Esta acción no se puede deshacer. ¿Continuar?',
       },
       publish: {
         title: 'Publicar productos en borrador',
         description:
-          'Publica productos en estado Draft que son seguros para mostrar a los clientes (al menos una imagen Y stock confirmado en BIMS) en la tienda online: los marca como Active y los agrega al canal de ventas Online Store. Usá el límite para publicar un lote pequeño primero y probar el checkout de punta a punta.',
+          'Publica productos en estado Draft que son seguros para mostrar a los clientes (al menos una imagen y stock confirmado en BIMS) en la tienda online: los marca como Active y los agrega al canal de ventas Online Store. Use el límite para publicar un lote pequeño primero y probar el checkout de punta a punta.',
         confirmApply: 'Esto publicará los productos listados en la tienda online. ¿Continuar?',
         confirmApplyNoImages:
           'Esto publicará los productos listados en la tienda online, incluyendo productos sin imágenes. ¿Continuar?',
