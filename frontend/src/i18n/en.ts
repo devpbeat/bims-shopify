@@ -39,6 +39,9 @@ export const en: Messages = {
     viewGuide: 'View guide',
     dismiss: 'Got it',
     languageToggleLabel: 'Language',
+    menu: 'Menu',
+    openMenu: 'Open menu',
+    menuDescription: 'Language, operator access and sign out.',
   },
   login: {
     title: 'Store portal',
@@ -59,6 +62,7 @@ export const en: Messages = {
     activity: 'Activity',
     payments: 'Payments',
     paymentsReport: 'Payments report',
+    navLabel: 'Sections',
   },
   dashboard: {
     syncStatus: 'Sync status',
@@ -177,6 +181,7 @@ export const en: Messages = {
     gateTitle: 'Operator access',
     gatePrompt: (slug) => `Enter the admin token to manage operations for "${slug}".`,
     tokenPlaceholder: 'Admin token',
+    tokenLabel: 'Admin token',
     enter: 'Enter',
     invalidToken: 'Invalid or expired admin token.',
     exit: 'Exit operator mode',

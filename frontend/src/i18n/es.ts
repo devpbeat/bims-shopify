@@ -39,6 +39,9 @@ export const es: Messages = {
     viewGuide: 'Ver guía',
     dismiss: 'Entendido',
     languageToggleLabel: 'Idioma',
+    menu: 'Menú',
+    openMenu: 'Abrir menú',
+    menuDescription: 'Idioma, acceso de operador y cierre de sesión.',
   },
   login: {
     title: 'Portal de la tienda',
@@ -48,7 +51,7 @@ export const es: Messages = {
     tooManyAttempts: 'Demasiados intentos de inicio de sesión. Esperá un minuto e intentá de nuevo.',
     invalidCredentials: 'Email o contraseña inválidos.',
     loginFailedGeneric: 'No se pudo iniciar sesión.',
-    accessKeyPrompt: (slug) => `Ingresá el token de acceso para "${slug}" para continuar.`,
+    accessKeyPrompt: (slug) => `Ingrese el token de acceso para "${slug}" para continuar.`,
     accessKeyPlaceholder: 'Token de acceso del portal',
   },
   tabs: {
@@ -59,6 +62,7 @@ export const es: Messages = {
     activity: 'Actividad',
     payments: 'Pagos',
     paymentsReport: 'Reporte de pagos',
+    navLabel: 'Secciones',
   },
   dashboard: {
     syncStatus: 'Estado de sincronización',
@@ -180,8 +184,9 @@ export const es: Messages = {
   operator: {
     entryLabel: 'Acceso de operador',
     gateTitle: 'Acceso de operador',
-    gatePrompt: (slug) => `Ingresá el token de administrador para gestionar operaciones de "${slug}".`,
+    gatePrompt: (slug) => `Ingrese el token de administrador para gestionar operaciones de "${slug}".`,
     tokenPlaceholder: 'Token de administrador',
+    tokenLabel: 'Token de administrador',
     enter: 'Ingresar',
     invalidToken: 'El token de administrador es inválido o expiró.',
     exit: 'Salir del modo operador',

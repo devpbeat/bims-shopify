@@ -1,5 +1,14 @@
 import { useT } from '../i18n'
 import type { HelpSection } from '../i18n/types'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 
 interface HelpModalProps {
   section: HelpSection
@@ -10,32 +19,30 @@ export function HelpModal({ section, onClose }: HelpModalProps) {
   const { t } = useT()
 
   return (
-    <div className="modal-overlay" role="dialog" aria-modal="true" aria-label={section.title} onClick={onClose}>
-      <div className="modal-card" onClick={(event) => event.stopPropagation()}>
-        <div className="modal-header">
-          <h2>
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>
             {section.title} {t.help.modalTitleSuffix}
-          </h2>
-          <button type="button" className="btn-link modal-close" onClick={onClose} aria-label={t.common.close}>
-            ✕
-          </button>
-        </div>
-        <div className="modal-body">
+          </DialogTitle>
+          <DialogDescription className="sr-only">{section.title}</DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-3 text-sm leading-relaxed">
           <p>{section.what}</p>
           <p>{section.howAutoResolves}</p>
           <p>{section.manualActions}</p>
-          <div className="modal-highlight">
+          <div className="rounded-lg border bg-muted/50 p-3">
             <strong>{section.ifNothingDoneTitle}</strong>
-            <p>{section.ifNothingDone}</p>
+            <p className="mt-1">{section.ifNothingDone}</p>
           </div>
         </div>
-        <div className="modal-footer">
-          <button type="button" className="btn btn-primary" onClick={onClose}>
+        <DialogFooter>
+          <Button type="button" className="h-11 sm:h-9" onClick={onClose}>
             {t.common.close}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 

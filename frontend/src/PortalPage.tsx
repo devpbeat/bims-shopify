@@ -15,11 +15,16 @@ import { PaymentsReportTab } from './components/PaymentsReportTab'
 import { PaymentsTab } from './components/PaymentsTab'
 import { OperatorGate } from './components/OperatorGate'
 import { PortalHeader } from './components/PortalHeader'
+import { PortalNav } from './components/PortalNav'
+import type { PortalNavItem } from './components/PortalNav'
 import { TokenGate } from './components/TokenGate'
 import { UnresolvedTab } from './components/UnresolvedTab'
 import { useT } from './i18n'
 import { clearAdminToken, loadAdminToken, saveAdminToken } from './adminSession'
 import { clearToken, loadToken, saveToken } from './session'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Skeleton } from '@/components/ui/skeleton'
+import { Tabs, TabsContent } from '@/components/ui/tabs'
 
 type Tab = 'dashboard' | 'duplicates' | 'unresolved' | 'mismatches' | 'activity' | 'payments' | 'paymentsReport' | 'operations'
 
@@ -215,24 +220,29 @@ export function PortalPage() {
 
   if (loading && !dashboard) {
     return (
-      <div className="centered-page">
-        <p>{t.common.loadingReport}</p>
+      <div className="mx-auto flex min-h-dvh w-full max-w-5xl flex-col gap-4 p-4 sm:p-6" role="status" aria-live="polite">
+        <p className="text-sm text-muted-foreground">{t.common.loadingReport}</p>
+        <Skeleton className="h-12 w-full" />
+        <Skeleton className="h-10 w-full" />
+        <Skeleton className="h-48 w-full" />
       </div>
     )
   }
 
   if (error && !dashboard) {
     return (
-      <div className="centered-page">
-        <p className="error-text">{error}</p>
+      <div className="mx-auto flex min-h-dvh w-full max-w-md items-center p-4">
+        <Alert variant="destructive">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
       </div>
     )
   }
 
   if (!dashboard) {
     return (
-      <div className="centered-page">
-        <p className="empty-state">{t.common.noReport}</p>
+      <div className="mx-auto flex min-h-dvh w-full max-w-md items-center justify-center p-4">
+        <p className="text-sm text-muted-foreground">{t.common.noReport}</p>
       </div>
     )
   }
@@ -250,8 +260,23 @@ export function PortalPage() {
   const guideSection =
     tab === 'unresolved' ? t.help.unresolved : tab === 'mismatches' ? t.help.mismatches : t.help.duplicates
 
+  const navItems: PortalNavItem[] = [
+    { value: 'dashboard', label: t.tabs.dashboard },
+    ...(conflictsVisible
+      ? [
+          { value: 'duplicates', label: t.tabs.duplicates, count: duplicates.length },
+          { value: 'unresolved', label: t.tabs.unresolved, count: unresolved.length },
+          { value: 'mismatches', label: t.tabs.mismatches, count: mismatches.length },
+        ]
+      : []),
+    { value: 'activity', label: t.tabs.activity },
+    { value: 'payments', label: t.tabs.payments },
+    { value: 'paymentsReport', label: t.tabs.paymentsReport },
+    ...(adminToken ? [{ value: 'operations', label: t.operator.tabLabel }] : []),
+  ]
+
   return (
-    <div className="portal-page">
+    <div className="min-h-dvh bg-muted/40 pb-24">
       <PortalHeader
         slug={slug}
         syncStatus={syncStatus}
@@ -261,98 +286,81 @@ export function PortalPage() {
       />
 
       {operatorGateOpen && (
-        <div className="operator-gate-overlay">
-          <OperatorGate slug={slug} error={operatorError} onSubmit={handleOperatorSubmit} />
-        </div>
+        <OperatorGate
+          slug={slug}
+          error={operatorError}
+          onSubmit={handleOperatorSubmit}
+          onClose={() => setOperatorGateOpen(false)}
+        />
       )}
 
-      {error && <p className="error-banner">{error}</p>}
+      <Tabs value={tab} onValueChange={(value) => setTab(value as Tab)} className="gap-0">
+        <div className="border-b bg-background">
+          <div className="mx-auto w-full max-w-5xl px-4 sm:px-6">
+            <PortalNav items={navItems} active={tab} />
+          </div>
+        </div>
 
-      <AutoReconcileBanner onViewGuide={() => setGuideOpen(true)} />
-      {guideOpen && <HelpModal section={guideSection} onClose={() => setGuideOpen(false)} />}
+        <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 px-4 py-4 sm:px-6">
+          {error && (
+            <Alert variant="destructive">
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
 
-      <nav className="tabs">
-        <button type="button" className={tab === 'dashboard' ? 'tab active' : 'tab'} onClick={() => setTab('dashboard')}>
-          {t.tabs.dashboard}
-        </button>
-        {conflictsVisible && (
-          <>
-            <button type="button" className={tab === 'duplicates' ? 'tab active' : 'tab'} onClick={() => setTab('duplicates')}>
-              {t.tabs.duplicates} ({duplicates.length})
-            </button>
-            <button type="button" className={tab === 'unresolved' ? 'tab active' : 'tab'} onClick={() => setTab('unresolved')}>
-              {t.tabs.unresolved} ({unresolved.length})
-            </button>
-            <button type="button" className={tab === 'mismatches' ? 'tab active' : 'tab'} onClick={() => setTab('mismatches')}>
-              {t.tabs.mismatches} ({mismatches.length})
-            </button>
-          </>
-        )}
-        <button type="button" className={tab === 'activity' ? 'tab active' : 'tab'} onClick={() => setTab('activity')}>
-          {t.tabs.activity}
-        </button>
-        <button type="button" className={tab === 'payments' ? 'tab active' : 'tab'} onClick={() => setTab('payments')}>
-          {t.tabs.payments}
-        </button>
-        <button type="button" className={tab === 'paymentsReport' ? 'tab active' : 'tab'} onClick={() => setTab('paymentsReport')}>
-          {t.tabs.paymentsReport}
-        </button>
-        {adminToken && (
-          <button
-            type="button"
-            className={tab === 'operations' ? 'tab active' : 'tab'}
-            onClick={() => setTab('operations')}
+          <AutoReconcileBanner onViewGuide={() => setGuideOpen(true)} />
+          {guideOpen && <HelpModal section={guideSection} onClose={() => setGuideOpen(false)} />}
+
+          <TabsContent
+            value={tab}
+            className="min-h-60 min-w-0 flex-none overflow-x-auto rounded-xl border bg-card p-3 text-card-foreground shadow-sm sm:p-4"
           >
-            {t.operator.tabLabel}
-          </button>
-        )}
-      </nav>
-
-      <main className="tab-content">
-        {tab === 'dashboard' && (
-          <DashboardTab
-            slug={slug}
-            syncStatus={syncStatus}
-            dashboard={dashboard}
-            conflictsVisible={conflictsVisible}
-            duplicatesCount={duplicates.length}
-            unresolvedCount={unresolved.length}
-            mismatchesCount={mismatches.length}
-            pendingCount={pendingCount}
-            adminToken={adminToken}
-            onNavigate={(dest) => {
-              if (dest === 'operations' && !adminToken) return
-              setTab(dest)
-            }}
-          />
-        )}
-        {tab === 'duplicates' && (
-          <DuplicatesTab rows={duplicates} resolutions={resolutions} pending={pending} onPick={handlePickSurvivor} />
-        )}
-        {tab === 'unresolved' && (
-          <UnresolvedTab
-            rows={unresolved}
-            resolutions={resolutions}
-            pending={pending}
-            onIgnore={(variantId, note) => queue(variantId, 'ignore', note || undefined)}
-          />
-        )}
-        {tab === 'mismatches' && (
-          <NameMismatchTab
-            rows={mismatches}
-            resolutions={resolutions}
-            pending={pending}
-            onApprove={(variantId) => queue(variantId, 'approve_sku')}
-            onIgnore={(variantId) => queue(variantId, 'ignore')}
-          />
-        )}
-        {tab === 'activity' && <ActivityTab slug={slug} token={token} />}
-        {tab === 'payments' && <PaymentsTab slug={slug} token={token} />}
-        {tab === 'paymentsReport' && <PaymentsReportTab slug={slug} token={token} />}
-        {tab === 'operations' && adminToken && (
-          <OperationsTab slug={slug} adminToken={adminToken} onUnauthorized={handleOperatorUnauthorized} />
-        )}
-      </main>
+          {tab === 'dashboard' && (
+            <DashboardTab
+              slug={slug}
+              syncStatus={syncStatus}
+              dashboard={dashboard}
+              conflictsVisible={conflictsVisible}
+              duplicatesCount={duplicates.length}
+              unresolvedCount={unresolved.length}
+              mismatchesCount={mismatches.length}
+              pendingCount={pendingCount}
+              adminToken={adminToken}
+              onNavigate={(dest) => {
+                if (dest === 'operations' && !adminToken) return
+                setTab(dest)
+              }}
+            />
+          )}
+          {tab === 'duplicates' && (
+            <DuplicatesTab rows={duplicates} resolutions={resolutions} pending={pending} onPick={handlePickSurvivor} />
+          )}
+          {tab === 'unresolved' && (
+            <UnresolvedTab
+              rows={unresolved}
+              resolutions={resolutions}
+              pending={pending}
+              onIgnore={(variantId, note) => queue(variantId, 'ignore', note || undefined)}
+            />
+          )}
+          {tab === 'mismatches' && (
+            <NameMismatchTab
+              rows={mismatches}
+              resolutions={resolutions}
+              pending={pending}
+              onApprove={(variantId) => queue(variantId, 'approve_sku')}
+              onIgnore={(variantId) => queue(variantId, 'ignore')}
+            />
+          )}
+          {tab === 'activity' && <ActivityTab slug={slug} token={token} />}
+          {tab === 'payments' && <PaymentsTab slug={slug} token={token} />}
+          {tab === 'paymentsReport' && <PaymentsReportTab slug={slug} token={token} />}
+          {tab === 'operations' && adminToken && (
+            <OperationsTab slug={slug} adminToken={adminToken} onUnauthorized={handleOperatorUnauthorized} />
+          )}
+          </TabsContent>
+        </div>
+      </Tabs>
 
       <ApplyFooter pendingCount={pendingCount} applying={applying} onApply={handleApply} />
     </div>
