@@ -219,3 +219,34 @@ async def test_snapshots_are_isolated_per_tenant(migrated_db):
         await _land(repo, b.id, _pull(1, tag="B"))
         assert [r.sku for r in (await repo.load_current(a.id)).rows] == ["A0", "A1"]
         assert [r.sku for r in (await repo.load_current(b.id)).rows] == ["B0"]
+
+
+async def test_round_trip_keeps_the_unfiltered_total_and_the_per_warehouse_breakdown(migrated_db):
+    """BIMS's warehouse filter can answer 0 for stock that exists, so the
+    snapshot keeps BOTH figures: the unfiltered total and every warehouse."""
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant()
+    pull = _pull(2)
+    pull.stock = {"A0": 6.0, "A1": 3.0}
+    pull.stock_by_warehouse = {"A0": {20: 0.0, 24: 0.0}, "A1": {20: 4.0, 24: -1.0}}
+    pull.stock_unfiltered = {"A0": 6.0, "A1": 3.0}
+    async with session_factory() as session:
+        repo = SqlAlchemySnapshotRepository(session)
+        await _land(repo, tenant.id, pull)
+        loaded = await repo.load_current(tenant.id)
+
+    assert loaded.stock["A0"].quantity == 6.0
+    assert loaded.stock["A0"].unfiltered_total == 6.0
+    assert loaded.stock["A0"].by_warehouse == {20: 0.0, 24: 0.0}
+    assert loaded.stock["A1"].by_warehouse == {20: 4.0, 24: -1.0}
+
+
+async def test_a_sku_without_an_unfiltered_answer_loads_as_unknown_not_zero(migrated_db):
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant()
+    async with session_factory() as session:
+        repo = SqlAlchemySnapshotRepository(session)
+        await _land(repo, tenant.id, _pull(1))  # no stock_unfiltered at all
+        loaded = await repo.load_current(tenant.id)
+
+    assert loaded.stock["A0"].unfiltered_total is None

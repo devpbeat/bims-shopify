@@ -334,3 +334,5 @@ class CatalogSnapshotStockModel(Base):
     quantity: Mapped[float] = mapped_column(Float)
     #: {"<warehouse_id>": quantity}; the diagnostic detail behind ``quantity``.
     by_warehouse: Mapped[dict] = mapped_column(JSON, default=dict)
+    #: BIMS's total WITHOUT any warehouse filter. ``None``: not asked / no answer.
+    unfiltered_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
