@@ -1591,6 +1591,9 @@ class DiagnoseReport:
     #: answer; ``None`` when it was skipped or its outcome is unknown.
     found_via_direct_lookup: bool | None = None
     direct_lookup_row: dict[str, Any] | None = None
+    #: ``snapshot`` (the default) or ``live``; ``snapshot`` carries its id and age.
+    source: str = "live"
+    snapshot: dict[str, Any] | None = None
 
 
 async def lookup_single_product(
@@ -1775,7 +1778,7 @@ def compute_diagnosis(
     *,
     stock_by_sku: dict[str, float],
     stock_by_warehouse: dict[int, dict[str, float]],
-    stock_total_all: dict[str, float],
+    stock_total_all: dict[str, float | None],
     shopify_index: dict[str, dict[str, Any]],
     online_store_publication_id: str | None,
     tenant_company_id: int | None = None,
@@ -1884,6 +1887,8 @@ def build_diagnose_report(report: DiagnoseReport) -> dict[str, Any]:
         "catalog_pull": report.catalog_pull,
         "found_via_direct_lookup": report.found_via_direct_lookup,
         "direct_lookup_row": report.direct_lookup_row,
+        "source": report.source,
+        "snapshot": report.snapshot,
         "online_store_publication_id": report.online_store_publication_id,
         "notes": report.notes,
         "verdict_counts": verdict_counts,
@@ -1896,10 +1901,16 @@ async def _run_diagnose(
 ) -> dict[str, Any]:
     """Explain why each BIMS product matching ``args.query`` is or is not live.
 
-    STRICTLY read-only: it only pulls from BIMS and Shopify, never mutates
-    either, writes no audit row, and has no ``apply`` option.
+    STRICTLY read-only: it only reads, never mutates BIMS or Shopify, writes
+    no audit row, and has no ``apply`` option.
 
-    The BIMS catalog is pulled in ``mode="simple"`` with no ``last_update``
+    By default the BIMS half is answered from the latest persisted snapshot
+    (``source: "snapshot"``, with its age): the catalog, the pushed stock, the
+    per-warehouse breakdown and BIMS's unfiltered total are all in the database,
+    so no multi-minute BIMS pull is made. ``live`` (CLI ``--live``), or no
+    snapshot at all, pulls BIMS as described below (``source: "live"``).
+
+    The live BIMS catalog is pulled in ``mode="simple"`` with no ``last_update``
     filter (duplicate detection and product grouping need every row of the
     tenant's company). The pull is two-phase: phase 1 filters by the tenant's
     ``company_id`` (fast; covers essentially every real query). Only when it
@@ -1912,50 +1923,103 @@ async def _run_diagnose(
     if not query:
         raise SystemExit("diagnose: a non-empty query is required")
 
-    bims_client = _new_bims_client(tenant)
+    live = bool(getattr(args, "live", False))
+    snapshot = None if live else await _load_status_snapshot(tenant.id)
+    notes: list[str] = []
+    if snapshot is None and not live:
+        notes.append(
+            "There is no catalog snapshot to read, so BIMS was pulled live. "
+            "Run a pull to have the next diagnosis answer from the database."
+        )
+
+    # Only the live path (and the one-product lookup below) talks to BIMS.
+    bims_client: BIMSClient | None = None
     shopify_client = ShopifyClient(tenant)
     try:
-        await _emit_progress(progress, 0, None, "pulling BIMS catalog")
-        pull = await fetch_bims_catalog_pull(
-            bims_client, tenant.bims_company_id, tenant_timezone=tenant.bims_timezone
-        )
-        raw_rows = pull.rows
-        all_matches = match_catalog_rows(raw_rows, query)
         searched_all_companies = False
-        if not all_matches:
-            # Nothing in the tenant's company: look at every company so a
-            # product that belongs elsewhere is explained, not hidden.
-            await _emit_progress(progress, 0, None, "pulling BIMS catalog (all companies)")
+        stock_by_sku: dict[str, float] = {}
+        stock_by_warehouse: dict[int, dict[str, float]] = {}
+        stock_total_all: dict[str, float | None] = {}
+        extra: dict[str, Any] = {}
+        if snapshot is not None:
+            await _emit_progress(progress, 0, None, "reading the catalog snapshot")
+            raw_rows = [catalog_row_to_raw(r) for r in snapshot.rows]
+            all_matches = match_catalog_rows(raw_rows, query)
+            matched = all_matches[:DIAGNOSE_MAX_MATCHES]
+            stock_by_sku = {sku: rec.quantity for sku, rec in snapshot.stock.items()}
+            for sku, rec in snapshot.stock.items():
+                for warehouse_id, quantity in rec.by_warehouse.items():
+                    stock_by_warehouse.setdefault(warehouse_id, {})[sku] = quantity
+                stock_total_all[sku] = rec.unfiltered_total
+            if any(rec.unfiltered_total is None for rec in snapshot.stock.values()):
+                notes.append(
+                    "Some SKUs in this snapshot have no unfiltered BIMS total (it was written "
+                    "before that figure was stored, or BIMS gave no answer): shown as null, "
+                    "not zero. Run a pull to refresh it."
+                )
+            meta = snapshot.meta
+            finished = meta.finished_at or meta.started_at
+            extra["snapshot"] = {
+                "id": meta.id,
+                "finished_at": finished.isoformat(),
+                "age_minutes": round((datetime.now(UTC) - finished).total_seconds() / 60, 1),
+            }
+            pull_summary: dict[str, Any] = {
+                "rows": meta.rows_pulled,
+                "reported_count": meta.reported_count,
+                "complete": meta.complete,
+                "pages": meta.pages,
+                "stop_reason": meta.stop_reason,
+                "warnings": meta.warnings,
+                "duration_seconds": meta.timings.get("catalog_pull_seconds"),
+            }
+            catalog_complete = meta.complete
+            catalog_rows = meta.rows_pulled
+            catalog_reported = meta.reported_count
+        else:
+            bims_client = _new_bims_client(tenant)
+            await _emit_progress(progress, 0, None, "pulling BIMS catalog")
             pull = await fetch_bims_catalog_pull(
-                bims_client, None, tenant_timezone=tenant.bims_timezone
+                bims_client, tenant.bims_company_id, tenant_timezone=tenant.bims_timezone
             )
             raw_rows = pull.rows
             all_matches = match_catalog_rows(raw_rows, query)
-            searched_all_companies = True
-        matched = all_matches[:DIAGNOSE_MAX_MATCHES]
-
-        await _emit_progress(progress, 0, None, "checking stock")
-        own_skus = list(dict.fromkeys(str(r["code2"]) for r in matched if r.get("code2")))
-        stock_by_sku: dict[str, float] = {}
-        stock_by_warehouse: dict[int, dict[str, float]] = {}
-        stock_total_all: dict[str, float] = {}
-        if own_skus:
-            warehouse_ids = tenant.stock_warehouse_ids
-            stock_by_sku = await fetch_stock_by_sku(
-                bims_client, diagnosis_stock_skus(raw_rows, matched, tenant.bims_company_id), warehouse_ids
-            )
-            for warehouse_id in warehouse_ids:
-                stock_by_warehouse[warehouse_id] = await fetch_stock_by_sku(
-                    bims_client, own_skus, [warehouse_id]
+            if not all_matches:
+                # Nothing in the tenant's company: look at every company so a
+                # product that belongs elsewhere is explained, not hidden.
+                await _emit_progress(progress, 0, None, "pulling BIMS catalog (all companies)")
+                pull = await fetch_bims_catalog_pull(
+                    bims_client, None, tenant_timezone=tenant.bims_timezone
                 )
-            stock_total_all = await fetch_stock_by_sku(bims_client, own_skus, None)
+                raw_rows = pull.rows
+                all_matches = match_catalog_rows(raw_rows, query)
+                searched_all_companies = True
+            matched = all_matches[:DIAGNOSE_MAX_MATCHES]
+
+            await _emit_progress(progress, 0, None, "checking stock")
+            own_skus = list(dict.fromkeys(str(r["code2"]) for r in matched if r.get("code2")))
+            if own_skus:
+                warehouse_ids = tenant.stock_warehouse_ids
+                stock_by_sku = await fetch_stock_by_sku(
+                    bims_client,
+                    diagnosis_stock_skus(raw_rows, matched, tenant.bims_company_id),
+                    warehouse_ids,
+                )
+                for warehouse_id in warehouse_ids:
+                    stock_by_warehouse[warehouse_id] = await fetch_stock_by_sku(
+                        bims_client, own_skus, [warehouse_id]
+                    )
+                stock_total_all = dict(await fetch_stock_by_sku(bims_client, own_skus, None))
+            pull_summary = pull.summary()
+            catalog_complete = pull.complete
+            catalog_rows = len(pull.rows)
+            catalog_reported = pull.reported_count
 
         await _emit_progress(progress, 0, None, "scanning Shopify")
-        notes: list[str] = []
-        if pull.complete is False:
+        if catalog_complete is False:
             notes.append(
-                f"The BIMS catalog pull is incomplete ({len(pull.rows)} rows received, "
-                f"server reports {pull.reported_count}); a missing product is NOT "
+                f"The BIMS catalog pull is incomplete ({catalog_rows} rows received, "
+                f"server reports {catalog_reported}); a missing product is NOT "
                 "conclusive evidence that it does not exist in BIMS."
             )
         found_via_direct_lookup: bool | None = None
@@ -1964,6 +2028,7 @@ async def _run_diagnose(
             # Only a BIMS product id can be fetched directly; anything else
             # would be a guess.
             await _emit_progress(progress, 0, None, "looking up product directly")
+            bims_client = bims_client or _new_bims_client(tenant)
             found_via_direct_lookup, direct_lookup_row, lookup_note = await lookup_single_product(
                 bims_client, query
             )
@@ -1997,13 +2062,16 @@ async def _run_diagnose(
                 online_store_publication_id=publication_id,
                 notes=notes,
                 searched_all_companies=searched_all_companies,
-                catalog_pull=pull.summary(),
+                catalog_pull=pull_summary,
                 found_via_direct_lookup=found_via_direct_lookup,
                 direct_lookup_row=direct_lookup_row,
+                source="snapshot" if snapshot is not None else "live",
+                snapshot=extra.get("snapshot"),
             )
         )
     finally:
-        await bims_client.aclose()
+        if bims_client is not None:
+            await bims_client.aclose()
         await shopify_client.aclose()
 
 
@@ -2563,7 +2631,9 @@ async def run_publish(tenant: Tenant, options: dict[str, Any], progress: Progres
 
 
 async def run_diagnose(tenant: Tenant, options: dict[str, Any], progress: ProgressFn | None = None) -> dict[str, Any]:
-    args = argparse.Namespace(query=str(options.get("query", "")))
+    args = argparse.Namespace(
+        query=str(options.get("query", "")), live=bool(options.get("live", False))
+    )
     return await _run_diagnose(tenant, args, progress=progress)
 
 
@@ -2724,6 +2794,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     diagnose_parser.add_argument(
         "query",
         help="Matched case-insensitively against BIMS id, code, code2, or part of the name.",
+    )
+    diagnose_parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Pull the BIMS catalog and stock now (minutes) instead of reading the latest "
+            "persisted snapshot (the default whenever a snapshot exists)."
+        ),
     )
 
     subparsers.add_parser(

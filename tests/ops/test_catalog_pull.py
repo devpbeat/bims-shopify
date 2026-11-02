@@ -182,7 +182,7 @@ async def test_diagnose_reports_catalog_pull_and_warns_when_a_miss_is_not_conclu
             {"count": 50, "data": []},
         ],
     )
-    report = await catalog_ops.run_diagnose(tenant, {"query": "not-there"})
+    report = await catalog_ops.run_diagnose(tenant, {"query": "not-there", "live": True})
 
     assert report["total_matches"] == 0
     assert report["searched_all_companies"] is True
@@ -192,6 +192,6 @@ async def test_diagnose_reports_catalog_pull_and_warns_when_a_miss_is_not_conclu
 
 async def test_diagnose_complete_pull_adds_no_incompleteness_note(tenant, monkeypatch):
     _install(monkeypatch, [{"count": 1, "data": [_product(1)]}, {"count": 1, "data": []}])
-    report = await catalog_ops.run_diagnose(tenant, {"query": "shirt 1"})
+    report = await catalog_ops.run_diagnose(tenant, {"query": "shirt 1", "live": True})
     assert report["catalog_pull"]["complete"] is True
     assert report["notes"] == []

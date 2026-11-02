@@ -184,6 +184,16 @@ bigger blast radius. All of them are enforced inside `do_reconcile`:
   as 0**: if BIMS says there is nothing, Shopify is told there is nothing.
 * **Stock consolidation only through `consolidate_sellable_stock`**, at pull time. The write
   path has no second implementation.
+* **The pushed quantity is decided by `decide_sellable_stock`** from two BIMS figures that are
+  both stored in the snapshot (`by_warehouse` and `unfiltered_quantity`). Default rule
+  `detail_or_total`: the larger of the consolidated per-warehouse figure and the unfiltered
+  total clamped at 0, so neither BIMS's broken warehouse filter (all zeros) nor a negative
+  warehouse cancelling a positive one can zero a sellable SKU. A tenant can pick another rule
+  with `field_mappings.stock_figure_rule` (`detail_only` | `total_only`); an unknown value
+  fails the pull. Every SKU whose warehouse NET differs from the unfiltered total is a
+  discrepancy: `stock_discrepancy` error log, `stock_discrepancies` in the pull outcome and
+  `snapshot.pull_completed` audit, a `snapshot.stock_discrepancy` audit entry and a snapshot
+  warning.
 * **Integers.** Quantities are written as integers, so the comparison is made on the integer
   that would be written: BIMS `2.5` against Shopify `2` is not drift.
 * **Pinned snapshot.** A cycle reads the current snapshot once, when it starts, and every
