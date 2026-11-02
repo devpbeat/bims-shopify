@@ -15,6 +15,7 @@ from typing import Any
 
 from bims_shopify.application.sync_inventory import ProgressFn, _emit_progress
 from bims_shopify.domain.snapshot import CatalogPull, SnapshotMeta
+from bims_shopify.domain.stock_consolidation import summarize_stock_discrepancies
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 from bims_shopify.ports.erp import ERPPort
@@ -42,6 +43,9 @@ class PullResult:
     previous: SnapshotMeta | None = None
     stats: dict[str, Any] | None = None
     stats_error: str | None = None
+    #: ``summarize_stock_discrepancies`` of the pull: the warehouse breakdown vs
+    #: BIMS's unfiltered total. ``count`` is 0 when they agree everywhere.
+    stock_discrepancies: dict[str, Any] = field(default_factory=dict)
 
 
 def _drop_exceeds(new: int, previous: int, max_drop_ratio: float) -> bool:
@@ -103,6 +107,25 @@ class PullCatalogSnapshot:
             progress, len(pull.rows), None, f"pulled {len(pull.rows)} products from BIMS"
         )
 
+        discrepancies = summarize_stock_discrepancies(pull.stock_discrepancies)
+        if discrepancies["count"]:
+            # A silent disagreement between the warehouses and BIMS's total is
+            # what cost the merchant a sales day: make it impossible to miss.
+            logger.error(
+                "stock_discrepancy",
+                tenant_slug=tenant.slug,
+                tenant_id=tenant.id,
+                count=discrepancies["count"],
+                by_kind=discrepancies["by_kind"],
+                sample=discrepancies["sample"],
+            )
+            pull.warnings = [
+                *pull.warnings,
+                f"{discrepancies['count']} stock discrepancies: the per-warehouse breakdown "
+                "disagrees with BIMS's unfiltered total (see the snapshot.stock_discrepancy "
+                "audit entry).",
+            ]
+
         previous = await self._snapshots.get_current_meta(tenant.id)
         verdict = check_sanity(tenant, pull, previous)
         if verdict is not None:
@@ -123,7 +146,9 @@ class PullCatalogSnapshot:
                 reason=reason,
                 **{k: v for k, v in detail.items() if k != "warnings"},
             )
-            return PullResult("rejected", meta, reason, detail, previous)
+            return PullResult(
+                "rejected", meta, reason, detail, previous, stock_discrepancies=discrepancies
+            )
 
         write_started = time.perf_counter()
         staged = await self._snapshots.stage(tenant.id, pull, started_at)
@@ -155,4 +180,11 @@ class PullCatalogSnapshot:
             if stats is not None:
                 await self._snapshots.set_stats(meta.id, stats)
                 meta.stats = stats
-        return PullResult("ok", meta, previous=previous, stats=stats, stats_error=stats_error)
+        return PullResult(
+            "ok",
+            meta,
+            previous=previous,
+            stats=stats,
+            stats_error=stats_error,
+            stock_discrepancies=discrepancies,
+        )

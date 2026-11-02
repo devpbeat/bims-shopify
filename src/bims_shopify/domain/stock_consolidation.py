@@ -186,3 +186,21 @@ def decide_sellable_stock(
                 by_warehouse=dict(by_warehouse),
             )
     return StockDecision(quantity=quantity, discrepancy=discrepancy)
+
+
+#: SKUs quoted in the log event / audit entry (the counter always has them all).
+DISCREPANCY_SAMPLE_SIZE = 20
+
+
+def summarize_stock_discrepancies(
+    discrepancies: list[StockDiscrepancy], sample_size: int = DISCREPANCY_SAMPLE_SIZE
+) -> dict[str, Any]:
+    """Counter, per-kind breakdown and a bounded sample, for logs, audit and the portal."""
+    by_kind: dict[str, int] = {}
+    for discrepancy in discrepancies:
+        by_kind[discrepancy.kind] = by_kind.get(discrepancy.kind, 0) + 1
+    return {
+        "count": len(discrepancies),
+        "by_kind": by_kind,
+        "sample": [d.as_dict() for d in discrepancies[:sample_size]],
+    }

@@ -253,6 +253,7 @@ async def do_pull(
             "complete": meta.complete,
             "duration_seconds": duration,
             "started_at": started_at.isoformat(),
+            "stock_discrepancies": result.stock_discrepancies.get("count", 0),
         }
 
         if result.status == "rejected":
@@ -307,8 +308,22 @@ async def do_pull(
                 "complete": meta.complete,
                 "duration_seconds": duration,
                 "trigger": trigger,
+                "stock_discrepancies": result.stock_discrepancies.get("count", 0),
             },
         )
+        if result.stock_discrepancies.get("count"):
+            await audit.log(
+                actor="system",
+                action="snapshot.stock_discrepancy",
+                entity="snapshot",
+                tenant_id=tenant.id,
+                entity_id=str(meta.id),
+                payload={
+                    **result.stock_discrepancies,
+                    "snapshot_id": meta.id,
+                    "trigger": trigger,
+                },
+            )
         if result.stats is not None:
             # Same entry `status` writes, so the dashboard and
             # GET /sync/{slug}/reconciliation follow the pull, not a manual run.
@@ -335,6 +350,7 @@ async def do_pull(
             "snapshot": meta.as_dict(),
             "stats": result.stats,
             "stats_error": result.stats_error,
+            "stock_discrepancies": result.stock_discrepancies,
         }
     finally:
         await client.aclose()
