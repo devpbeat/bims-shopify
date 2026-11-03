@@ -32,6 +32,13 @@ describe('describeEntry', () => {
     ])
   })
 
+  it('surfaces the stock discrepancy counter of a completed pull', () => {
+    const summary = describeEntry(
+      entry('snapshot.pull_completed', { rows: 11270, stock_rows: 11270, duration_seconds: 90, stock_discrepancies: 42 }),
+    )
+    expect(summary.metrics.map((m) => [m.id, m.value])).toContainEqual(['stockDiscrepancies', 42])
+  })
+
   it('reads nested drift counts and array lengths', () => {
     const drift = describeEntry(entry('sync.reconcile_completed', { drift: { count: 7 }, updated: 5, scanned: { snapshot: 10, shopify: 12 } }))
     expect(drift.metrics.map((m) => m.id)).toEqual(['drift', 'updated'])

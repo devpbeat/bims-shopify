@@ -3,7 +3,8 @@
 It is a read-only report: a few-minutes-old snapshot answers it without making
 BIMS pull the whole catalog three times per refresh. `live: true` (CLI
 `--live`) forces the old behavior. Commands that gate WRITES on fresh stock
-(`publish`) or explain a live discrepancy (`diagnose`) are NOT switched.
+(`publish`) are NOT switched; `diagnose` reads the snapshot too (see
+`test_diagnose_snapshot.py`).
 """
 from __future__ import annotations
 

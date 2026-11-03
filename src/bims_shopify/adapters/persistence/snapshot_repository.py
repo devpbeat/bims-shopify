@@ -99,6 +99,7 @@ class SqlAlchemySnapshotRepository:
                     sku,
                     quantity,
                     {str(wid): qty for wid, qty in pull.stock_by_warehouse.get(sku, {}).items()},
+                    pull.stock_unfiltered.get(sku),
                 )
                 for sku, quantity in pull.stock.items()
             ]
@@ -131,13 +132,19 @@ class SqlAlchemySnapshotRepository:
         )
 
     async def _insert_stock(
-        self, snapshot_id: int, entries: list[tuple[str, float, dict[str, float]]]
+        self, snapshot_id: int, entries: list[tuple[str, float, dict[str, float], float | None]]
     ) -> None:
         await self._session.execute(
             insert(CatalogSnapshotStockModel),
             [
-                {"snapshot_id": snapshot_id, "sku": sku, "quantity": quantity, "by_warehouse": by_wh}
-                for sku, quantity, by_wh in entries
+                {
+                    "snapshot_id": snapshot_id,
+                    "sku": sku,
+                    "quantity": quantity,
+                    "by_warehouse": by_wh,
+                    "unfiltered_quantity": unfiltered,
+                }
+                for sku, quantity, by_wh, unfiltered in entries
             ],
         )
 
@@ -359,6 +366,7 @@ class SqlAlchemySnapshotRepository:
                     CatalogSnapshotStockModel.sku,
                     CatalogSnapshotStockModel.quantity,
                     CatalogSnapshotStockModel.by_warehouse,
+                    CatalogSnapshotStockModel.unfiltered_quantity,
                 ).where(CatalogSnapshotStockModel.snapshot_id == meta.id)
             )
         ).all()
@@ -367,8 +375,9 @@ class SqlAlchemySnapshotRepository:
             sku: StockRecord(
                 quantity=float(quantity),
                 by_warehouse={int(wid): float(qty) for wid, qty in (by_wh or {}).items()},
+                unfiltered_total=None if unfiltered is None else float(unfiltered),
             )
-            for sku, quantity, by_wh in stock_rows
+            for sku, quantity, by_wh, unfiltered in stock_rows
         }
         return CatalogSnapshot(meta=meta, rows=rows, stock=stock)
 

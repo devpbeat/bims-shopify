@@ -272,3 +272,73 @@ async def test_a_skipped_write_cycle_does_not_overwrite_the_last_write_outcome(m
     assert outcome["status"] == "ok" and outcome["drift"]["count"] == 3  # still readable
     assert outcome["last_skip"]["status"] == "skipped"
     assert outcome["last_skip"]["skipped_total"] == 2  # skipped snapshots are counted
+
+
+def _broken_filter_stock(unfiltered: dict[str, float]):
+    """BIMS on 2026-11-02: the warehouse filter answers 0, the unfiltered call is real."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        body = _json.loads(request.content)
+        filtered = "warehouse_ids" in body
+        rows = [
+            {"sku": sku, "stock": 0 if filtered else unfiltered[sku]}
+            for sku in body["skus"]
+            if sku in unfiltered
+        ]
+        return httpx.Response(200, json={"status": "OK", "data": {"stockPorSku": rows}})
+
+    return respond
+
+
+async def test_a_discrepancy_is_logged_counted_and_audited(migrated_db):
+    """The silent disagreement cost the merchant a sales day: it must be LOUD."""
+    import structlog.testing
+
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant()
+    mock, _ = world([_product(1, "A"), _product(2, "B")], {}, ["A", "B"])
+    mock.post(BIMS_STOCK).mock(side_effect=_broken_filter_stock({"A": 6.0, "B": 0.0}))
+    with mock, structlog.testing.capture_logs() as captured:
+        result = await _pull(session_factory, tenant)
+
+    # The outage regression, end to end: A is sellable although every filtered answer is 0.
+    async with session_factory() as session:
+        snapshot = await SqlAlchemySnapshotRepository(session).load_current(tenant.id)
+    assert snapshot.stock["A"].quantity == 6.0
+    assert snapshot.stock["A"].unfiltered_total == 6.0 and snapshot.stock["A"].by_warehouse == {1: 0.0}
+
+    # 1. structured log event
+    events = [e for e in captured if e.get("event") == "stock_discrepancy"]
+    assert len(events) == 1
+    assert events[0]["count"] == 1 and events[0]["log_level"] == "error"
+    assert events[0]["sample"][0]["sku"] == "A"
+    # 2. summary counter: returned, in the stored outcome, and in the completed audit entry
+    assert result["stock_discrepancies"]["count"] == 1
+    assert (await _outcome(session_factory, tenant.id))["stock_discrepancies"] == 1
+    completed = await _audit(session_factory, tenant.id, "snapshot.pull_completed")
+    assert completed.payload["stock_discrepancies"] == 1
+    # 3. a dedicated audit entry with the evidence
+    entry = await _audit(session_factory, tenant.id, "snapshot.stock_discrepancy")
+    assert entry.payload["count"] == 1
+    assert entry.payload["by_kind"] == {"detail_below_total": 1}
+    assert entry.payload["sample"][0]["unfiltered_total"] == 6.0
+    assert entry.payload["snapshot_id"] == result["snapshot"]["id"]
+    # 4. persisted on the snapshot, so the portal's pull summary shows it
+    assert any("stock discrepanc" in w for w in result["snapshot"]["warnings"])
+
+
+async def test_no_discrepancy_means_no_event_and_a_zero_counter(migrated_db):
+    import structlog.testing
+
+    session_factory, make_tenant = migrated_db
+    tenant = await make_tenant()
+    mock, _ = world([_product(1, "A")], {"A": 5}, ["A"])
+    with mock, structlog.testing.capture_logs() as captured:
+        result = await _pull(session_factory, tenant)
+
+    assert result["stock_discrepancies"]["count"] == 0
+    assert not [e for e in captured if e.get("event") == "stock_discrepancy"]
+    assert await _audit(session_factory, tenant.id, "snapshot.stock_discrepancy") is None
+    assert (await _outcome(session_factory, tenant.id))["stock_discrepancies"] == 0

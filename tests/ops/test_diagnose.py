@@ -17,6 +17,20 @@ from bims_shopify.ops.catalog import (
 pytestmark = pytest.mark.usefixtures("sequential_paging")
 
 
+@pytest.fixture(autouse=True)
+def _no_snapshot(monkeypatch):
+    """These tests exercise the LIVE path (no snapshot to read), as before.
+
+    The snapshot path has its own tests in ``test_diagnose_snapshot.py``.
+    """
+    from bims_shopify.ops import catalog as catalog_ops
+
+    async def no_snapshot(tenant_id):
+        return None
+
+    monkeypatch.setattr(catalog_ops, "_load_status_snapshot", no_snapshot)
+
+
 BIMS_URL = "https://bims.example.com"
 
 

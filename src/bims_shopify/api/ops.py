@@ -160,7 +160,11 @@ def _validate_options(command: str, options: dict[str, Any]) -> dict[str, Any]:
                 status_code=422,
                 detail=f"options.query must be at most {_MAX_DIAGNOSE_QUERY_LENGTH} characters",
             )
-        return {"query": query}
+        live = options.get("live", False)
+        if not isinstance(live, bool):
+            raise HTTPException(status_code=422, detail="options.live must be a boolean")
+        # ``live`` is only forwarded when asked for: the default is the snapshot.
+        return {"query": query, "live": True} if live else {"query": query}
 
     if command == "status":
         live = options.get("live", False)

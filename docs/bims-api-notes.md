@@ -235,6 +235,11 @@ used by other legacy endpoints):
   different single warehouse ids (20/24/25/26/27) for the same SKUs returned
   different stock numbers per warehouse, confirming real per-warehouse
   scoping (not ignored).
+- **WARNING (2026-11-02, production): the warehouse filter is not reliable.**
+  With `warehouse_ids` BIMS answered 0 for every warehouse (20/24/25/26/27) on
+  SKUs that held stock (OTTO NEW BASIC SATORI MARFIL: 6, 7, 7, 5 units in the
+  same call WITHOUT the filter). Never trust the filtered answers alone: the
+  pull always also asks without `warehouse_ids` and stores both.
 - **Important:** this endpoint's response envelope uses `status: "OK"/"ERROR"`
   (uppercase), NOT the lowercase `"ok"/"error"` convention documented for the
   rest of the legacy API and assumed in the "Common response envelope fields"

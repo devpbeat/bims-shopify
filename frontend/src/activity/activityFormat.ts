@@ -10,6 +10,7 @@ export type MetricId =
   | 'missingInShopify'
   | 'rowsPulled'
   | 'stockRows'
+  | 'stockDiscrepancies'
   | 'duration'
   | 'reason'
   | 'detail'
@@ -82,8 +83,10 @@ export const ACTIVITY_ACTIONS: Record<string, MetricSpec[]> = {
   'snapshot.pull_completed': [
     n('rowsPulled', 'rows'),
     n('stockRows', 'stock_rows'),
+    n('stockDiscrepancies', 'stock_discrepancies'),
     { id: 'duration', path: 'duration_seconds', kind: 'seconds' },
   ],
+  'snapshot.stock_discrepancy': [n('stockDiscrepancies', 'count')],
   'snapshot.pull_failed': [s('error', 'error')],
   'snapshot.pull_skipped': [s('reason', 'reason')],
   'snapshot.pull_rejected': [s('reason', 'reason'), s('detail', 'detail')],

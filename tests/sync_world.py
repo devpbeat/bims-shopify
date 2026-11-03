@@ -183,6 +183,8 @@ async def land_snapshot(
     finished_at: datetime | None = None,
     complete: bool | None = True,
     extra_rows: list[CatalogRow] | None = None,
+    by_warehouse: dict[str, dict[int, float]] | None = None,
+    unfiltered: dict[str, float] | None = None,
 ):
     """Persist a snapshot: a row per SKU in ``stock`` and ``no_stock``; stock
     records only for ``stock`` (a ``no_stock`` SKU is ABSENT from BIMS's stock
@@ -194,7 +196,8 @@ async def land_snapshot(
     pull = CatalogPull(
         rows=rows,
         stock=dict(stock),
-        stock_by_warehouse={sku: {1: qty} for sku, qty in stock.items()},
+        stock_by_warehouse=by_warehouse or {sku: {1: qty} for sku, qty in stock.items()},
+        stock_unfiltered=dict(unfiltered or {}),
         reported_count=len(rows) if complete is not None else None,
         complete=complete,
         pages=1,

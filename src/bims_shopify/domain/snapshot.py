@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any
 
 from bims_shopify.domain.product import ProductSnapshot
+from bims_shopify.domain.stock_consolidation import StockDiscrepancy
 
 #: Snapshot lifecycle. ``building`` rows are invisible to readers; exactly one
 #: snapshot per tenant is ``current``; ``rejected``/``failed`` are metadata
@@ -98,6 +99,9 @@ class StockRecord:
 
     quantity: float
     by_warehouse: dict[int, float] = field(default_factory=dict)
+    #: BIMS's total without the warehouse filter (``None``: unknown). Kept
+    #: because the filtered answers can be wrong; see ``stock_consolidation``.
+    unfiltered_total: float | None = None
 
 
 @dataclass
@@ -111,6 +115,10 @@ class CatalogPull:
     rows: list[CatalogRow]
     stock: dict[str, float]
     stock_by_warehouse: dict[str, dict[int, float]] = field(default_factory=dict)
+    #: Raw (unclamped) per-SKU total from the request WITHOUT ``warehouse_ids``.
+    stock_unfiltered: dict[str, float] = field(default_factory=dict)
+    #: SKUs whose warehouse breakdown disagrees with the unfiltered total.
+    stock_discrepancies: list[StockDiscrepancy] = field(default_factory=list)
     reported_count: int | None = None
     complete: bool | None = None
     pages: int = 0

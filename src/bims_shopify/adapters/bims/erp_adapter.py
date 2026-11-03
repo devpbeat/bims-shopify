@@ -8,7 +8,11 @@ from typing import Any
 from bims_shopify.domain.product import ProductSnapshot
 from bims_shopify.domain.sale import SaleOrder, SaleResult, SaleResultKind
 from bims_shopify.domain.snapshot import CatalogPull, CatalogRow, resolve_product_snapshots
-from bims_shopify.domain.stock_consolidation import consolidate_sellable_stock
+from bims_shopify.domain.stock_consolidation import (
+    StockDiscrepancy,
+    decide_sellable_stock,
+    resolve_stock_figure_rule,
+)
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
 
@@ -18,6 +22,8 @@ from .stock import STOCK_BATCH_SIZE, fetch_stock_batches
 from .timezones import to_bims_local
 
 PAGE_LIMIT = 250
+#: Stand-in warehouse key for the one pass over all warehouses together (live path).
+_AGGREGATE_KEY = 0
 logger = get_logger(__name__)
 
 
@@ -66,14 +72,12 @@ class BIMSERPAdapter:
         to persist a snapshot.
 
         Every row is kept (eligible or not, so the snapshot can explain why a
-        product is or is not live); stock is requested only for eligible SKUs,
-        exactly as the live sync always did. The aggregate stock comes from one
-        ``stock_fenicio`` pass over the tenant's warehouses together. With
-        ``warehouse_detail`` and more than one warehouse, each warehouse is
-        then asked on its own as well: BIMS cannot break the aggregate down, and
-        that detail is what diagnoses "BIMS shows 10 in one warehouse, we show
-        0". With a single warehouse the aggregate IS the per-warehouse figure,
-        so no extra request is made.
+        product is or is not live); stock is requested only for eligible SKUs.
+        Two kinds of stock answer are fetched and BOTH kept: BIMS's total
+        without any warehouse filter, and (with ``warehouse_detail``) one answer
+        per warehouse. The quantity to publish is decided from them by the
+        tenant's ``StockFigureRule``, and every SKU where they disagree is
+        listed in ``stock_discrepancies``.
 
         All-or-nothing: any failing request fails the pull, so a snapshot never
         mixes complete and missing stock.
@@ -83,58 +87,79 @@ class BIMSERPAdapter:
         rows = [CatalogRow.from_raw(product, tenant.field_mappings) for product in raw_products]
         skus = [row.sku for row in rows if row.eligible and row.sku]
 
-        warehouse_ids_for_pull = tenant.stock_warehouse_ids
-        # With per-warehouse detail over several warehouses the aggregate pass
-        # is pure waste: the sellable figure is recomputed from the detail
-        # below, so asking BIMS for its own (wrong-for-us) aggregate costs a
-        # full extra pass over every SKU for a number we discard. BIMS is the
-        # client's live billing ERP and already timed out under that load.
-        skip_aggregate = warehouse_detail and len(warehouse_ids_for_pull) > 1
-        stock: dict[str, float] = {}
-        if not skip_aggregate:
-            stock = await self.fetch_stock_levels(tenant, skus)
+        rule = resolve_stock_figure_rule(tenant.field_mappings)
+        warehouse_ids = tenant.stock_warehouse_ids
+
+        # BIMS's own total WITHOUT a warehouse filter, always asked and always
+        # kept: its warehouse filter can answer 0 for stock that exists
+        # (2026-11-02), so the filtered answers alone are not trustworthy.
+        # Unclamped, so the snapshot holds exactly what BIMS said.
+        unfiltered, unfiltered_seconds = await self._fetch_stock(
+            tenant, skus, None, request_prefix="bims-shopify-all-", clamp=False
+        )
+        self.last_stock_fetch_seconds = unfiltered_seconds
         timings: dict[str, float | None] = {
             "catalog_pull_seconds": paged.duration_seconds if paged else None,
-            "stock_fetch_seconds": self.last_stock_fetch_seconds,
+            "stock_fetch_seconds": unfiltered_seconds,
             "warehouse_stock_seconds": None,
         }
 
+        # What the tenant's warehouses say, per SKU. With detail, each
+        # warehouse is asked on its own (the detail that diagnoses "BIMS shows
+        # 10 in one warehouse, we show 0"); without it, one pass over the
+        # warehouses together stands in for the whole breakdown.
         by_warehouse: dict[str, dict[int, float]] = {}
-        warehouse_ids = tenant.stock_warehouse_ids
+        started = time.perf_counter()
         if warehouse_detail:
-            if len(warehouse_ids) == 1:
-                for sku, quantity in stock.items():
-                    by_warehouse[sku] = {warehouse_ids[0]: quantity}
-            else:
-                started = time.perf_counter()
-                for warehouse_id in warehouse_ids:
-                    per_sku, _ = await self._fetch_stock(
-                        tenant,
-                        skus,
-                        [warehouse_id],
-                        request_prefix=f"bims-shopify-wh{warehouse_id}-",
-                        clamp=False,
-                    )
-                    for sku, quantity in per_sku.items():
-                        by_warehouse.setdefault(sku, {})[warehouse_id] = quantity
-                timings["warehouse_stock_seconds"] = time.perf_counter() - started
+            for warehouse_id in warehouse_ids:
+                per_sku, _ = await self._fetch_stock(
+                    tenant,
+                    skus,
+                    [warehouse_id],
+                    request_prefix=f"bims-shopify-wh{warehouse_id}-",
+                    clamp=False,
+                )
+                for sku, quantity in per_sku.items():
+                    by_warehouse.setdefault(sku, {})[warehouse_id] = quantity
+            timings["warehouse_stock_seconds"] = time.perf_counter() - started
+        else:
+            together, _ = await self._fetch_stock(tenant, skus, warehouse_ids, clamp=False)
+            by_warehouse = {sku: {_AGGREGATE_KEY: quantity} for sku, quantity in together.items()}
 
-                # BIMS's own aggregate lets a negative warehouse cancel a
-                # positive one, which hides merchandise the store can ship
-                # (see ``consolidate_sellable_stock`` for why those negatives
-                # exist). Recompute the sellable figure from the per-warehouse
-                # detail we just fetched, under the tenant's rule.
-                stock = {
-                    sku: consolidate_sellable_stock(
-                        warehouses, mode=tenant.stock_consolidation
-                    )
-                    for sku, warehouses in by_warehouse.items()
-                }
+        # The pushed figure is decided by an explicit, per-tenant rule (see
+        # ``decide_sellable_stock``); every SKU where the warehouses and the
+        # unfiltered total disagree is reported, never absorbed silently.
+        stock: dict[str, float] = {}
+        discrepancies: list[StockDiscrepancy] = []
+        for sku in dict.fromkeys([*unfiltered, *by_warehouse]):
+            decision = decide_sellable_stock(
+                by_warehouse=by_warehouse.get(sku, {}),
+                unfiltered_total=unfiltered.get(sku),
+                rule=rule,
+                consolidation=tenant.stock_consolidation,
+                sku=sku,
+            )
+            if decision.quantity is not None:
+                stock[sku] = decision.quantity
+            if decision.discrepancy is not None:
+                discrepancies.append(decision.discrepancy)
+        if not warehouse_detail:
+            by_warehouse = {}
+        clamped_count = sum(1 for quantity in unfiltered.values() if quantity < 0)
+        if clamped_count:
+            logger.warning(
+                "negative_stock_clamped",
+                tenant=tenant.slug,
+                clamped_count=clamped_count,
+                warehouse_ids=None,
+            )
 
         return CatalogPull(
             rows=rows,
             stock=stock,
             stock_by_warehouse=by_warehouse,
+            stock_unfiltered=unfiltered,
+            stock_discrepancies=discrepancies,
             reported_count=paged.reported_count if paged else None,
             complete=paged.complete if paged else None,
             pages=paged.pages if paged else 0,
