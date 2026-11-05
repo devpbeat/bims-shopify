@@ -28,7 +28,7 @@ from bims_shopify.adapters.persistence.tenant_repository import SqlAlchemyTenant
 from bims_shopify.adapters.persistence.crypto import SecretBox
 from bims_shopify.config import Settings
 from bims_shopify.logging import get_logger
-from bims_shopify.ops import catalog, refresh_job, rekey_skus, sync_job
+from bims_shopify.ops import catalog, missing_photos, refresh_job, rekey_skus, sync_job
 
 logger = get_logger(__name__)
 
@@ -47,6 +47,7 @@ _COMMAND_RUNNERS = {
     "publish": catalog.run_publish,
     "diagnose": catalog.run_diagnose,
     "warehouses": catalog.run_warehouses,
+    "missing_photos": missing_photos.run_missing_photos,
     "sync": sync_job.run_sync,
     "reconcile": sync_job.run_reconcile,
     "refresh": refresh_job.run_refresh,
