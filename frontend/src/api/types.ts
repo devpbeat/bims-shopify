@@ -212,3 +212,58 @@ export interface PaymentExportFile {
   filename: string
   truncated: boolean
 }
+
+export type PhotoScanStatus = 'never' | 'running' | 'ready' | 'failed'
+
+export interface PhotoScanState {
+  status: PhotoScanStatus
+  job_id: number | null
+  progress_done: number | null
+  progress_total: number | null
+  message: string | null
+  /** When the last successful scan finished (ISO), or null when none has. */
+  scanned_at: string | null
+  /** When the BIMS stock snapshot behind the stock figures was taken (ISO), or null. */
+  stock_as_of: string | null
+}
+
+export type PhotoScope = 'live' | 'all'
+
+export interface ProductWithoutPhotos {
+  product_id: string
+  title: string | null
+  skus: string[]
+  status: string | null
+  /** null: the Online Store publication could not be resolved. */
+  on_online_store: boolean | null
+  /** null: BIMS reported no stock for any of the SKUs. */
+  stock: number | null
+  /** null when the product id is not a Shopify product gid. */
+  admin_url: string | null
+}
+
+export interface ProductsWithoutPhotos {
+  scan: PhotoScanState
+  scope: PhotoScope
+  page: number
+  page_size: number
+  /** Rows matching the scope and the search. */
+  total: number
+  items: ProductWithoutPhotos[]
+  /** null until a scan has completed. */
+  counts: { live: number; all: number; scanned: number } | null
+  /** The stored list is capped: the counts stay exact but the rows are partial. */
+  truncated: boolean
+}
+
+export interface ProductsWithoutPhotosQuery {
+  scope: PhotoScope
+  q: string
+  page: number
+  pageSize: number
+}
+
+export interface PhotoScanStarted {
+  job_id: number
+  status: string
+}

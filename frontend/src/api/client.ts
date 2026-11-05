@@ -7,11 +7,15 @@ import type {
   PaymentsConfig,
   PaymentsConfigUpdate,
   PaymentsTestResult,
+  PhotoScanStarted,
+  ProductsWithoutPhotos,
+  ProductsWithoutPhotosQuery,
   RekeyReport,
   ResolutionRequest,
   ResolutionResult,
   SyncStatus,
 } from './types'
+import { photosQueryString } from '../productsWithoutPhotosUtils'
 
 export class ApiError extends Error {
   status: number
@@ -172,4 +176,16 @@ export async function downloadPaymentsExport(
     filename: filenameFromDisposition(response.headers.get('Content-Disposition')) ?? 'payments.xlsx',
     truncated: response.headers.get('X-Report-Truncated') === 'true',
   }
+}
+
+export function getProductsWithoutPhotos(
+  slug: string,
+  token: string,
+  query: ProductsWithoutPhotosQuery,
+): Promise<ProductsWithoutPhotos> {
+  return portalFetch<ProductsWithoutPhotos>(slug, token, `/products-without-photos${photosQueryString(query)}`)
+}
+
+export function startPhotosScan(slug: string, token: string): Promise<PhotoScanStarted> {
+  return portalFetch<PhotoScanStarted>(slug, token, '/products-without-photos/scan', { method: 'POST' })
 }

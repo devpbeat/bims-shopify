@@ -78,6 +78,7 @@ export interface Messages {
     activity: string
     payments: string
     paymentsReport: string
+    noPhotos: string
     navLabel: string
   }
   dashboard: {
@@ -333,5 +334,54 @@ export interface Messages {
     loading: string
     loadFailed: string
     sessionExpired: string
+  }
+  noPhotos: {
+    title: string
+    intro: string
+    liveCount: string
+    allCount: string
+    scannedCount: (n: number) => string
+    lastScan: string
+    stockAsOf: string
+    scanNow: string
+    scanAgain: string
+    scanning: string
+    scanProgress: (done: number, total: number | null) => string
+    neverScanned: string
+    neverScannedHint: string
+    scanFailed: string
+    startFailed: string
+    loading: string
+    loadFailed: string
+    sessionExpired: string
+    retry: string
+    scope: string
+    scopeLive: string
+    scopeAll: string
+    search: string
+    searchPlaceholder: string
+    emptyLive: string
+    emptyLiveHint: string
+    emptyAll: string
+    emptySearch: string
+    truncated: string
+    listLabel: string
+    colSku: string
+    colProduct: string
+    colStatus: string
+    colOnlineStore: string
+    colStock: string
+    statusActive: string
+    statusDraft: string
+    statusArchived: string
+    yes: string
+    no: string
+    unknown: string
+    noSku: string
+    openInShopify: string
+    openInShopifyFor: (name: string) => string
+    previous: string
+    next: string
+    pageRange: string
   }
 }
