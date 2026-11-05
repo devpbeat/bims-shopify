@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
-import { ApiError, getDashboard, getRekeyReport, getSyncStatus, postRekeyResolutions } from './api/client'
+import { ApiError, getDashboard, getProductsWithoutPhotos, getRekeyReport, getSyncStatus, postRekeyResolutions } from './api/client'
 import type { DashboardData, PendingQueue, RekeyReport, Resolution, SyncStatus } from './api/types'
 import { ActivityTab } from './components/ActivityTab'
 import { ApplyFooter } from './components/ApplyFooter'
@@ -13,6 +13,7 @@ import { NameMismatchTab } from './components/NameMismatchTab'
 import { OperationsTab } from './components/OperationsTab'
 import { PaymentsReportTab } from './components/PaymentsReportTab'
 import { PaymentsTab } from './components/PaymentsTab'
+import { ProductsWithoutPhotosTab } from './components/ProductsWithoutPhotosTab'
 import { OperatorGate } from './components/OperatorGate'
 import { PortalHeader } from './components/PortalHeader'
 import { PortalNav } from './components/PortalNav'
@@ -27,10 +28,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 
-type Tab = 'dashboard' | 'duplicates' | 'unresolved' | 'mismatches' | 'activity' | 'payments' | 'paymentsReport' | 'operations'
+type Tab = 'dashboard' | 'duplicates' | 'unresolved' | 'mismatches' | 'photos' | 'activity' | 'payments' | 'paymentsReport' | 'operations'
 
 // These tabs lay out their own cards; the others render inside a shared surface.
-const SELF_CONTAINED_TABS: Tab[] = ['dashboard', 'payments', 'paymentsReport', 'operations']
+const SELF_CONTAINED_TABS: Tab[] = ['dashboard', 'photos', 'payments', 'paymentsReport', 'operations']
 
 function tokenFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get('token')
@@ -44,6 +45,8 @@ export function PortalPage() {
   const [reportMissing, setReportMissing] = useState(false)
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
   const [dashboard, setDashboard] = useState<DashboardData | null>(null)
+  const [photosLiveCount, setPhotosLiveCount] = useState<number | null>(null)
+  const handlePhotosLiveCount = useCallback((count: number) => setPhotosLiveCount(count), [])
   const [resolutions, setResolutions] = useState<Resolution[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -108,8 +111,11 @@ export function PortalPage() {
       }),
       getSyncStatus(slug, token),
       getDashboard(slug, token),
+      // Only feeds the navigation badge: its failure must never block the portal.
+      getProductsWithoutPhotos(slug, token, { scope: 'live', q: '', page: 1, pageSize: 1 }).catch(() => null),
     ])
-      .then(([reportData, syncData, dashboardData]) => {
+      .then(([reportData, syncData, dashboardData, photosData]) => {
+        if (!cancelled && photosData?.counts) setPhotosLiveCount(photosData.counts.live)
         if (cancelled) return
         if (reportData === null || reportData.obsolete) {
           setReport(reportData)
@@ -273,6 +279,11 @@ export function PortalPage() {
           { value: 'mismatches', label: t.tabs.mismatches, count: mismatches.length },
         ]
       : []),
+    {
+      value: 'photos',
+      label: t.tabs.noPhotos,
+      ...(photosLiveCount !== null ? { count: photosLiveCount } : {}),
+    },
     { value: 'activity', label: t.tabs.activity },
     { value: 'payments', label: t.tabs.payments },
     { value: 'paymentsReport', label: t.tabs.paymentsReport },
@@ -359,6 +370,7 @@ export function PortalPage() {
               onIgnore={(variantId) => queue(variantId, 'ignore')}
             />
           )}
+          {tab === 'photos' && <ProductsWithoutPhotosTab slug={slug} token={token} onLiveCount={handlePhotosLiveCount} />}
           {tab === 'activity' && <ActivityTab slug={slug} token={token} />}
           {tab === 'payments' && <PaymentsTab slug={slug} token={token} />}
           {tab === 'paymentsReport' && <PaymentsReportTab slug={slug} token={token} />}
