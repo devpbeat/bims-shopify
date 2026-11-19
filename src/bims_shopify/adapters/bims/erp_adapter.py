@@ -10,8 +10,10 @@ from bims_shopify.domain.sale import SaleOrder, SaleResult, SaleResultKind
 from bims_shopify.domain.snapshot import CatalogPull, CatalogRow, resolve_product_snapshots
 from bims_shopify.domain.stock_consolidation import (
     StockDiscrepancy,
+    StockFigureRule,
     decide_sellable_stock,
     resolve_stock_figure_rule,
+    resolve_stock_scope_warehouse_ids,
 )
 from bims_shopify.domain.tenant import Tenant
 from bims_shopify.logging import get_logger
@@ -89,6 +91,31 @@ class BIMSERPAdapter:
 
         rule = resolve_stock_figure_rule(tenant.field_mappings)
         warehouse_ids = tenant.stock_warehouse_ids
+        scope_ids: list[int] | None = None
+        detail_requested = warehouse_detail
+        if rule is StockFigureRule.WAREHOUSE_SCOPE:
+            scope_ids = resolve_stock_scope_warehouse_ids(tenant.field_mappings)
+            if not scope_ids:
+                # Loud, and before any stock request: never publish the whole
+                # catalog or zero it because the scope was never set.
+                raise ValueError(
+                    f"stock_figure_rule={rule.value} needs a non-empty "
+                    "stock_scope_warehouse_ids"
+                )
+            # DECISION 1: the scope is answered per warehouse or not at all. The
+            # ``warehouse_detail=False`` path fakes ``{_AGGREGATE_KEY: total}``,
+            # which has no warehouse identity, so the detail is FORCED for this
+            # rule (the cost: one request pass per warehouse on the live
+            # ``list_products`` path) rather than refusing the live path or
+            # publishing a number that is not the scope's. The breakdown is still
+            # returned only when the caller asked for it.
+            warehouse_detail = True
+            # DECISION 2: fetch the UNION of the tenant's warehouses and the
+            # scope, tenant order first. A scoped id missing from
+            # ``stock_warehouse_ids`` would otherwise never be requested and its
+            # SKUs would read as "never mentioned"; the union keeps the existing
+            # breakdown and makes the selection independent of that list.
+            warehouse_ids = list(dict.fromkeys([*warehouse_ids, *scope_ids]))
 
         # BIMS's own total WITHOUT a warehouse filter, always asked and always
         # kept: its warehouse filter can answer 0 for stock that exists
@@ -138,12 +165,13 @@ class BIMSERPAdapter:
                 rule=rule,
                 consolidation=tenant.stock_consolidation,
                 sku=sku,
+                scope_warehouse_ids=scope_ids,
             )
             if decision.quantity is not None:
                 stock[sku] = decision.quantity
             if decision.discrepancy is not None:
                 discrepancies.append(decision.discrepancy)
-        if not warehouse_detail:
+        if not detail_requested:
             by_warehouse = {}
         clamped_count = sum(1 for quantity in unfiltered.values() if quantity < 0)
         if clamped_count:

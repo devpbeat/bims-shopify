@@ -287,3 +287,147 @@ async def test_detail_only_rule_keeps_the_old_figure_but_still_records_the_total
     assert pull.stock == {"A": 0.0}
     assert pull.stock_unfiltered == {"A": 6.0}
     assert len(pull.stock_discrepancies) == 1
+
+
+# -- warehouse_scope: the storefront is fed from a SELECTED subset of warehouses --
+
+SCOPE_MAPPINGS = {"stock_figure_rule": "warehouse_scope", "stock_scope_warehouse_ids": [27]}
+
+
+@respx.mock
+async def test_warehouse_scope_publishes_only_the_selected_warehouse(adapter, tenant):
+    tenant.bims_warehouse_ids = [24, 26, 27]
+    tenant.field_mappings = dict(SCOPE_MAPPINGS)
+    respx.get(INDEX).mock(side_effect=_catalog([_product(code2="A")]))
+    respx.post(STOCK).mock(
+        side_effect=_stock_by_request(
+            {(): {"A": 18.0}, (24,): {"A": 3.0}, (26,): {"A": 5.0}, (27,): {"A": 10.0}}, []
+        )
+    )
+
+    pull = await adapter.pull_catalog(tenant)
+
+    assert pull.stock == {"A": 10.0}
+    assert pull.stock_by_warehouse["A"] == {24: 3.0, 26: 5.0, 27: 10.0}
+    assert pull.stock_discrepancies == []  # a subset differing from the total is expected
+
+
+@respx.mock
+async def test_warehouse_scope_trusts_a_scoped_zero_and_records_the_evidence(adapter, tenant):
+    # DELIBERATE OWNER DECISION: BIMS is trusted literally inside the scope, so a
+    # zero answer for MAYORISTA publishes 0 even though the total is positive.
+    tenant.bims_warehouse_ids = [24, 27]
+    tenant.field_mappings = dict(SCOPE_MAPPINGS)
+    respx.get(INDEX).mock(side_effect=_catalog([_product(code2="A")]))
+    respx.post(STOCK).mock(
+        side_effect=_stock_by_request({(): {"A": 6.0}, (24,): {"A": 6.0}, (27,): {"A": 0.0}}, [])
+    )
+
+    pull = await adapter.pull_catalog(tenant)
+
+    assert pull.stock == {"A": 0.0}
+    assert [d.kind for d in pull.stock_discrepancies] == ["scope_zero_below_total"]
+
+
+@respx.mock
+async def test_warehouse_scope_fetches_a_scoped_id_missing_from_the_tenant_warehouses(
+    adapter, tenant
+):
+    """The scope may name a warehouse the tenant does not otherwise list: it is still asked."""
+    tenant.bims_warehouse_ids = [24]
+    tenant.field_mappings = dict(SCOPE_MAPPINGS)
+    respx.get(INDEX).mock(side_effect=_catalog([_product(code2="A")]))
+    requests: list[dict] = []
+    respx.post(STOCK).mock(
+        side_effect=_stock_by_request(
+            {(): {"A": 14.0}, (24,): {"A": 4.0}, (27,): {"A": 10.0}}, requests
+        )
+    )
+
+    pull = await adapter.pull_catalog(tenant)
+
+    assert sorted(tuple(r.get("warehouse_ids") or ()) for r in requests) == [(), (24,), (27,)]
+    assert pull.stock == {"A": 10.0}
+
+
+@respx.mock
+async def test_warehouse_scope_forces_the_per_warehouse_detail_on_the_live_path(adapter, tenant):
+    """list_products asks for no detail, but the scope cannot be answered from {0: total}."""
+    tenant.bims_warehouse_ids = [24, 27]
+    tenant.field_mappings = dict(SCOPE_MAPPINGS)
+    respx.get(INDEX).mock(side_effect=_catalog([_product(code2="A")]))
+    requests: list[dict] = []
+    respx.post(STOCK).mock(
+        side_effect=_stock_by_request(
+            # The together answer (24+27) would wrongly say 13 if it were used.
+            {(): {"A": 13.0}, (24, 27): {"A": 13.0}, (24,): {"A": 3.0}, (27,): {"A": 10.0}},
+            requests,
+        )
+    )
+
+    products = await adapter.list_products(tenant)
+
+    assert [(p.sku, p.stock) for p in products] == [("A", 10.0)]
+    assert (24, 27) not in [tuple(r.get("warehouse_ids") or ()) for r in requests]
+
+
+@respx.mock
+async def test_warehouse_scope_without_detail_still_returns_no_breakdown(adapter, tenant):
+    tenant.bims_warehouse_ids = [27]
+    tenant.field_mappings = dict(SCOPE_MAPPINGS)
+    respx.get(INDEX).mock(side_effect=_catalog([_product(code2="A")]))
+    respx.post(STOCK).mock(side_effect=_stock_by_request({(): {"A": 10.0}, (27,): {"A": 10.0}}, []))
+
+    pull = await adapter.pull_catalog(tenant, warehouse_detail=False)
+
+    assert pull.stock == {"A": 10.0}
+    assert pull.stock_by_warehouse == {}
+
+
+@respx.mock
+async def test_warehouse_scope_sku_absent_from_every_answer_is_unknown(adapter, tenant):
+    tenant.bims_warehouse_ids = [27]
+    tenant.field_mappings = dict(SCOPE_MAPPINGS)
+    respx.get(INDEX).mock(side_effect=_catalog([_product(code2="A"), _product(id=2, code2="B")]))
+    respx.post(STOCK).mock(side_effect=_stock_by_request({(): {"A": 2.0}, (27,): {"A": 2.0}}, []))
+
+    pull = await adapter.pull_catalog(tenant)
+
+    assert pull.stock == {"A": 2.0}  # B is unknown, never pushed as zero
+
+
+@pytest.mark.parametrize(
+    "mappings",
+    [
+        {"stock_figure_rule": "warehouse_scope"},
+        {"stock_figure_rule": "warehouse_scope", "stock_scope_warehouse_ids": []},
+        {"stock_figure_rule": "warehouse_scope", "stock_scope_warehouse_ids": ["x"]},
+    ],
+)
+@respx.mock
+async def test_warehouse_scope_misconfiguration_fails_before_any_stock_request(
+    adapter, tenant, mappings
+):
+    tenant.field_mappings = mappings
+    respx.get(INDEX).mock(side_effect=_catalog([_product(code2="A")]))
+    stock_route = respx.post(STOCK).mock(side_effect=_stock_by_request({(): {"A": 1.0}}, []))
+
+    with pytest.raises(ValueError):
+        await adapter.pull_catalog(tenant)
+
+    assert not stock_route.called
+
+
+@respx.mock
+async def test_the_default_rule_ignores_a_stored_scope(adapter, tenant):
+    tenant.bims_warehouse_ids = [24, 27]
+    tenant.field_mappings = {"stock_scope_warehouse_ids": [27]}
+    respx.get(INDEX).mock(side_effect=_catalog([_product(code2="A")]))
+    requests: list[dict] = []
+    respx.post(STOCK).mock(
+        side_effect=_stock_by_request({(): {"A": 13.0}, (24,): {"A": 3.0}, (27,): {"A": 10.0}}, requests)
+    )
+
+    pull = await adapter.pull_catalog(tenant)
+
+    assert pull.stock == {"A": 13.0}  # detail_or_total over every tenant warehouse
