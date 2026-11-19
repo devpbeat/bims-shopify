@@ -23,6 +23,13 @@ from bims_shopify.adapters.persistence.sync_state_repository import (
 )
 from bims_shopify.api.portal_auth import hash_password
 from bims_shopify.application.run_history import CYCLE_MODE, PULL_MODE
+from bims_shopify.domain.stock_consolidation import (
+    DEFAULT_STOCK_FIGURE_RULE,
+    STOCK_FIGURE_RULE_KEY,
+    resolve_stock_figure_rule,
+    resolve_stock_scope_warehouse_ids,
+    validate_stock_field_mappings,
+)
 from bims_shopify.domain.tenant import PaymentProvider, ReorderStrategy, SyncMode, Tenant
 
 from .deps import (
@@ -76,6 +83,34 @@ def _validate_vpos_config(tenant: Tenant) -> None:
                 "field": "provider_config.environment",
             },
         )
+
+
+def _validate_stock_config(tenant: Tenant) -> None:
+    """Reject (422) an unknown ``stock_figure_rule`` or a malformed / missing
+    ``stock_scope_warehouse_ids``. The domain resolvers are the single source of truth."""
+    try:
+        validate_stock_field_mappings(tenant.field_mappings)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail={"message": str(exc), "field": "field_mappings"}
+        ) from None
+
+
+def effective_stock_config(field_mappings: dict) -> tuple[str, list[int]]:
+    """The tenant's rule value and scope ids for display; never raises.
+
+    A value that predates validation and is unusable is shown as stored (rule) or
+    empty (scope) rather than turning every read of the tenant into a 500.
+    """
+    try:
+        rule = resolve_stock_figure_rule(field_mappings).value
+    except ValueError:
+        rule = str(field_mappings.get(STOCK_FIGURE_RULE_KEY))
+    try:
+        scope = resolve_stock_scope_warehouse_ids(field_mappings)
+    except ValueError:
+        scope = []
+    return rule, scope
 
 
 router = APIRouter(prefix="/tenants", tags=["tenants"], dependencies=[Depends(require_admin)])
@@ -293,10 +328,17 @@ class TenantOut(BaseModel):
     pull_max_drop_ratio: float
     auto_create_missing: bool
     auto_publish: bool
+    #: The effective stock figure rule (``detail_or_total`` when unset) and, for
+    #: ``warehouse_scope``, the selected BIMS warehouse ids.
+    stock_figure_rule: str = DEFAULT_STOCK_FIGURE_RULE.value
+    stock_scope_warehouse_ids: list[int] = []
 
     @classmethod
     def from_domain(cls, tenant: Tenant) -> TenantOut:
+        stock_rule, stock_scope = effective_stock_config(tenant.field_mappings or {})
         return cls(
+            stock_figure_rule=stock_rule,
+            stock_scope_warehouse_ids=stock_scope,
             id=tenant.id,
             slug=tenant.slug,
             bims_base_url=tenant.bims_base_url,
@@ -340,6 +382,7 @@ async def create_tenant(
 ):
     tenant = Tenant(id=None, **body.model_dump())
     _validate_vpos_config(tenant)
+    _validate_stock_config(tenant)
     await _enforce_staleness_limit(session, None, tenant)
     created = await repo.create(tenant)
     await audit.log(
@@ -380,6 +423,7 @@ async def update_tenant(
         values["bancard_vpos_private_key"] = existing.bancard_vpos_private_key
     updated = Tenant(id=existing.id, **values)
     _validate_vpos_config(updated)
+    _validate_stock_config(updated)
     await _enforce_staleness_limit(session, existing, updated)
     saved = await repo.update(updated)
     await audit.log(
@@ -418,6 +462,10 @@ async def patch_tenant(
         del changes["bancard_vpos_private_key"]
     updated = replace(existing, **changes)
     _validate_vpos_config(updated)
+    if "field_mappings" in changes:
+        # Only when the mappings are being changed: an unrelated edit must not be
+        # blocked by a value stored before this validation existed.
+        _validate_stock_config(updated)
     await _enforce_staleness_limit(session, existing, updated)
     saved = await repo.update(updated)
     await audit.log(

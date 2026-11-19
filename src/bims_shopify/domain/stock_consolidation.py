@@ -164,6 +164,22 @@ def resolve_stock_scope_warehouse_ids(field_mappings: dict[str, Any]) -> list[in
     return ids
 
 
+def validate_stock_field_mappings(field_mappings: dict[str, Any]) -> None:
+    """Raise ``ValueError`` if the stock settings in ``field_mappings`` cannot be used.
+
+    Run at write time (API) so a bad rule or scope is refused up front instead of
+    failing inside a background pull. Built only on the two resolvers, plus the one
+    cross-field rule: ``WAREHOUSE_SCOPE`` needs a non-empty scope.
+    """
+    rule = resolve_stock_figure_rule(field_mappings)
+    scope = resolve_stock_scope_warehouse_ids(field_mappings)
+    if rule is StockFigureRule.WAREHOUSE_SCOPE and not scope:
+        raise ValueError(
+            f"{STOCK_FIGURE_RULE_KEY}={rule.value} requires a non-empty "
+            f"{STOCK_SCOPE_WAREHOUSE_IDS_KEY}"
+        )
+
+
 @dataclass(frozen=True)
 class StockDiscrepancy:
     """The per-warehouse breakdown and the unfiltered total disagree for a SKU."""

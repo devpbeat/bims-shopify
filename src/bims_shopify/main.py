@@ -30,6 +30,7 @@ from bims_shopify.api import (
     portal_payment_rollback,
     portal_payments,
     portal_products_without_photos,
+    portal_warehouse_scope,
     shopify_launch,
     shopify_oauth,
     sync,
@@ -232,6 +233,7 @@ def create_app() -> FastAPI:
     app.include_router(portal_payments.router)
     app.include_router(portal_payment_rollback.router)
     app.include_router(portal_products_without_photos.router)
+    app.include_router(portal_warehouse_scope.router)
     app.include_router(audit.router)
     app.include_router(ops.router)
     app.include_router(checkout_extension.router)
