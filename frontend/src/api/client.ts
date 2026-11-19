@@ -14,6 +14,8 @@ import type {
   ResolutionRequest,
   ResolutionResult,
   SyncStatus,
+  WarehouseScope,
+  WarehouseSyncState,
 } from './types'
 import { photosQueryString } from '../productsWithoutPhotosUtils'
 
@@ -188,4 +190,23 @@ export function getProductsWithoutPhotos(
 
 export function startPhotosScan(slug: string, token: string): Promise<PhotoScanStarted> {
   return portalFetch<PhotoScanStarted>(slug, token, '/products-without-photos/scan', { method: 'POST' })
+}
+
+export function getWarehouseScope(slug: string, token: string): Promise<WarehouseScope> {
+  return portalFetch<WarehouseScope>(slug, token, '/warehouse-scope')
+}
+
+export function saveWarehouseScope(slug: string, token: string, warehouseIds: number[]): Promise<WarehouseScope> {
+  return portalFetch<WarehouseScope>(slug, token, '/warehouse-scope', {
+    method: 'PUT',
+    body: JSON.stringify({ warehouse_ids: warehouseIds }),
+  })
+}
+
+export function getWarehouseSyncState(slug: string, token: string): Promise<WarehouseSyncState> {
+  return portalFetch<WarehouseSyncState>(slug, token, '/warehouse-scope/sync')
+}
+
+export function startWarehouseSync(slug: string, token: string): Promise<PhotoScanStarted> {
+  return portalFetch<PhotoScanStarted>(slug, token, '/warehouse-scope/sync', { method: 'POST' })
 }

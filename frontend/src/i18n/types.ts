@@ -79,6 +79,7 @@ export interface Messages {
     payments: string
     paymentsReport: string
     noPhotos: string
+    warehouses: string
     navLabel: string
   }
   dashboard: {
@@ -383,5 +384,36 @@ export interface Messages {
     previous: string
     next: string
     pageRange: string
+  }
+  warehouses: {
+    title: string
+    intro: string
+    warning: string
+    selectorLabel: string
+    warehouseLabel: (id: number, name: string | null) => string
+    synced: string
+    selectedCount: (n: number) => string
+    selectAtLeastOne: string
+    staleIds: (ids: number[]) => string
+    inactive: string
+    save: string
+    saving: string
+    saved: string
+    unsavedHint: string
+    saveFailed: string
+    unknownIds: string
+    bimsUnavailable: string
+    runSync: string
+    syncing: string
+    syncProgress: (done: number, total: number | null) => string
+    syncSucceeded: string
+    syncFailed: string
+    syncNever: string
+    syncStartFailed: string
+    syncSaveFirst: string
+    loading: string
+    loadFailed: string
+    sessionExpired: string
+    retry: string
   }
 }

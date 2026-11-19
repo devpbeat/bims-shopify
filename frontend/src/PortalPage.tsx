@@ -20,6 +20,7 @@ import { PortalNav } from './components/PortalNav'
 import type { PortalNavItem } from './components/PortalNav'
 import { TokenGate } from './components/TokenGate'
 import { UnresolvedTab } from './components/UnresolvedTab'
+import { WarehousesTab } from './components/WarehousesTab'
 import { useT } from './i18n'
 import { clearAdminToken, loadAdminToken, saveAdminToken } from './adminSession'
 import { clearToken, loadToken, saveToken } from './session'
@@ -28,10 +29,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 
-type Tab = 'dashboard' | 'duplicates' | 'unresolved' | 'mismatches' | 'photos' | 'activity' | 'payments' | 'paymentsReport' | 'operations'
+type Tab = 'dashboard' | 'duplicates' | 'unresolved' | 'mismatches' | 'photos' | 'activity' | 'payments' | 'paymentsReport' | 'warehouses' | 'operations'
 
 // These tabs lay out their own cards; the others render inside a shared surface.
-const SELF_CONTAINED_TABS: Tab[] = ['dashboard', 'photos', 'payments', 'paymentsReport', 'operations']
+const SELF_CONTAINED_TABS: Tab[] = ['dashboard', 'photos', 'payments', 'paymentsReport', 'warehouses', 'operations']
 
 function tokenFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get('token')
@@ -287,6 +288,7 @@ export function PortalPage() {
     { value: 'activity', label: t.tabs.activity },
     { value: 'payments', label: t.tabs.payments },
     { value: 'paymentsReport', label: t.tabs.paymentsReport },
+    { value: 'warehouses', label: t.tabs.warehouses },
     ...(adminToken ? [{ value: 'operations', label: t.operator.tabLabel }] : []),
   ]
 
@@ -374,6 +376,7 @@ export function PortalPage() {
           {tab === 'activity' && <ActivityTab slug={slug} token={token} />}
           {tab === 'payments' && <PaymentsTab slug={slug} token={token} />}
           {tab === 'paymentsReport' && <PaymentsReportTab slug={slug} token={token} />}
+          {tab === 'warehouses' && <WarehousesTab slug={slug} token={token} />}
           {tab === 'operations' && adminToken && (
             <OperationsTab slug={slug} adminToken={adminToken} onUnauthorized={handleOperatorUnauthorized} />
           )}

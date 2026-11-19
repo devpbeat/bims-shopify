@@ -267,3 +267,32 @@ export interface PhotoScanStarted {
   job_id: number
   status: string
 }
+
+export interface WarehouseOption {
+  id: number
+  name: string | null
+  /** Whether the tenant already syncs this warehouse. */
+  synced: boolean
+  selected: boolean
+}
+
+export interface WarehouseScope {
+  rule: string
+  /** True when the store is fed from the selected warehouses only. */
+  active: boolean
+  selected_ids: number[]
+  /** Saved ids that BIMS no longer lists. */
+  selected_ids_not_found: number[]
+  warehouses: WarehouseOption[]
+}
+
+export type WarehouseSyncStatus = 'never' | 'running' | 'succeeded' | 'failed'
+
+export interface WarehouseSyncState {
+  status: WarehouseSyncStatus
+  job_id: number | null
+  progress_done: number | null
+  progress_total: number | null
+  message: string | null
+  finished_at: string | null
+}
