@@ -14,7 +14,11 @@ services:
     labels:
       - traefik.enable=true
       - traefik.docker.network=traefik_web
-      - traefik.http.routers.mystoresync.rule=Host(`mystoresync.ignitesolutions.click`)
+      # Both hosts are served at once so the public domain can move without
+      # downtime: add the new one here, cut PUBLIC_BASE_URL and the Shopify
+      # app URLs over, verify, and only then drop the legacy host.
+      # Override per environment in .env (see env.prod.example).
+      - traefik.http.routers.mystoresync.rule=Host(`${PUBLIC_HOST:-shopifybimsync.tatalabs.com.py}`) || Host(`${LEGACY_PUBLIC_HOST:-mystoresync.ignitesolutions.click}`)
       - traefik.http.routers.mystoresync.entrypoints=websecure
       - traefik.http.routers.mystoresync.tls=true
       - traefik.http.routers.mystoresync.tls.certresolver=myresolver

@@ -109,8 +109,11 @@ async def test_get_exposes_flag_and_confirm_url_never_the_key(app):
     assert body["private_key_configured"] is True
     assert body["public_key"] == "pub" and body["environment"] == "staging"
     assert body["provider"] == "bancard_vpos" and body["editable"] is True
+    # Derived from the configured origin, never a hardcoded domain: the public
+    # host moves between deployments and this assertion must follow it.
     assert body["confirm_url"] == (
-        "https://mystoresync.ignitesolutions.click/payments/bancard_vpos/acme/callback"
+        f"{app.state.settings.public_base_url.rstrip('/')}"
+        "/payments/bancard_vpos/acme/callback"
     )
     assert SECRET not in response.text
     assert (await _call(app, "GET", "nokey/payments-config")).json()["private_key_configured"] is False
