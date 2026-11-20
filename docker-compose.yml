@@ -18,12 +18,12 @@ services:
       # downtime: add the new one here, cut PUBLIC_BASE_URL and the Shopify
       # app URLs over, verify, and only then drop the legacy host.
       # Override per environment in .env (see env.prod.example).
-      - traefik.http.routers.mystoresync.rule=Host(`${PUBLIC_HOST:-shopifybimsync.tatalabs.com.py}`) || Host(`${LEGACY_PUBLIC_HOST:-mystoresync.ignitesolutions.click}`)
-      - traefik.http.routers.mystoresync.entrypoints=websecure
-      - traefik.http.routers.mystoresync.tls=true
-      - traefik.http.routers.mystoresync.tls.certresolver=myresolver
-      - traefik.http.routers.mystoresync.middlewares=secure-headers@file
-      - traefik.http.services.mystoresync.loadbalancer.server.port=8000
+      - traefik.http.routers.stocksync.rule=Host(`${PUBLIC_HOST:-stocksync.tatalabs.com.py}`) || Host(`${LEGACY_PUBLIC_HOST:-mystoresync.ignitesolutions.click}`)
+      - traefik.http.routers.stocksync.entrypoints=websecure
+      - traefik.http.routers.stocksync.tls=true
+      - traefik.http.routers.stocksync.tls.certresolver=myresolver
+      - traefik.http.routers.stocksync.middlewares=secure-headers@file
+      - traefik.http.services.stocksync.loadbalancer.server.port=8000
 
   postgres:
     image: postgres:16-alpine

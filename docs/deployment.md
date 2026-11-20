@@ -1,6 +1,6 @@
 # Deployment runbook
 
-Deploys `bims-shopify` to `shopifybimsync.tatalabs.com.py` behind the shared
+Deploys `bims-shopify` to `stocksync.tatalabs.com.py` behind the shared
 Traefik instance (`traefik_web` network), following the pattern in
 `docs/deploy-pattern.md`. GitHub Actions builds and pushes the image to GHCR, then
 triggers a Woodpecker pipeline that pulls it on the VPS.
@@ -48,7 +48,7 @@ triggers a Woodpecker pipeline that pulls it on the VPS.
    "legacy DB" note below only if importing an existing dataset.
 6. Verify:
    ```bash
-   curl -sf https://shopifybimsync.tatalabs.com.py/health
+   curl -sf https://stocksync.tatalabs.com.py/health
    ```
 
 ## Ongoing deploys (automatic)
@@ -77,7 +77,7 @@ it does:
 ```bash
 EXPECTED=$(git rev-parse origin/main)
 for i in $(seq 1 30); do
-  SHA=$(curl -sf https://shopifybimsync.tatalabs.com.py/version | jq -r .sha)
+  SHA=$(curl -sf https://stocksync.tatalabs.com.py/version | jq -r .sha)
   [ "$SHA" = "$EXPECTED" ] && echo "deployed: $SHA" && break
   echo "running: ${SHA:-unreachable}, waiting..."; sleep 10
 done

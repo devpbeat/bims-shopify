@@ -4,7 +4,7 @@
 
 name = "BIMS Sync"
 client_id = "REPLACE_WITH_CLIENT_ID_FROM_DEV_DASHBOARD"
-application_url = "https://shopifybimsync.tatalabs.com.py"
+application_url = "https://stocksync.tatalabs.com.py"
 embedded = false
 
 [access_scopes]
@@ -12,7 +12,7 @@ scopes = "read_products,write_products,read_inventory,write_inventory,read_order
 
 [auth]
 redirect_urls = [
-  "https://shopifybimsync.tatalabs.com.py/shopify/callback",
+  "https://stocksync.tatalabs.com.py/shopify/callback",
   # Legacy origin, kept so installs keep working while the domain moves.
   "https://mystoresync.ignitesolutions.click/shopify/callback",
   "http://localhost:8000/shopify/callback",

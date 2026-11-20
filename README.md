@@ -89,7 +89,7 @@ curl -X POST http://localhost:8000/tenants \
 ## Shopify app / OAuth install
 
 BIMS Sync is a single, multi-tenant Shopify app (config-only, no Remix
-frontend) hosted at `https://shopifybimsync.tatalabs.com.py`. Merchants
+frontend) hosted at `https://stocksync.tatalabs.com.py`. Merchants
 install it through the standard OAuth authorization code grant; the service
 provisions a `Tenant` row automatically and an operator finishes BIMS
 configuration afterwards via `PUT /tenants/{slug}`.
@@ -102,7 +102,7 @@ Set these in `.env` (see `env.example`):
 - `SHOPIFY_API_SECRET` — the app's client secret. Used to verify the OAuth
   callback HMAC, exchange the authorization code for an offline token, and
   verify app-level/compliance webhook HMACs.
-- `PUBLIC_BASE_URL` — defaults to `https://shopifybimsync.tatalabs.com.py`;
+- `PUBLIC_BASE_URL` — defaults to `https://stocksync.tatalabs.com.py`;
   used to build the OAuth `redirect_uri`.
 
 ### Install flow
@@ -162,11 +162,11 @@ Two kinds of webhook delivery exist side by side:
    shopify app deploy
    ```
 4. Install on a dev store by visiting
-   `https://shopifybimsync.tatalabs.com.py/shopify/install?shop=your-dev-store.myshopify.com`,
+   `https://stocksync.tatalabs.com.py/shopify/install?shop=your-dev-store.myshopify.com`,
    or via the Dashboard's "Select store" test-install flow.
 5. After install, configure BIMS fields for the new tenant:
    ```bash
-   curl -X PUT https://shopifybimsync.tatalabs.com.py/tenants/{slug} \
+   curl -X PUT https://stocksync.tatalabs.com.py/tenants/{slug} \
      -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
      -d '{"bims_base_url": "...", "bims_api_key": "...", "active": true, ...}'
    ```
