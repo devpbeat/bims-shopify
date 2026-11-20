@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>BIMS Sync — Guía para seleccionar depósitos</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    color: #1a1a1a;
+    font-size: 11pt;
+    line-height: 1.55;
+    margin: 0;
+  }
+  h1 {
+    font-size: 21pt;
+    margin: 0 0 4px;
+    letter-spacing: -0.3px;
+  }
+  .sub {
+    color: #666;
+    font-size: 10pt;
+    margin-bottom: 22px;
+    padding-bottom: 14px;
+    border-bottom: 2px solid #1a1a1a;
+  }
+  h2 {
+    font-size: 13pt;
+    margin: 26px 0 10px;
+    padding-top: 2px;
+  }
+  h2 .n {
+    display: inline-block;
+    width: 23px; height: 23px;
+    line-height: 23px;
+    text-align: center;
+    background: #1a1a1a;
+    color: #fff;
+    border-radius: 50%;
+    font-size: 11pt;
+    margin-right: 8px;
+  }
+  p { margin: 0 0 9px; }
+  ol, ul { margin: 0 0 10px; padding-left: 20px; }
+  li { margin-bottom: 6px; }
+  .ui {
+    font-weight: bold;
+    background: #eef1f5;
+    padding: 1px 5px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .warn {
+    border-left: 4px solid #b58900;
+    background: #fdf7e6;
+    padding: 11px 14px;
+    margin: 14px 0;
+  }
+  .warn .t { font-weight: bold; display: block; margin-bottom: 3px; }
+  .note {
+    border-left: 4px solid #0b6bcb;
+    background: #eef4fb;
+    padding: 11px 14px;
+    margin: 14px 0;
+  }
+  .note .t { font-weight: bold; display: block; margin-bottom: 3px; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0 4px; }
+  th, td {
+    border: 1px solid #ccc;
+    padding: 6px 9px;
+    text-align: left;
+    font-size: 10pt;
+    vertical-align: top;
+  }
+  th { background: #f2f4f7; }
+  .foot {
+    margin-top: 30px;
+    padding-top: 10px;
+    border-top: 1px solid #ccc;
+    color: #777;
+    font-size: 9pt;
+  }
+  .keep { page-break-inside: avoid; }
+</style>
+</head>
+<body>
+
+<h1>Depósitos que abastecen la tienda</h1>
+<div class="sub">BIMS Sync · Guía de configuración para My Store</div>
+
+<p>Esta guía explica cómo entrar al panel de BIMS Sync desde Shopify y cómo elegir
+qué depósitos de BIMS aportan el stock que se publica en la tienda.</p>
+
+<p>No necesita usuario ni contraseña aparte: el acceso se hace desde su propia
+cuenta de Shopify.</p>
+
+<h2 class="keep"><span class="n">1</span>Abrir el panel desde Shopify</h2>
+
+<ol>
+  <li>Ingrese al administrador de Shopify de su tienda.</li>
+  <li>Abra <span class="ui">Configuración</span> (abajo a la izquierda).</li>
+  <li>En el menú lateral, elija <span class="ui">Apps</span>.</li>
+  <li>Seleccione la pestaña <span class="ui">Instaladas</span>.</li>
+  <li>Ubique <span class="ui">BIMS Sync</span> en la lista.</li>
+  <li>Haga clic en el botón <span class="ui">···</span> que está a la derecha de esa fila.</li>
+  <li>Elija <span class="ui">Abrir app</span>.</li>
+</ol>
+
+<p>El panel se abre ya con la sesión iniciada. Si en lugar del panel aparece una
+pantalla de inicio de sesión, cierre la pestaña y repita el paso 7; si continúa,
+avísenos.</p>
+
+<div class="note">
+  <span class="t">Por qué no le pide contraseña</span>
+  Shopify confirma su identidad al abrir la app. El panel confía en esa
+  confirmación y crea la sesión automáticamente. Por eso es importante abrirlo
+  siempre desde <span class="ui">Abrir app</span> y no desde un enlace guardado.
+</div>
+
+<h2 class="keep"><span class="n">2</span>Entrar a la sección Depósitos</h2>
+
+<p>Dentro del panel, abra la pestaña <span class="ui">Depósitos</span>.</p>
+
+<p>Verá la lista de depósitos que existen en BIMS. Cada uno aparece con su nombre
+y su número de identificación, por ejemplo <span class="ui">MAYORISTA (ID 27)</span>.</p>
+
+<h2 class="keep"><span class="n">3</span>Elegir los depósitos</h2>
+
+<ol>
+  <li>Marque la casilla de cada depósito que debe abastecer la tienda.</li>
+  <li>Desmarque los que no deben contarse.</li>
+  <li>Haga clic en <span class="ui">Guardar selección</span>.</li>
+</ol>
+
+<p>Puede marcar uno o varios depósitos. Si marca varios, el stock publicado es la
+suma de todos los marcados.</p>
+
+<p>Debe quedar al menos un depósito marcado. Si intenta guardar sin ninguno, el
+panel lo rechaza con el mensaje
+<span class="ui">Seleccione al menos un depósito para guardar.</span></p>
+
+<div class="warn">
+  <span class="t">Importante: el stock se toma tal cual lo informa BIMS</span>
+  La tienda publica exactamente el stock que BIMS informa para los depósitos
+  seleccionados. Si esos depósitos informan cero unidades de un producto, la
+  tienda lo mostrará con stock cero y no se podrá vender, aunque otros depósitos
+  no seleccionados sí tengan unidades.
+  <br><br>
+  Antes de guardar, verifique en BIMS que los depósitos elegidos tengan
+  cargado el stock que espera vender.
+</div>
+
+<h2 class="keep"><span class="n">4</span>Aplicar los cambios a la tienda</h2>
+
+<p>Guardar la selección no actualiza la tienda de inmediato. Para aplicarla:</p>
+
+<ol>
+  <li>Haga clic en <span class="ui">Ejecutar sincronización</span>.</li>
+  <li>Espere a que el proceso termine. Mientras corre verá el avance en pantalla.</li>
+  <li>Al finalizar aparece <span class="ui">La última sincronización finalizó.</span></li>
+</ol>
+
+<div class="note">
+  <span class="t">El botón de sincronizar está deshabilitado</span>
+  Ocurre cuando todavía tiene cambios sin guardar, o cuando ya hay una
+  sincronización en curso. Guarde primero con
+  <span class="ui">Guardar selección</span> y luego ejecute la sincronización.
+  La sincronización aplica lo guardado, no lo que está en pantalla sin guardar.
+</div>
+
+<h2 class="keep"><span class="n">5</span>Mensajes que puede encontrar</h2>
+
+<table>
+  <tr>
+    <th style="width:46%">Mensaje</th>
+    <th>Qué hacer</th>
+  </tr>
+  <tr>
+    <td>Aún no se guardó ninguna selección: la tienda usa actualmente la regla de stock predeterminada.</td>
+    <td>Todavía no eligió depósitos. La tienda sigue funcionando con la configuración anterior.</td>
+  </tr>
+  <tr>
+    <td>Tiene cambios sin guardar.</td>
+    <td>Haga clic en <span class="ui">Guardar selección</span>.</td>
+  </tr>
+  <tr>
+    <td>No se pudo conectar con BIMS. No se guardó nada.</td>
+    <td>BIMS no respondió. No se modificó nada. Espere unos minutos y reintente.</td>
+  </tr>
+  <tr>
+    <td>BIMS no lista uno de los depósitos seleccionados.</td>
+    <td>El depósito cambió o se eliminó en BIMS. Use <span class="ui">Reintentar</span> para actualizar la lista y vuelva a elegir.</td>
+  </tr>
+  <tr>
+    <td>Los siguientes ID de depósito guardados ya no figuran en BIMS.</td>
+    <td>Un depósito guardado antes ya no existe en BIMS. Revise la selección y guarde de nuevo.</td>
+  </tr>
+  <tr>
+    <td>Su sesión venció. Inicie sesión nuevamente.</td>
+    <td>Vuelva a abrir el panel desde Shopify siguiendo el paso 1.</td>
+  </tr>
+  <tr>
+    <td>La última sincronización no finalizó.</td>
+    <td>Ejecute la sincronización nuevamente. Si vuelve a fallar, avísenos.</td>
+  </tr>
+</table>
+
+<h2 class="keep"><span class="n">6</span>Cambiar la selección más adelante</h2>
+
+<p>Puede repetir este procedimiento cuando lo necesite. Para incorporar otro
+depósito, márquelo, guarde y ejecute la sincronización.</p>
+
+<p>Para volver a la configuración anterior del sistema (sin selección de
+depósitos), comuníquese con nosotros: ese cambio no se realiza desde el panel.</p>
+
+<div class="foot">
+  BIMS Sync · Guía de configuración de depósitos · Documento interno para My Store
+</div>
+
+</body>
+</html>
