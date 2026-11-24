@@ -268,7 +268,26 @@ def decide_sellable_stock(
             sku=sku,
             scope_warehouse_ids=scope_warehouse_ids,
         )
-    detail = consolidate_sellable_stock(by_warehouse, mode=consolidation) if by_warehouse else None
+    # An all-zero breakdown is BIMS's broken warehouse filter, not a quantity:
+    # measured 2026-11-23 on SKU 112743, all five warehouses answered 0 while
+    # the unfiltered total said 20 and Shopify held 20. A dict full of those
+    # zeros is non-empty, so it used to read as a known 0 and get pushed. With
+    # no unfiltered total to correct it there is no evidence of any quantity,
+    # and the project's older rule applies: unknown stock is never pushed as
+    # zero. A negative warehouse IS evidence -- a real ledger entry.
+    breakdown_is_evidence = bool(by_warehouse) and (
+        # A non-zero figure anywhere is a real ledger entry, including a
+        # negative one.
+        any(quantity != 0 for quantity in by_warehouse.values())
+        # All zeros alone prove nothing, but the unfiltered total is there to
+        # correct them, so the breakdown can still take part in the decision.
+        or unfiltered_total is not None
+    )
+    detail = (
+        consolidate_sellable_stock(by_warehouse, mode=consolidation)
+        if breakdown_is_evidence
+        else None
+    )
     total = None if unfiltered_total is None else max(0.0, float(unfiltered_total))
 
     if rule is StockFigureRule.DETAIL_ONLY:
