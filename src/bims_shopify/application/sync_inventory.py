@@ -34,6 +34,14 @@ async def _emit_progress(progress: ProgressFn | None, done: int, total: int | No
 # dry_run=False.
 DEFAULT_MAX_ZERO_RATIO = 0.20
 DEFAULT_MAX_CHANGED_VARIANTS = 500
+#: Units that must be disappearing before the zero RATIO is allowed to block.
+#: In a clothing catalogue most sizes carry one or two units, so an ordinary
+#: day of sales zeroes a large share of whatever changed while removing almost
+#: no stock: on 2026-11-24, 87 of 149 changed SKUs went to zero and the whole
+#: loss was 87 units. The 2026-11-19 incident was the same ratio over 2,448
+#: SKUs holding hundreds each -- hundreds of thousands of units. The count
+#: cannot tell those apart; the units can.
+DEFAULT_MIN_ZEROED_UNITS = 1000
 #: Below this many changed SKUs the zero-RATIO check is not evaluated. The
 #: ratio exists to catch a catalog-wide wipe (BIMS answering with garbage),
 #: which is an event of thousands of SKUs. With continuous pulls most cycles
@@ -147,10 +155,23 @@ def check_safety_guard(
         tenant.field_mappings.get("max_changed_variants", DEFAULT_MAX_CHANGED_VARIANTS)
     )
 
+    min_zeroed_units = float(
+        tenant.field_mappings.get("min_zeroed_units", DEFAULT_MIN_ZEROED_UNITS)
+    )
+
     zero_count = sum(1 for d in resolved if d.new_stock == 0)
     zero_ratio = zero_count / matched_count
 
-    if matched_count >= GUARD_MIN_SAMPLE and zero_ratio > max_zero_ratio:
+    # Units, not SKUs, separate a day of trade from a wipe. Only stock we can
+    # see leaving is counted: a delta whose previous quantity is unknown
+    # contributes nothing rather than an invented number.
+    units_zeroed = sum(d.previous_stock or 0 for d in resolved if d.new_stock == 0)
+
+    if (
+        matched_count >= GUARD_MIN_SAMPLE
+        and zero_ratio > max_zero_ratio
+        and units_zeroed > min_zeroed_units
+    ):
         return NeedsConfirmation(
             reason="zero_ratio_exceeded",
             zero_count=zero_count,

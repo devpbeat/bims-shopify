@@ -40,8 +40,15 @@ def test_a_whole_small_batch_going_to_zero_still_does_not_block(tenant):
 
 
 def test_the_ratio_still_fires_once_the_sample_is_meaningful(tenant):
+    # Enough SKUs AND enough units: the ratio alone no longer blocks, because
+    # a big share of a tiny loss is an ordinary day of sales (see
+    # test_guard_counts_units).
     total = GUARD_MIN_SAMPLE
-    verdict = check_safety_guard(tenant, _deltas(total, total))
+    deltas = [
+        InventoryDelta(sku=f"S{i}", previous_stock=100.0, new_stock=0.0)
+        for i in range(total)
+    ]
+    verdict = check_safety_guard(tenant, deltas)
     assert verdict is not None
     assert verdict.reason == "zero_ratio_exceeded"
 

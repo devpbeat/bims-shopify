@@ -241,7 +241,7 @@ async def test_scheduled_full_sync_guard_still_blocks_mass_zero(env):
     size = GUARD_MIN_SAMPLE + 5
     skus = [f"SKU{i}" for i in range(size)]
     mock, pushes = _mock_world(
-        {sku: 0 for sku in skus}, levels={sku: 5 for sku in skus}
+        {sku: 0 for sku in skus}, levels={sku: 100 for sku in skus}
     )  # BIMS suddenly says 0 everywhere, Shopify still holds 5
 
     with mock:
@@ -264,7 +264,7 @@ async def test_needs_confirmation_result_reports_mode(env):
     tenant = await make_tenant()
     # Above GUARD_MIN_SAMPLE so the ratio is actually evaluated.
     skus = [f"SKU{i}" for i in range(GUARD_MIN_SAMPLE + 5)]
-    mock, _pushes = _mock_world({sku: 0 for sku in skus}, levels={sku: 5 for sku in skus})
+    mock, _pushes = _mock_world({sku: 0 for sku in skus}, levels={sku: 100 for sku in skus})
     with mock:
         async with session_factory() as session:
             result = await _do_run_sync(tenant, False, session, full=True)

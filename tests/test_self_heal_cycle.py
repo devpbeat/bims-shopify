@@ -142,7 +142,8 @@ async def test_the_mass_zero_guard_stops_creating_and_publishing_on_that_snapsho
     await land_catalog(session_factory, tenant, items)
     world = HealShopify([product(i + 1, f"EXISTING {i}", {f"E{i}": "M"}) for i in range(GUARD_MIN_SAMPLE + 5)])
     world.products.append(_draft_with_stock())
-    world.levels = {sku: 5 for sku in existing}  # what Shopify really holds
+    # 100 units each: the guard weighs units, not only the zeroed share.
+    world.levels = {sku: 100 for sku in existing}  # what Shopify really holds
     with world:
         result = await _cycle(session_factory, tenant)
 
@@ -222,7 +223,7 @@ async def test_every_stage_works_from_the_snapshot_the_cycle_started_with(migrat
     bad = [(sku, name, 0.0) for sku, name in existing.items()]  # BIMS "lost" all stock
     await land_catalog(session_factory, tenant, bad)
     world = HealShopify([product(i + 1, f"EXISTING {i}", {f"E{i}": "M"}) for i in range(GUARD_MIN_SAMPLE + 5)])
-    world.levels = {sku: 5 for sku in existing}
+    world.levels = {sku: 100 for sku in existing}
 
     real_reconcile = sync_workers.do_reconcile
 

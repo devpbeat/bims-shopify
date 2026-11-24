@@ -115,7 +115,9 @@ async def test_oneshot_guard_still_blocks_a_mass_zero(migrated_db):
     session_factory, make_tenant = migrated_db
     tenant = await make_tenant()
     skus = [f"S{i}" for i in range(GUARD_MIN_SAMPLE + 5)]
-    world = ShopifyWorld(skus, levels={s: 5 for s in skus})
+    # 100 units each: the guard now needs real UNITS disappearing, not just
+    # a high share of SKUs (see tests/test_guard_counts_units.py).
+    world = ShopifyWorld(skus, levels={s: 100 for s in skus})
     world.serve_bims({s: 0 for s in skus})
     with world:
         result = await _oneshot(session_factory, tenant)

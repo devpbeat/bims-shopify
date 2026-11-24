@@ -271,13 +271,14 @@ async def test_the_mass_zero_guard_still_fires_and_nothing_is_written(migrated_d
     size = GUARD_MIN_SAMPLE + 5
     skus = [f"S{i}" for i in range(size)]
     await land_snapshot(session_factory, tenant, {sku: 0 for sku in skus})  # a "bad" snapshot
-    world = ShopifyWorld(skus, levels={sku: 5 for sku in skus})
+    # 100 units each: the guard weighs units, not only the zeroed share.
+    world = ShopifyWorld(skus, levels={sku: 100 for sku in skus})
     with world:
         result = await _reconcile(session_factory, tenant)
 
     assert result["status"] == "needs_confirmation"
     assert result["reason"] == "zero_ratio_exceeded"
-    assert world.write_calls == 0 and world.levels == {sku: 5 for sku in skus}
+    assert world.write_calls == 0 and world.levels == {sku: 100 for sku in skus}
     assert result["drift"]["count"] == size  # the drift is still reported
     assert result["report"]["guard"]["fired"] is True
     state = await _state(session_factory, tenant.id)
