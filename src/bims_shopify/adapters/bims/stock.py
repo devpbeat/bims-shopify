@@ -13,6 +13,37 @@ from typing import Any
 #: SKUs per ``stock_fenicio`` request.
 STOCK_BATCH_SIZE = 200
 
+#: ``field_mappings`` key a tenant uses to override the batch size.
+STOCK_BATCH_SIZE_KEY = "stock_batch_size"
+
+#: Upper bound, so a typo cannot build one enormous request.
+MAX_STOCK_BATCH_SIZE = 500
+
+
+def resolve_stock_batch_size(field_mappings: dict) -> int:
+    """How many SKUs to ask BIMS for per stock request.
+
+    Tunable per tenant because BIMS answers differently depending on batch
+    size: asked for SKU 112743 on its own it reports an unfiltered total of
+    20, and asked inside a 200-SKU batch it reports 0 for that same SKU in
+    the same pull (measured 2026-11-23). Lowering the size trades pull time
+    for answers that match what BIMS shows in its own UI.
+
+    ``field_mappings`` is operator-edited free-form JSON, so an unusable
+    value falls back to the default rather than stopping inventory from
+    syncing.
+    """
+    raw = (field_mappings or {}).get(STOCK_BATCH_SIZE_KEY)
+    if raw is None or raw == "":
+        return STOCK_BATCH_SIZE
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        return STOCK_BATCH_SIZE
+    if size < 1 or size > MAX_STOCK_BATCH_SIZE:
+        return STOCK_BATCH_SIZE
+    return size
+
 #: Batches in flight at once. Tunable per call without a redeploy of callers.
 DEFAULT_STOCK_CONCURRENCY = 2
 

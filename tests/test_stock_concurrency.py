@@ -50,14 +50,19 @@ def _skus(n: int) -> list[str]:
 
 
 def _tenant() -> Any:
-    return SimpleNamespace(stock_warehouse_ids=[1], slug="t")
+    # The adapter now reads its batch size from the tenant (see
+    # ``resolve_stock_batch_size``), so small batches are configured here
+    # rather than monkeypatched onto the module.
+    return SimpleNamespace(
+        stock_warehouse_ids=[1], slug="t", field_mappings={"stock_batch_size": 10}
+    )
 
 
 @pytest.fixture(autouse=True)
 def small_batches(monkeypatch):
     monkeypatch.setattr(stock_module, "STOCK_BATCH_SIZE", 10)
     monkeypatch.setattr("bims_shopify.ops.catalog.STOCK_BATCH_SIZE", 10, raising=False)
-    monkeypatch.setattr("bims_shopify.adapters.bims.erp_adapter.STOCK_BATCH_SIZE", 10)
+
 
 
 async def test_catalog_stock_merged_map_equals_sequential():

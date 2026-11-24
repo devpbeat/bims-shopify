@@ -20,7 +20,7 @@ from bims_shopify.logging import get_logger
 
 from .client import BIMSClient
 from .paging import PagedPull, paginate_products
-from .stock import STOCK_BATCH_SIZE, fetch_stock_batches
+from .stock import fetch_stock_batches, resolve_stock_batch_size
 from .timezones import to_bims_local
 
 PAGE_LIMIT = 250
@@ -263,7 +263,7 @@ class BIMSERPAdapter:
             unique_skus,
             warehouse_ids,
             request_prefix=request_prefix,
-            batch_size=STOCK_BATCH_SIZE,
+            batch_size=resolve_stock_batch_size(tenant.field_mappings),
             concurrency=concurrency if concurrency is not None else self._stock_concurrency,
         )
         seconds = time.perf_counter() - started
