@@ -26,6 +26,22 @@ logger = get_logger(__name__)
 REJECT_INCOMPLETE = "incomplete"
 REJECT_TOO_FEW_ROWS = "too_few_rows"
 REJECT_TOO_FEW_STOCK_ROWS = "too_few_stock_rows"
+REJECT_TOO_MANY_ROWS = "too_many_rows"
+REJECT_TOO_MANY_STOCK_ROWS = "too_many_stock_rows"
+
+#: Growth beyond this fraction of the previous snapshot is refused. BIMS
+#: intermittently answers 2.55x the rows (33,705 where every other pull that
+#: day said 13,196). The check used to look only for drops, so the inflated
+#: answer was always accepted, became the reference, and then every correct
+#: pull looked like a 61% drop and was refused -- four times in one day.
+#: Bad data won because nobody checked it on the way IN.
+DEFAULT_PULL_MAX_RISE_RATIO = 0.5
+
+#: The rise check only applies once the catalogue is established. A tenant
+#: still filling up legitimately multiplies its row count, and refusing that
+#: would stop onboarding; an established catalogue jumping 2.55x is the BIMS
+#: anomaly. Below this many previous rows, growth is never refused.
+RISE_CHECK_MIN_BASELINE = 1000
 
 #: Float slack so a drop of exactly the threshold (e.g. 100 -> 70 at 30%) is accepted.
 _EPSILON = 1e-9
@@ -73,16 +89,35 @@ def check_sanity(
     if previous is None:
         return None
     max_drop = tenant.pull_max_drop_ratio
-    for reason, new, old, label in (
-        (REJECT_TOO_FEW_ROWS, len(pull.rows), previous.rows_pulled, "rows"),
-        (REJECT_TOO_FEW_STOCK_ROWS, len(pull.stock), previous.stock_rows, "stock_rows"),
+    max_rise = float(
+        getattr(tenant, "pull_max_rise_ratio", None) or DEFAULT_PULL_MAX_RISE_RATIO
+    )
+    for drop_reason, rise_reason, new, old, label in (
+        (REJECT_TOO_FEW_ROWS, REJECT_TOO_MANY_ROWS, len(pull.rows), previous.rows_pulled, "rows"),
+        (
+            REJECT_TOO_FEW_STOCK_ROWS,
+            REJECT_TOO_MANY_STOCK_ROWS,
+            len(pull.stock),
+            previous.stock_rows,
+            "stock_rows",
+        ),
     ):
-        if old > 0 and _drop_exceeds(new, old, max_drop):
-            return reason, {
+        if old <= 0:
+            continue
+        if _drop_exceeds(new, old, max_drop):
+            return drop_reason, {
                 label: new,
                 f"previous_{label}": old,
                 "drop_ratio": 1 - new / old,
                 "max_drop_ratio": max_drop,
+                "previous_snapshot_id": previous.id,
+            }
+        if old >= RISE_CHECK_MIN_BASELINE and (new / old) - 1 > max_rise + _EPSILON:
+            return rise_reason, {
+                label: new,
+                f"previous_{label}": old,
+                "rise_ratio": (new / old) - 1,
+                "max_rise_ratio": max_rise,
                 "previous_snapshot_id": previous.id,
             }
     return None
